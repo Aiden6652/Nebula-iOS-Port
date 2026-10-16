@@ -1,0 +1,28 @@
+name: Build iOS dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Build dylib (arm64-ios)
+        run: cd src/dylib && make
+
+      - name: Verify artifact
+        run: file src/dylib/nebula_ios_loader.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: nebula-ios-dylib
+          path: src/dylib/*.dylib
