@@ -1,5 +1,8 @@
 build/
 *.o
 *.dylib
+*.so
+test_protocol
+test_dispatch
 .DS_Store
 *.log
