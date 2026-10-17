@@ -1,4 +1,4 @@
-name: Build iOS dylib
+name: Build & Test Nebula-iOS
 
 on:
   push:
@@ -6,21 +6,27 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # ① Linux：跑 host 端协议 + 分发层测试（抓回归，不依赖真机）
+  test-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & run host tests
+        run: cd src/net && make test
+      - name: Run Python reference simulator
+        run: python3 tools/sim/protocol_sim.py
+
+  # ② macOS：交叉编译 iOS arm64 dylib
+  build-dylib:
     runs-on: macos-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-
       - name: Build dylib (arm64-ios)
         run: cd src/dylib && make
-
       - name: Verify artifact
         run: file src/dylib/nebula_ios_loader.dylib
-
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:

@@ -10,6 +10,8 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include "../net/net_layer.h"
+#include "../net/protocol.h"
 
 /* ===== 简易日志 ===== */
 static void port_log(const char *msg) {
@@ -28,6 +30,27 @@ typedef struct {
 
 static il2cpp_ctx_t g_ctx = {0};
 
+/* ===== 自洽网络层：示例 RPC 处理器 =====
+ * 真实玩法会为每类自定义消息注册处理器（角色/技能/胜负…）。
+ * 这里先注册一个 ROLE_ASSIGN 处理器，证明 dylib 已接入网络层。 */
+static void on_role_assign(const uint8_t *payload, size_t len) {
+    uint32_t net_id; uint16_t role_id;
+    if (nebula_unpack_role(payload, (uint16_t)len, &net_id, &role_id) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf),
+                 "recv ROLE_ASSIGN net_id=%u role=%u", net_id, role_id);
+        port_log(buf);
+    }
+}
+
+/* ===== 底层发送通道（占位） =====
+ * 真实情况下由 dylib 在 Hook 原版 Among Us 网络发送点时接入：
+ * 把游戏的网络发送函数包一层，自定义消息从这里出门。 */
+static int transport_send_stub(const uint8_t *buf, size_t len) {
+    (void)buf; (void)len;
+    return 0; /* TODO: 转发到原版发送点 */
+}
+
 /* ===== 初始化 IL2CPP 桥接（占位） ===== */
 void nebula_port_init(void) {
     port_log("loader constructed");
@@ -41,10 +64,18 @@ void nebula_port_hook_setup(void) {
      *       例如 PlayerControl.FixedUpdate / GameManager.Update */
 }
 
+/* ===== 初始化自洽网络层 ===== */
+void nebula_port_net_init(void) {
+    nebula_net_set_transport(transport_send_stub);
+    nebula_net_register(RPC_ROLE_ASSIGN, on_role_assign);
+    port_log("net layer initialized (self-consistent RPC)");
+}
+
 /* ===== dylib 入口：dyld 加载阶段自动执行 ===== */
 __attribute__((constructor))
 static void loader_entry(void) {
     nebula_port_init();
+    nebula_port_net_init();
     nebula_port_hook_setup();
     port_log("dylib loaded");
 }

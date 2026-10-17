@@ -4,7 +4,7 @@
 CC      ?= clang
 TARGET  := arm64-apple-ios14.0
 SYSROOT := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
-SRC     := loader.c
+SRC     := loader.c ../net/protocol.c ../net/dispatch.c
 OUT     := nebula_ios_loader.dylib
 CFLAGS  := -target $(TARGET) -isysroot $(SYSROOT) -fPIC -O2 -Wall
 
