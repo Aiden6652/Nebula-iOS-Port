@@ -19,6 +19,7 @@ jobs:
         run: |
           python3 tools/sim/protocol_sim.py
           python3 tools/sim/core_sim.py
+          python3 tools/sim/full_game_sim.py
 
   # ② macOS：交叉编译 iOS arm64 dylib
   build-dylib:

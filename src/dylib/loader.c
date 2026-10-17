@@ -99,6 +99,9 @@ void nebula_port_net_init(void) {
     port_log("net layer + local core initialized");
 }
 
+/* ===== 供 Frida/JS 桥接：返回本地游戏实例指针 ===== */
+nebula_game_t *nebula_get_game(void) { return &g_game; }
+
 /* ===== dylib 入口：dyld 加载阶段自动执行 ===== */
 __attribute__((constructor))
 static void loader_entry(void) {

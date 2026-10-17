@@ -1,6 +1,6 @@
 /*
- * core.c — Nebula-iOS 纯本地玩法内核实现
- * 与 src/core/core.h 配套；规则为星云舰式最小可玩集，后续逐步对齐原版。
+ * core.c — Nebula-iOS 纯本地玩法引擎实现
+ * 规则为星云舰式可玩集，框架稳定，后续按原版逐步扩充。
  */
 
 #include "core.h"
@@ -14,6 +14,7 @@ void nebula_core_init(nebula_game_t *g)
 {
     if (!g) return;
     memset(g, 0, sizeof(*g));
+    g->meeting_by = -1;
 }
 
 void nebula_core_add_player(nebula_game_t *g, uint32_t net_id, nebula_role_t role)
@@ -24,6 +25,11 @@ void nebula_core_add_player(nebula_game_t *g, uint32_t net_id, nebula_role_t rol
     p->role   = role;
     p->alive  = 1;
     p->kill_cd = 0;
+    p->vent_cd = 0;
+    p->in_vent = 0;
+    p->voted  = 0;
+    p->vote_target = 0;
+    p->modifiers = MOD_NONE;
 }
 
 nebula_player_t *nebula_core_find(nebula_game_t *g, uint32_t net_id)
@@ -34,53 +40,147 @@ nebula_player_t *nebula_core_find(nebula_game_t *g, uint32_t net_id)
     return NULL;
 }
 
-static void do_kill(nebula_game_t *g, uint32_t caster, uint32_t target,
-                    float x, float y, int local)
+/* 广播帮助：本地动作 → 编码 ABILITY_USE → 回调 */
+static void broadcast(uint32_t caster, uint16_t ability, uint32_t target, float x, float y)
+{
+    if (g_action_cb) g_action_cb(caster, ability, target, x, y);
+}
+
+static void do_kill(nebula_game_t *g, uint32_t caster, uint32_t target)
 {
     nebula_player_t *c = nebula_core_find(g, caster);
     nebula_player_t *t = nebula_core_find(g, target);
-    if (!c || !t || !c->alive || !t->alive) return;   /* 死者不能行动/被再次击杀 */
+    if (!c || !t || !c->alive || !t->alive) return;
 
     if (c->role == ROLE_IMPOSTOR) {
-        t->alive = 0;                                  /* 内鬼击杀：目标死 */
+        t->alive = 0;
     } else if (c->role == ROLE_SHERIFF) {
-        if (t->role == ROLE_IMPOSTOR) {
-            t->alive = 0;                              /* 警长枪内鬼：内鬼死 */
-        } else {
-            c->alive = 0;                              /* 警长误杀船员：自己死 */
-        }
+        if (t->role == ROLE_IMPOSTOR) t->alive = 0;
+        else c->alive = 0;                 /* 误杀船员，自己死 */
     } else {
-        return;                                        /* 船员无击杀能力，忽略 */
+        return;                            /* 船员/工程师无击杀 */
     }
-    c->kill_cd = 30;                                   /* 进入冷却（演示） */
+    c->kill_cd = 30;
 
-    /* 本地发起 → 广播动作，让对端用同一逻辑重算 */
-    if (local && g_action_cb) g_action_cb(caster, ABILITY_KILL, target, x, y);
+    /* 被击杀者带 BAIT 修饰 → 死后触发会议（演示） */
+    if (t->modifiers & MOD_BAIT) nebula_core_call_meeting(g, target, 0);
 }
 
-int nebula_core_use_ability(nebula_game_t *g,
-                            uint32_t caster, uint16_t ability,
-                            uint32_t target, float x, float y,
-                            int local)
+int nebula_core_use_ability(nebula_game_t *g, uint32_t caster, uint16_t ability,
+                            uint32_t target, float x, float y, int local)
 {
-    if (!g || g->over) return -1;
-    if (ability == ABILITY_KILL) {
-        do_kill(g, caster, target, x, y, local);
-        nebula_core_check_win(g);
-        return 0;
+    if (!g || g->phase == PHASE_OVER) return -1;
+
+    switch (ability) {
+    case ABILITY_KILL:
+        do_kill(g, caster, target);
+        break;
+    case ABILITY_VENT: {
+        nebula_player_t *c = nebula_core_find(g, caster);
+        if (!c || !c->alive) return -1;
+        /* 仅内鬼/工程师可用；工程师有额外冷却 */
+        if (c->role == ROLE_IMPOSTOR || c->role == ROLE_ENGINEER) {
+            c->in_vent = !c->in_vent;
+            c->vent_cd = (c->role == ROLE_ENGINEER) ? 20 : 5;
+        } else return -1;
+        break;
     }
-    return -1;   /* 未实现的技能 */
+    case ABILITY_SABOTAGE:
+        /* 仅内鬼；演示：仅标记，不单独改变胜负 */
+        if (!(nebula_core_find(g, caster) &&
+              nebula_core_find(g, caster)->role == ROLE_IMPOSTOR)) return -1;
+        break;
+    case ABILITY_TASK: {
+        nebula_player_t *c = nebula_core_find(g, caster);
+        if (!c || !c->alive) return -1;     /* 任务只由存活者完成 */
+        break;
+    }
+    default:
+        return -1;
+    }
+
+    if (local) broadcast(caster, ability, target, x, y);
+    /* 会议期间（如 BAIT 触发）不立即结算胜负，待会议结束再判 */
+    if (g->phase == PHASE_PLAY) nebula_core_check_win(g);
+    return 0;
+}
+
+void nebula_core_call_meeting(nebula_game_t *g, uint32_t caster, int local)
+{
+    if (!g || g->phase == PHASE_OVER) return;
+    if (!nebula_core_find(g, caster)) return;
+    g->phase = PHASE_MEET;
+    g->meeting_by = (int)caster;
+    for (int i = 0; i < g->n_players; i++) {
+        g->players[i].voted = 0;
+        g->players[i].vote_target = 0;
+    }
+    if (local) broadcast(caster, ABILITY_MEETING, caster, 0, 0);
+}
+
+void nebula_core_cast_vote(nebula_game_t *g, uint32_t voter, uint32_t target, int local)
+{
+    if (!g || g->phase != PHASE_MEET) return;
+    nebula_player_t *v = nebula_core_find(g, voter);
+    if (!v || !v->alive || v->voted) return;
+    v->voted = 1;
+    v->vote_target = target;
+    if (local) broadcast(voter, ABILITY_VOTE, target, 0, 0);
+}
+
+int nebula_core_resolve_meeting(nebula_game_t *g)
+{
+    if (!g || g->phase != PHASE_MEET) return -1;
+
+    /* 统计票数，找最高 */
+    int cnt[NEBULA_MAX_PLAYERS] = {0};
+    for (int i = 0; i < g->n_players; i++) {
+        if (g->players[i].voted)
+            for (int j = 0; j < g->n_players; j++)
+                if (g->players[j].net_id == g->players[i].vote_target)
+                    { cnt[j]++; break; }
+    }
+    int maxc = 0, ej = -1, tie = 0;
+    for (int j = 0; j < g->n_players; j++) {
+        if (cnt[j] > maxc) { maxc = cnt[j]; ej = j; tie = 0; }
+        else if (cnt[j] == maxc && maxc > 0) tie = 1;
+    }
+
+    int ejected = -1;
+    if (maxc > 0 && !tie) {
+        ejected = ej;
+        g->players[ej].alive = 0;
+        /* 小丑被驱逐 → 小丑胜 */
+        if (g->players[ej].role == ROLE_JESTER) {
+            g->phase = PHASE_OVER; g->winner = ROLE_JESTER; return ejected;
+        }
+    }
+    g->phase = PHASE_PLAY;
+    g->meeting_by = -1;
+    nebula_core_check_win(g);
+    return ejected;
 }
 
 void nebula_core_check_win(nebula_game_t *g)
 {
-    if (!g || g->over) return;
+    if (!g || g->phase == PHASE_OVER) return;
     int alive_imp = 0, alive_other = 0;
     for (int i = 0; i < g->n_players; i++) {
         if (!g->players[i].alive) continue;
         if (g->players[i].role == ROLE_IMPOSTOR) alive_imp++;
-        else alive_other++;
+        else if (g->players[i].role != ROLE_JESTER) alive_other++;
     }
-    if (alive_imp == 0) { g->over = 1; g->winner = 1; }       /* 内鬼全灭→船员胜 */
-    else if (alive_imp >= alive_other) { g->over = 1; g->winner = 2; } /* 内鬼≥好人→内鬼胜 */
+    if (alive_imp == 0) { g->phase = PHASE_OVER; g->winner = 1; }       /* 内鬼全灭→船员胜 */
+    else if (alive_imp >= alive_other) { g->phase = PHASE_OVER; g->winner = 2; } /* 内鬼≥好人→内鬼胜 */
+}
+
+void nebula_core_add_modifier(nebula_game_t *g, uint32_t net_id, uint32_t mod)
+{
+    nebula_player_t *p = nebula_core_find(g, net_id);
+    if (p) p->modifiers |= mod;
+}
+
+int nebula_core_has_modifier(nebula_player_t *p, uint32_t mod)
+{
+    return p && (p->modifiers & mod);
 }

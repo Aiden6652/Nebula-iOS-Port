@@ -1,0 +1,9 @@
+{
+  "_comment": "由 src/frida/dump.js 产出（默认写到 /tmp/nebula_methods.json）。hook.js 读取它按地址解析 IL2CPP 方法。不同 Among Us 版本方法名/地址会变，只改这里即可，不动逻辑。",
+  "GameManager.Update":      { "ptr": "0x0", "cls": "GameManager", "name": "Update" },
+  "PlayerControl.FixedUpdate": { "ptr": "0x0", "cls": "PlayerControl", "name": "FixedUpdate" },
+  "PlayerControl.RpcSendChat": { "ptr": "0x0", "cls": "PlayerControl", "name": "RpcSendChat" },
+  "ShipStatus.OnEnable":     { "ptr": "0x0", "cls": "ShipStatus", "name": "OnEnable" },
+  "KillButton.OnClick":      { "ptr": "0x0", "cls": "KillButton", "name": "OnClick" },
+  "EmergencyButton.OnClick": { "ptr": "0x0", "cls": "EmergencyButton", "name": "OnClick" }
+}
