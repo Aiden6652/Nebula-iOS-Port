@@ -4,5 +4,6 @@ build/
 *.so
 test_protocol
 test_dispatch
+test_core
 .DS_Store
 *.log

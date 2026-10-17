@@ -6,15 +6,19 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ① Linux：跑 host 端协议 + 分发层测试（抓回归，不依赖真机）
+  # ① Linux：跑 host 端协议 + 分发层 + 本地内核测试（抓回归，不依赖真机）
   test-protocol:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build & run host tests
         run: cd src/net && make test
-      - name: Run Python reference simulator
-        run: python3 tools/sim/protocol_sim.py
+      - name: Build & run local-core tests
+        run: cd src/core && make test
+      - name: Run Python reference simulators
+        run: |
+          python3 tools/sim/protocol_sim.py
+          python3 tools/sim/core_sim.py
 
   # ② macOS：交叉编译 iOS arm64 dylib
   build-dylib:

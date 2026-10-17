@@ -31,12 +31,15 @@
 
 ```
 docs/                 技术方案 / 架构 / 协议笔记
-src/dylib/            自建 iOS 模组加载器（可编译的 arm64 dylib 空壳）
-src/net/              自洽网络层接口（iOS↔iOS，不绑定 PC 协议）
+src/dylib/            自建 iOS 模组加载器（可编译的 arm64 dylib，已接入网络层+本地内核）
+src/core/             纯本地玩法内核（角色/技能/胜负，每台设备独立算，不碰网络）
+src/net/              自洽网络层（iOS↔iOS，联机时只广播"动作"，两端各算各的）
 src/frida/            frida-il2cpp-bridge dump 脚本（定位 Hook 点）
-tools/                insert_dylib + 重签 示意脚本
-.github/workflows/    GitHub Actions：macOS 交叉编译 ARM64 dylib
+tools/                insert_dylib + 重签 示意脚本；sim/ 双客户端联机模拟器
+.github/workflows/    GitHub Actions：Linux 跑测试 + macOS 交叉编译 ARM64 dylib
 ```
+
+> **架构边界（已确认）**：模组逻辑【全部纯本地】——角色/技能/胜负每台设备独立用相同规则重算；**只有联机才走网络**，且网络层【只广播动作】（如"玩家X对Y用了技能"），两端各自本地重算 → 状态自然收敛。
 
 ## 构建
 
@@ -45,4 +48,8 @@ tools/                insert_dylib + 重签 示意脚本
 
 ## 现状
 
-🚧 **骨架阶段**：加载器空壳 + 网络层接口 + 协议分析占位已就位。**尚未包含任何星云舰玩法逻辑**，也未完成真实 Hook。下一步见 `docs/PORTING_PLAN.md` 的阶段拆分。
+🚧 **本地内核 + 网络层已落地（可测）**：
+- `src/core`：纯本地玩法内核已实现最小可玩集（船员/内鬼/警长 + 击杀 + 胜负），host 测试全过。
+- `src/net`：自洽协议 + 分发层已实现并测通；`tools/sim/core_sim.py` 验证「纯本地逻辑 + 动作广播」端到端收敛。
+- `src/dylib`：已接入网络层与本地内核（注册 RPC、本地动作→广播、对端动作→本地重算）。
+- **尚未**：真实 IL2CPP Hook（需真机 dump 方法地址）、完整星云舰角色/技能铺开、注入到 IPA 实测。

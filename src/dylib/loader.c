@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "../net/net_layer.h"
 #include "../net/protocol.h"
+#include "../core/core.h"
 
 /* ===== 简易日志 ===== */
 static void port_log(const char *msg) {
@@ -29,6 +30,30 @@ typedef struct {
 } il2cpp_ctx_t;
 
 static il2cpp_ctx_t g_ctx = {0};
+
+/* ===== 本地玩法内核（纯本地逻辑，联机时只广播动作） ===== */
+static nebula_game_t g_game = {0};
+
+/* 本地动作回调：本地发起的技能 → 编码成 RPC_ABILITY_USE → 走网络层广播 */
+static void on_local_action(uint32_t caster, uint16_t ability,
+                            uint32_t target, float x, float y) {
+    uint8_t pl[32]; uint16_t pln;
+    if (nebula_pack_ability(caster, ability, target, x, y, pl, &pln) == 0) {
+        uint8_t msg[64]; size_t mlen;
+        if (nebula_msg_encode(RPC_ABILITY_USE, pl, pln, msg, &mlen) == 0) {
+            nebula_net_send(msg, mlen);
+        }
+    }
+}
+
+/* 收到对端的技能动作 → 本地用同一套逻辑重算（不二次广播） */
+static void on_ability_recv(const uint8_t *payload, size_t len) {
+    uint32_t caster, target; uint16_t ability; float x, y;
+    if (nebula_unpack_ability(payload, (uint16_t)len,
+                              &caster, &ability, &target, &x, &y) == 0) {
+        nebula_core_use_ability(&g_game, caster, ability, target, x, y, 0);
+    }
+}
 
 /* ===== 自洽网络层：示例 RPC 处理器 =====
  * 真实玩法会为每类自定义消息注册处理器（角色/技能/胜负…）。
@@ -64,11 +89,14 @@ void nebula_port_hook_setup(void) {
      *       例如 PlayerControl.FixedUpdate / GameManager.Update */
 }
 
-/* ===== 初始化自洽网络层 ===== */
+/* ===== 初始化自洽网络层 + 本地内核 ===== */
 void nebula_port_net_init(void) {
+    nebula_core_init(&g_game);
+    nebula_core_set_action_cb(on_local_action);   /* 本地动作 → 广播 */
     nebula_net_set_transport(transport_send_stub);
     nebula_net_register(RPC_ROLE_ASSIGN, on_role_assign);
-    port_log("net layer initialized (self-consistent RPC)");
+    nebula_net_register(RPC_ABILITY_USE, on_ability_recv);  /* 对端动作 → 本地重算 */
+    port_log("net layer + local core initialized");
 }
 
 /* ===== dylib 入口：dyld 加载阶段自动执行 ===== */
