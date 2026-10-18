@@ -32,14 +32,24 @@ static void     (*g_tick_cb)(void) = NULL;
  * 万一目标设备的调用点真的做了 PAC 认证（会 SIGILL），不必重新编译：
  * 在 IPA 里可执行文件旁边放一个 nebula_no_hook.txt，即停用所有 hook，
  * 自动退回"纯字段轮询"模式（功能降级但必定不崩）。 */
-int nebula_hook_enabled(void) {
+/* 通用开关：可执行文件旁是否存在指定文件 */
+int nebula_flag_file(const char *filename) {
 #if defined(__APPLE__)
     char path[1024]; uint32_t sz = sizeof(path);
-    if (_NSGetExecutablePath(path, &sz) != 0) return 1;
+    if (_NSGetExecutablePath(path, &sz) != 0) return 0;
     char *slash = strrchr(path, '/');
-    if (!slash) return 1;
-    strncpy(slash + 1, "nebula_no_hook.txt", sizeof(path) - (size_t)(slash + 1 - path) - 1);
-    return (access(path, F_OK) == 0) ? 0 : 1;
+    if (!slash) return 0;
+    strncpy(slash + 1, filename, sizeof(path) - (size_t)(slash + 1 - path) - 1);
+    return (access(path, F_OK) == 0) ? 1 : 0;
+#else
+    (void)filename;
+    return 0;   /* 非 Apple 平台：一律视为不存在 */
+#endif
+}
+
+int nebula_hook_enabled(void) {
+#if defined(__APPLE__)
+    return nebula_flag_file("nebula_no_hook.txt") ? 0 : 1;
 #else
     return 1;   /* 非 Apple 平台无该机制：始终允许安装 */
 #endif

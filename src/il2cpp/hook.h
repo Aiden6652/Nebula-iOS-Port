@@ -41,6 +41,9 @@ void nebula_hook_set_tick(void (*tick_cb)(void));
    返回 1=可安装，0=已停用。 */
 int  nebula_hook_enabled(void);
 
+/* 通用开关：可执行文件旁是否存在指定文件（用于逐级排查闪退） */
+int  nebula_flag_file(const char *filename);
+
 /* 安装 GameManager.Update 的每帧 hook（每帧调 tick 回调，再调原函数） */
 int  nebula_hook_install_game_update(void);
 

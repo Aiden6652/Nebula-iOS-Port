@@ -116,8 +116,15 @@ static void nebula_port_tick(void) {
 
 /* 无 Frida 的游戏桥接：dylib 自己解析 libil2cpp 并轮询生效 */
 void nebula_port_bridge_start(void) {
-    static const char *hints[] = { "PlayerControl", "GameManager", "ShipStatus", "GameData" };
-    nebula_il2cpp_dump_report(NULL, hints, 4);
+    /* ★ 注意：绝不能在 constructor 里调用任何 IL2CPP API ——
+     *   此刻 Unity 还没初始化 il2cpp，domain 是空的，一调就闪退。
+     *   真正的 dump / hook 全部推迟到轮询线程里、等 IL2CPP 就绪后再做。 */
+    /* 逐级排查开关：放 nebula_no_bridge.txt 可完全不启动游戏桥
+       （不碰 IL2CPP、不装 hook），用来判断闪退是否来自桥接本身 */
+    if (nebula_flag_file("nebula_no_bridge.txt")) {
+        port_log("bridge 已停用（检测到 nebula_no_bridge.txt）");
+        return;
+    }
     /* 注册每帧要做的事：Update hook 成功后会每帧调用它 */
     nebula_hook_set_tick(nebula_port_tick);
     /* 启动后台轮询；其内部的poll线程在 IL2CPP 就绪后会自动安装 Update hook */

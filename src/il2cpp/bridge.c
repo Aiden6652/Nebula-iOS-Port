@@ -60,9 +60,33 @@ void nebula_log(const char *fmt, ...) {
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
+/* 计算镜像映射大小（取各 segment 的最大末端），用于符号表越界校验 */
+static size_t image_size(const struct mach_header *mh)
+{
+    uintptr_t base = (uintptr_t)mh;
+    struct load_command *lc = (struct load_command *)(base + sizeof(struct mach_header_64));
+    uint32_t ncmds = ((struct mach_header_64 *)mh)->ncmds;
+    uint64_t min_addr = ~0ULL, max_end = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if ((uintptr_t)lc + sizeof(struct load_command) > base + (1u << 30)) break;
+        if (lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *sg = (struct segment_command_64 *)lc;
+            if (sg->vmaddr < min_addr) min_addr = sg->vmaddr;
+            if (sg->vmaddr + sg->vmsize > max_end) max_end = sg->vmaddr + sg->vmsize;
+        }
+        if (lc->cmdsize == 0) break;
+        lc = (struct load_command *)((uintptr_t)lc + lc->cmdsize);
+    }
+    if (max_end <= min_addr) return 0;
+    return (size_t)(max_end - min_addr);
+}
+
 static void *lookup_in_image(const struct mach_header *mh, intptr_t slide, const char *want) {
     if (!mh) return NULL;
     if (mh->magic != MH_MAGIC_64) return NULL;
+
+    size_t isz = image_size(mh);
+    if (isz == 0) return NULL;
 
     uintptr_t base = (uintptr_t)mh;
     struct load_command *lc = (struct load_command *)(base + sizeof(struct mach_header_64));
@@ -71,6 +95,11 @@ static void *lookup_in_image(const struct mach_header *mh, intptr_t slide, const
     for (uint32_t i = 0; i < ncmds; i++) {
         if (lc->cmd == LC_SYMTAB) {
             struct symtab_command *st = (struct symtab_command *)lc;
+            /* ★ 越界校验：很多系统镜像（含 dyld 共享缓存）符号表不完整，
+             *   不校验会读到镜像外直接闪退 */
+            if (st->symoff == 0 || st->stroff == 0) return NULL;
+            if ((size_t)st->symoff + (size_t)st->nsyms * sizeof(struct nlist_64) > isz) return NULL;
+            if ((size_t)st->stroff + (size_t)st->strsize > isz) return NULL;
             struct nlist_64 *syms = (struct nlist_64 *)(base + st->symoff);
             char *strtab = (char *)(base + st->stroff);
             for (uint32_t s = 0; s < st->nsyms; s++) {
@@ -431,10 +460,16 @@ static volatile int g_poll_run = 0;
 static void *poll_thread_main(void *arg) {
     poll_arg_t *pa = (poll_arg_t *)arg;
     if (nebula_il2cpp_init() != 0) return NULL;
-    /* 等游戏 IL2CPP 起来 */
+
+    /* ★ 先静置几秒：Unity 有自己的初始化顺序，太早碰 il2cpp 会闪退 */
+    sleep_ms(5000);
     for (int i = 0; i < 300 && !nebula_il2cpp_ready(); i++) sleep_ms(200);
     if (!nebula_il2cpp_ready()) { nlog("poll: 等待 IL2CPP 就绪超时"); return NULL; }
     nlog("poll: IL2CPP 已就绪，开始轮询（每 %d ms）", pa->interval_ms);
+
+    /* 就绪后才做自查 dump（类名/字段名/偏移），此时调 IL2CPP 才安全 */
+    static const char *hints[] = { "PlayerControl", "GameManager", "ShipStatus", "GameData" };
+    nebula_il2cpp_dump_report(NULL, hints, 4);
 
     /* 等级 2：安装指针替换型 hook（无 JIT / 无 Frida），失败则继续纯轮询 */
     int tries = 0, installed = -1;
