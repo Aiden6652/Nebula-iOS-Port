@@ -15,6 +15,8 @@ jobs:
         run: cd src/net && make test
       - name: Build & run local-core tests
         run: cd src/core && make test
+      - name: Build & run il2cpp bridge tests
+        run: cd src/il2cpp && make test
       - name: Run Python reference simulators
         run: |
           python3 tools/sim/protocol_sim.py

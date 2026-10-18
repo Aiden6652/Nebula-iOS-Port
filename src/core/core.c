@@ -225,6 +225,17 @@ int nebula_core_resolve_meeting(nebula_game_t *g)
     return ejected;
 }
 
+void nebula_core_tick(nebula_game_t *g)
+{
+    if (!g || g->phase == PHASE_OVER) return;
+    for (int i = 0; i < g->n_players; i++) {
+        nebula_player_t *p = &g->players[i];
+        if (p->kill_cd > 0) p->kill_cd--;
+        if (p->vent_cd > 0) p->vent_cd--;
+    }
+    if (g->phase == PHASE_PLAY) nebula_core_check_win(g);
+}
+
 void nebula_core_check_win(nebula_game_t *g)
 {
     if (!g || g->phase == PHASE_OVER) return;

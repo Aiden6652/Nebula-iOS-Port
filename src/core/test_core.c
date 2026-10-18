@@ -158,6 +158,19 @@ int main(void)
     CHECK(nebula_core_find(&g,2)->alive==1, "招募不致死");
     CHECK(g.phase==PHASE_OVER && g.winner==WIN_JACKAL, "豺狼方压过其余方 → 豺狼胜");
 
+    /* ===== 每帧 tick：冷却递减 ===== */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 3, ROLE_IMPOSTOR);
+    nebula_core_add_player(&g, 2, ROLE_CREW);
+    nebula_core_add_player(&g, 4, ROLE_CREW);
+    nebula_core_add_player(&g, 5, ROLE_CREW);
+    nebula_core_use_ability(&g, 3, ABILITY_KILL, 2, 0, 0, 1);
+    CHECK(nebula_core_find(&g,3)->kill_cd==30, "击杀后进入冷却 30");
+    nebula_core_tick(&g);
+    CHECK(nebula_core_find(&g,3)->kill_cd==29, "tick 一次冷却 -1");
+    for (int i=0;i<29;i++) nebula_core_tick(&g);
+    CHECK(nebula_core_find(&g,3)->kill_cd==0, "冷却递减到 0");
+
     printf("\n%s (%d failures)\n", failures==0 ? "ALL PASS" : "HAS FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

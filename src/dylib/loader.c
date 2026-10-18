@@ -13,6 +13,8 @@
 #include "../net/net_layer.h"
 #include "../net/protocol.h"
 #include "../core/core.h"
+#include "../il2cpp/bridge.h"
+#include "../il2cpp/hook.h"
 
 /* ===== 简易日志 ===== */
 static void port_log(const char *msg) {
@@ -89,7 +91,7 @@ void nebula_port_hook_setup(void) {
      *       例如 PlayerControl.FixedUpdate / GameManager.Update */
 }
 
-/* ===== 初始化自洽网络层 + 本地内核 ===== */
+/* ===== 自洽网络层 + 本地内核 ===== */
 void nebula_port_net_init(void) {
     nebula_core_init(&g_game);
     nebula_core_set_action_cb(on_local_action);   /* 本地动作 → 广播 */
@@ -102,11 +104,30 @@ void nebula_port_net_init(void) {
 /* ===== 供 Frida/JS 桥接：返回本地游戏实例指针 ===== */
 nebula_game_t *nebula_get_game(void) { return &g_game; }
 
+/* ===== 无 Frida 的游戏桥接：dylib 自己解析 libil2cpp 并轮询生效 =====
+ * 不再依赖 Frida Gadget（用户环境没有），也不需要越狱；
+ * 只读/写游戏对象字段与调用原版方法，不需要 JIT。 */
+/* ===== 每帧回调：由 Update hook 调用，驱动本地引擎推进 ===== */
+static void nebula_port_tick(void) {
+    nebula_core_tick(&g_game);
+}
+
+/* 无 Frida 的游戏桥接：dylib 自己解析 libil2cpp 并轮询生效 */
+void nebula_port_bridge_start(void) {
+    static const char *hints[] = { "PlayerControl", "GameManager", "ShipStatus", "GameData" };
+    nebula_il2cpp_dump_report(NULL, hints, 4);
+    /* 注册每帧要做的事：Update hook 成功后会每帧调用它 */
+    nebula_hook_set_tick(nebula_port_tick);
+    /* 启动后台轮询；其内部的poll线程在 IL2CPP 就绪后会自动安装 Update hook */
+    nebula_il2cpp_start_poll(500);
+}
+
 /* ===== dylib 入口：dyld 加载阶段自动执行 ===== */
 __attribute__((constructor))
 static void loader_entry(void) {
     nebula_port_init();
     nebula_port_net_init();
     nebula_port_hook_setup();
+    nebula_port_bridge_start();
     port_log("dylib loaded");
 }

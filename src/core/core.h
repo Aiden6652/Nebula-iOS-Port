@@ -111,6 +111,9 @@ int  nebula_core_resolve_meeting(nebula_game_t *g);
 
 void nebula_core_check_win(nebula_game_t *g);
 
+/* 每帧推进：冷却递减等随时间变化的状态。由 Update hook 每帧调用。 */
+void nebula_core_tick(nebula_game_t *g);
+
 /* 修饰 */
 void nebula_core_add_modifier(nebula_game_t *g, uint32_t net_id, uint32_t mod);
 int  nebula_core_has_modifier(nebula_player_t *p, uint32_t mod);
