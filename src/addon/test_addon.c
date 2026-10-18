@@ -4,6 +4,7 @@
  */
 
 #include "addon.h"
+#include "../core/roles.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,14 @@ int main(int argc, char **argv) {
     CHECK(nebula_addon_count() >= 0, "插件计数可用");
     CHECK(nebula_addon_name(0) != NULL, "可取插件名");
     CHECK(nebula_addon_name(999) == NULL, "越界取插件名返回 NULL");
+
+    /* 5.5) 官方职业表：内置中文应直接用官方名 */
+    CHECK(nebula_role_count() == 77, "官方职业共 77 个");
+    CHECK(strcmp(nebula_lang_get("ROLE_JACKAL"), "豺狼") == 0, "官方名：豺狼");
+    CHECK(strcmp(nebula_lang_get("ROLE_SHERIFF"), "警长") == 0, "官方名：警长");
+    CHECK(strcmp(nebula_lang_get("ROLE_ARSONIST"), "纵火犯") == 0, "官方名：纵火犯");
+    CHECK(strcmp(nebula_lang_get("ROLE_NECROMANCER"), "死灵法师") == 0, "官方名：死灵法师");
+    CHECK(nebula_role_team(nebula_role_id_at(0)) >= 0, "阵营查询可用");
 
     /* 6) 可选：传入真实插件路径做实测（zip 或文件夹） */
     if (argc > 1) {

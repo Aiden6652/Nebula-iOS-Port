@@ -14,6 +14,7 @@
  */
 
 #include "addon.h"
+#include "../core/roles.h"      /* 官方职业表（中文名） */
 #include "../il2cpp/bridge.h"   /* 复用 nebula_log */
 
 #include <dirent.h>
@@ -52,6 +53,14 @@ static const char *BUILTIN_ZH[][2] = {
 
 static void load_builtin_zh(void)
 {
+    /* ① 先用官方职业表铺满 77 个职业的官方中文名（比手写准确） */
+    for (int i = 0; i < nebula_role_count(); i++) {
+        int id = nebula_role_id_at(i);
+        const char *k = nebula_role_enum_name(id);
+        const char *n = nebula_role_name(id);
+        if (k && k[0] && n && n[0]) nebula_lang_set(k, n);
+    }
+    /* ② 再补 UI 文案与几个非官方/移植职业 */
     for (int i = 0; BUILTIN_ZH[i][0]; i++)
         nebula_lang_set(BUILTIN_ZH[i][0], BUILTIN_ZH[i][1]);
 }
