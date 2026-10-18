@@ -32,6 +32,7 @@ void nebula_core_add_player(nebula_game_t *g, uint32_t net_id, nebula_role_t rol
     p->modifiers = MOD_NONE;
     p->shielded = 0;
     p->revealed = 0;
+    p->recruited = 0;
 }
 
 nebula_player_t *nebula_core_find(nebula_game_t *g, uint32_t net_id)
@@ -63,7 +64,15 @@ static void do_kill(nebula_game_t *g, uint32_t caster, uint32_t target)
     nebula_player_t *t = nebula_core_find(g, target);
     if (!c || !t || !c->alive || !t->alive) return;
 
-    if (c->role == ROLE_IMPOSTOR) {
+    /* 易怒者：被攻击时反杀凶手（目标本人安然无恙） */
+    if (t->role == ROLE_AVENGER) {
+        apply_lethal(c);
+        return;
+    }
+
+    if (c->role == ROLE_IMPOSTOR
+        || c->role == ROLE_JACKAL
+        || (c->role == ROLE_SIDEKICK && c->recruited)) {
         apply_lethal(t);
     } else if (c->role == ROLE_SHERIFF) {
         if (t->role == ROLE_IMPOSTOR) apply_lethal(t);
@@ -116,6 +125,25 @@ int nebula_core_use_ability(nebula_game_t *g, uint32_t caster, uint16_t ability,
         nebula_player_t *t = nebula_core_find(g, target);
         if (!c || !t || c->role != ROLE_BODYGUARD || !t->alive) return -1;
         t->shielded = 1;
+        break;
+    }
+    case ABILITY_BUBBLE: {
+        /* 泡泡枪手：远程击杀且隐藏尸体 → 不触发 BAIT 报告 */
+        nebula_player_t *c = nebula_core_find(g, caster);
+        nebula_player_t *t = nebula_core_find(g, target);
+        if (!c || !t || c->role != ROLE_BUBBLEGUNNER || !c->alive || !t->alive) return -1;
+        apply_lethal(t);        /* 与 do_kill 不同：刻意不调 call_meeting，故 BAIT 不报告 */
+        c->kill_cd = 40;
+        break;
+    }
+    case ABILITY_RECRUIT: {
+        /* 豺狼招募：把目标变为跟班（同一阵营） */
+        nebula_player_t *c = nebula_core_find(g, caster);
+        nebula_player_t *t = nebula_core_find(g, target);
+        if (!c || !t || c->role != ROLE_JACKAL || !t->alive) return -1;
+        if (t->role == ROLE_JACKAL || (t->role == ROLE_SIDEKICK && t->recruited)) return -1;
+        t->role = ROLE_SIDEKICK;
+        t->recruited = 1;
         break;
     }
     case ABILITY_REVEAL: {
@@ -188,7 +216,7 @@ int nebula_core_resolve_meeting(nebula_game_t *g)
         g->players[ej].alive = 0;
         /* 小丑被驱逐 → 小丑胜 */
         if (g->players[ej].role == ROLE_JESTER) {
-            g->phase = PHASE_OVER; g->winner = ROLE_JESTER; return ejected;
+            g->phase = PHASE_OVER; g->winner = WIN_JESTER; return ejected;
         }
     }
     g->phase = PHASE_PLAY;
@@ -200,16 +228,32 @@ int nebula_core_resolve_meeting(nebula_game_t *g)
 void nebula_core_check_win(nebula_game_t *g)
 {
     if (!g || g->phase == PHASE_OVER) return;
-    int alive_imp = 0, alive_other = 0;
+    int alive_imp = 0, alive_other = 0, alive_jackal = 0;
     for (int i = 0; i < g->n_players; i++) {
-        if (!g->players[i].alive) continue;
-        if (g->players[i].role == ROLE_IMPOSTOR || g->players[i].role == ROLE_SNIPER) alive_imp++;
-        else if (g->players[i].role == ROLE_JESTER) continue;    /* 中立不计 */
-        else if (g->players[i].role == ROLE_MADMATE) continue;   /* 狂信者不计入船员，与内鬼同胜 */
-        else alive_other++;
+        nebula_player_t *p = &g->players[i];
+        if (!p->alive) continue;
+        if (p->role == ROLE_IMPOSTOR || p->role == ROLE_SNIPER
+            || p->role == ROLE_BUBBLEGUNNER) {
+            alive_imp++;                                    /* 内鬼阵营 */
+        } else if (p->role == ROLE_JACKAL
+                   || (p->role == ROLE_SIDEKICK && p->recruited)) {
+            alive_jackal++;                                 /* 豺狼阵营（中立） */
+        } else if (p->role == ROLE_JESTER) {
+            continue;                                       /* 中立方不计入好人 */
+        } else if (p->role == ROLE_MADMATE) {
+            continue;                                       /* 狂信者不计入船员，挂改阵营判定 */
+        } else {
+            alive_other++;                                  /* 好人阵营 */
+        }
     }
-    if (alive_imp == 0) { g->phase = PHASE_OVER; g->winner = 1; }       /* 内鬼全灭→船员胜 */
-    else if (alive_imp >= alive_other) { g->phase = PHASE_OVER; g->winner = 2; } /* 内鬼≥好人→内鬼胜 */
+    /* 豺狼方压过其余方 → 豺狼胜（优先判定，避免被 Crew 提前结算） */
+    if (alive_jackal > 0 && alive_jackal >= (alive_imp + alive_other)) {
+        g->phase = PHASE_OVER; g->winner = WIN_JACKAL; return;
+    }
+    if (alive_imp == 0) { g->phase = PHASE_OVER; g->winner = WIN_CREW; return; }
+    if (alive_imp >= alive_other && alive_jackal == 0) {
+        g->phase = PHASE_OVER; g->winner = WIN_IMPOSTOR; return;
+    }
 }
 
 void nebula_core_add_modifier(nebula_game_t *g, uint32_t net_id, uint32_t mod)

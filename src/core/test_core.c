@@ -129,6 +129,35 @@ int main(void)
     nebula_core_use_ability(&g, 3, ABILITY_KILL, 2, 0, 0, 1);  /* 内鬼杀掉唯一船员 */
     CHECK(g.phase==PHASE_OVER && g.winner==2, "狂信者不计入船员 → 内鬼胜（狂信者随胜）");
 
+    /* ===== 新角色：易怒者（被攻击反杀凶手） ===== */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 3, ROLE_IMPOSTOR);
+    nebula_core_add_player(&g, 9, ROLE_AVENGER);
+    nebula_core_use_ability(&g, 3, ABILITY_KILL, 9, 0, 0, 1);
+    CHECK(nebula_core_find(&g,9)->alive==1, "易怒者未被杀死（安然无恙）");
+    CHECK(nebula_core_find(&g,3)->alive==0, "攻击者被反杀");
+
+    /* ===== 新角色：泡泡枪手（隐藏尸体，不触发 BAIT 报告） ===== */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 10, ROLE_BUBBLEGUNNER);
+    nebula_core_add_player(&g, 2, ROLE_CREW);       /* 带 BAIT 的受害者 */
+    nebula_core_add_player(&g, 12, ROLE_CREW);      /* 其余船员，保证局未结束 */
+    nebula_core_add_player(&g, 13, ROLE_CREW);
+    nebula_core_add_modifier(&g, 2, MOD_BAIT);
+    nebula_core_use_ability(&g, 10, ABILITY_BUBBLE, 2, 0, 0, 1);
+    CHECK(nebula_core_find(&g,2)->alive==0, "泡泡击杀致死");
+    CHECK(g.phase==PHASE_PLAY, "泡泡隐藏尸体 → 未触发 BAIT 报告（局仍进行）");
+
+    /* ===== 新角色：豺狼 + 跟班 ===== */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 11, ROLE_JACKAL);
+    nebula_core_add_player(&g, 2, ROLE_CREW);
+    nebula_core_use_ability(&g, 11, ABILITY_RECRUIT, 2, 0, 0, 1);
+    CHECK(nebula_core_find(&g,2)->role==ROLE_SIDEKICK
+          && nebula_core_find(&g,2)->recruited==1, "豺狼招募成功 → 目标成为跟班");
+    CHECK(nebula_core_find(&g,2)->alive==1, "招募不致死");
+    CHECK(g.phase==PHASE_OVER && g.winner==WIN_JACKAL, "豺狼方压过其余方 → 豺狼胜");
+
     printf("\n%s (%d failures)\n", failures==0 ? "ALL PASS" : "HAS FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

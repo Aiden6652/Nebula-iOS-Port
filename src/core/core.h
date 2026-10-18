@@ -25,7 +25,18 @@ typedef enum {
     ROLE_MADMATE   = 6,   /* 狂信者：不计入船员数，与内鬼同胜 */
     ROLE_BODYGUARD = 7,   /* 保镖：船员，可为目标加护盾（免疫一次致死） */
     ROLE_SNIPER    = 8,   /* 狙击手：内鬼阵营，可远程击杀且无反伤 */
+    ROLE_AVENGER   = 9,   /* 易怒者：被攻击时反杀凶手 */
+    ROLE_BUBBLEGUNNER = 10, /* 泡泡枪手：内鬼阵营，泡泡击杀隐藏尸体（不触发报告） */
+    ROLE_JACKAL    = 11,  /* 豺狼：中立阵营，可击杀，豺狼方≥其余方即胜 */
+    ROLE_SIDEKICK  = 12,  /* 跟班：被豺狼招募前算船员，招募后入豺狼阵营 */
 } nebula_role_t;
+
+/* 胜负方代码 */
+#define WIN_NONE     0
+#define WIN_CREW     1
+#define WIN_IMPOSTOR 2
+#define WIN_JACKAL   3
+#define WIN_JESTER   4
 
 /* ===================== 技能 / 动作 ID =====================
  * 与协议 RPC_ABILITY_USE 的 ability 字段对齐；一个 RPC 承载所有动作。 */
@@ -38,6 +49,8 @@ typedef enum {
 #define ABILITY_REVEAL   7   /* 识破：caster 识破 target 阵营 */
 #define ABILITY_SHIELD   8   /* 护盾：caster 给 target 加护盾 */
 #define ABILITY_SNIPE    9   /* 狙杀：caster 远程击杀 target（无反伤） */
+#define ABILITY_BUBBLE   10  /* 泡泡击杀：caster 远程击杀且隐藏尸体（不触发 BAIT 报告） */
+#define ABILITY_RECRUIT  11  /* 招募：豺狼把 target 变为自己的跟班 */
 
 /* ===================== 修饰（Auxiliary，位掩码） ===================== */
 #define MOD_NONE     0x0000
@@ -65,6 +78,7 @@ typedef struct {
     uint32_t      modifiers;   /* 生效中的修饰位掩码 */
     int           shielded;    /* 护盾：免疫一次致死 */
     int           revealed;    /* 阵营已被识破 */
+    int           recruited;   /* 是否已被豺狼招募为跟班 */
 } nebula_player_t;
 
 typedef struct {
