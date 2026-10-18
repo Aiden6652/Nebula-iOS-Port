@@ -21,6 +21,10 @@ typedef enum {
     ROLE_SHERIFF   = 2,   /* 警长：可枪杀，误杀船员则自己死 */
     ROLE_ENGINEER  = 3,   /* 工程师：船员，可短暂用通风管 */
     ROLE_JESTER    = 4,   /* 小丑：被投票驱逐即胜（中立） */
+    ROLE_SEER      = 5,   /* 占卜师：船员，可识破目标阵营 */
+    ROLE_MADMATE   = 6,   /* 狂信者：不计入船员数，与内鬼同胜 */
+    ROLE_BODYGUARD = 7,   /* 保镖：船员，可为目标加护盾（免疫一次致死） */
+    ROLE_SNIPER    = 8,   /* 狙击手：内鬼阵营，可远程击杀且无反伤 */
 } nebula_role_t;
 
 /* ===================== 技能 / 动作 ID =====================
@@ -31,6 +35,9 @@ typedef enum {
 #define ABILITY_VOTE     4   /* 投票：caster 投给 target */
 #define ABILITY_TASK     5   /* 完成任务：caster，target=任务id */
 #define ABILITY_SABOTAGE 6   /* 破坏：caster，target=破坏类型 */
+#define ABILITY_REVEAL   7   /* 识破：caster 识破 target 阵营 */
+#define ABILITY_SHIELD   8   /* 护盾：caster 给 target 加护盾 */
+#define ABILITY_SNIPE    9   /* 狙杀：caster 远程击杀 target（无反伤） */
 
 /* ===================== 修饰（Auxiliary，位掩码） ===================== */
 #define MOD_NONE     0x0000
@@ -56,6 +63,8 @@ typedef struct {
     int           voted;       /* 本次会议是否已投 */
     uint32_t      vote_target; /* 投给谁 */
     uint32_t      modifiers;   /* 生效中的修饰位掩码 */
+    int           shielded;    /* 护盾：免疫一次致死 */
+    int           revealed;    /* 阵营已被识破 */
 } nebula_player_t;
 
 typedef struct {

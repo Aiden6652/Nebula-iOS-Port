@@ -95,6 +95,40 @@ int main(void)
     nebula_core_use_ability(&g, 1, ABILITY_KILL, 3, 0, 0, 0);
     CHECK(g_bc==0, "网络动作不二次广播（防回环）");
 
+    /* ===== 新角色：狙击手 ===== */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 6, ROLE_SNIPER);
+    nebula_core_add_player(&g, 2, ROLE_CREW);
+    nebula_core_use_ability(&g, 6, ABILITY_SNIPE, 2, 0, 0, 1);
+    CHECK(nebula_core_find(&g,2)->alive==0, "狙杀：目标死亡且无反伤");
+    CHECK(nebula_core_find(&g,6)->alive==1, "狙击手存活（无反伤）");
+
+    /* ===== 新角色：保镖护盾 ===== */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 7, ROLE_BODYGUARD);
+    nebula_core_add_player(&g, 3, ROLE_IMPOSTOR);
+    nebula_core_add_player(&g, 2, ROLE_CREW);
+    nebula_core_use_ability(&g, 7, ABILITY_SHIELD, 2, 0, 0, 1);
+    CHECK(nebula_core_find(&g,2)->shielded==1, "保镖已给目标加护盾");
+    nebula_core_use_ability(&g, 3, ABILITY_KILL, 2, 0, 0, 1);
+    CHECK(nebula_core_find(&g,2)->alive==1, "护盾吸收第一次致死");
+    CHECK(nebula_core_find(&g,2)->shielded==0, "护盾已消耗");
+
+    /* ===== 新角色：占卜师识破 ===== */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 5, ROLE_SEER);
+    nebula_core_add_player(&g, 3, ROLE_IMPOSTOR);
+    nebula_core_use_ability(&g, 5, ABILITY_REVEAL, 3, 0, 0, 1);
+    CHECK(nebula_core_find(&g,3)->revealed==1, "占卜师识破目标阵营");
+
+    /* ===== 新角色：狂信者不计入船员，与内鬼同胜 ===== */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 3, ROLE_IMPOSTOR);
+    nebula_core_add_player(&g, 6, ROLE_MADMATE);
+    nebula_core_add_player(&g, 2, ROLE_CREW);
+    nebula_core_use_ability(&g, 3, ABILITY_KILL, 2, 0, 0, 1);  /* 内鬼杀掉唯一船员 */
+    CHECK(g.phase==PHASE_OVER && g.winner==2, "狂信者不计入船员 → 内鬼胜（狂信者随胜）");
+
     printf("\n%s (%d failures)\n", failures==0 ? "ALL PASS" : "HAS FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

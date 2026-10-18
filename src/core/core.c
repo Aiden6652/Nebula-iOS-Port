@@ -30,6 +30,8 @@ void nebula_core_add_player(nebula_game_t *g, uint32_t net_id, nebula_role_t rol
     p->voted  = 0;
     p->vote_target = 0;
     p->modifiers = MOD_NONE;
+    p->shielded = 0;
+    p->revealed = 0;
 }
 
 nebula_player_t *nebula_core_find(nebula_game_t *g, uint32_t net_id)
@@ -46,6 +48,15 @@ static void broadcast(uint32_t caster, uint16_t ability, uint32_t target, float 
     if (g_action_cb) g_action_cb(caster, ability, target, x, y);
 }
 
+/* 让 target 承受一次致死效果；有护盾则吸收并返回 0（未致死） */
+static int apply_lethal(nebula_player_t *t)
+{
+    if (!t) return 0;
+    if (t->shielded) { t->shielded = 0; return 0; }  /* 护盾吸收 */
+    t->alive = 0;
+    return 1;                                        /* 已致死 */
+}
+
 static void do_kill(nebula_game_t *g, uint32_t caster, uint32_t target)
 {
     nebula_player_t *c = nebula_core_find(g, caster);
@@ -53,12 +64,12 @@ static void do_kill(nebula_game_t *g, uint32_t caster, uint32_t target)
     if (!c || !t || !c->alive || !t->alive) return;
 
     if (c->role == ROLE_IMPOSTOR) {
-        t->alive = 0;
+        apply_lethal(t);
     } else if (c->role == ROLE_SHERIFF) {
-        if (t->role == ROLE_IMPOSTOR) t->alive = 0;
+        if (t->role == ROLE_IMPOSTOR) apply_lethal(t);
         else c->alive = 0;                 /* 误杀船员，自己死 */
     } else {
-        return;                            /* 船员/工程师无击杀 */
+        return;                            /* 船员/工程师/占卜师等无击杀 */
     }
     c->kill_cd = 30;
 
@@ -90,6 +101,31 @@ int nebula_core_use_ability(nebula_game_t *g, uint32_t caster, uint16_t ability,
         if (!(nebula_core_find(g, caster) &&
               nebula_core_find(g, caster)->role == ROLE_IMPOSTOR)) return -1;
         break;
+    case ABILITY_SNIPE: {
+        /* 狙击手：远程击杀，无反伤 */
+        nebula_player_t *c = nebula_core_find(g, caster);
+        nebula_player_t *t = nebula_core_find(g, target);
+        if (!c || !t || c->role != ROLE_SNIPER || !c->alive || !t->alive) return -1;
+        apply_lethal(t);
+        c->kill_cd = 45;
+        break;
+    }
+    case ABILITY_SHIELD: {
+        /* 保镖：给目标加护盾 */
+        nebula_player_t *c = nebula_core_find(g, caster);
+        nebula_player_t *t = nebula_core_find(g, target);
+        if (!c || !t || c->role != ROLE_BODYGUARD || !t->alive) return -1;
+        t->shielded = 1;
+        break;
+    }
+    case ABILITY_REVEAL: {
+        /* 占卜师：识破目标阵营 */
+        nebula_player_t *c = nebula_core_find(g, caster);
+        nebula_player_t *t = nebula_core_find(g, target);
+        if (!c || !t || c->role != ROLE_SEER) return -1;
+        t->revealed = 1;
+        break;
+    }
     case ABILITY_TASK: {
         nebula_player_t *c = nebula_core_find(g, caster);
         if (!c || !c->alive) return -1;     /* 任务只由存活者完成 */
@@ -167,8 +203,10 @@ void nebula_core_check_win(nebula_game_t *g)
     int alive_imp = 0, alive_other = 0;
     for (int i = 0; i < g->n_players; i++) {
         if (!g->players[i].alive) continue;
-        if (g->players[i].role == ROLE_IMPOSTOR) alive_imp++;
-        else if (g->players[i].role != ROLE_JESTER) alive_other++;
+        if (g->players[i].role == ROLE_IMPOSTOR || g->players[i].role == ROLE_SNIPER) alive_imp++;
+        else if (g->players[i].role == ROLE_JESTER) continue;    /* 中立不计 */
+        else if (g->players[i].role == ROLE_MADMATE) continue;   /* 狂信者不计入船员，与内鬼同胜 */
+        else alive_other++;
     }
     if (alive_imp == 0) { g->phase = PHASE_OVER; g->winner = 1; }       /* 内鬼全灭→船员胜 */
     else if (alive_imp >= alive_other) { g->phase = PHASE_OVER; g->winner = 2; } /* 内鬼≥好人→内鬼胜 */
