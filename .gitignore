@@ -11,3 +11,8 @@ test_core
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 上传 IPA 绝不入库
+*.ipa
+tools/uploader/inbox/
+tools/uploader/__pycache__/

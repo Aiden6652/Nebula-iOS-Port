@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IPA 上传 · Nebula 体检</title>
+<style>
+  :root{ --bg:#0f1115; --card:#171a21; --bd:#252a33; --fg:#e6e9ef;
+         --dim:#8b93a1; --ok:#3fb950; --ac:#3b82f6; --warn:#d29922; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;}
+  .wrap{max-width:760px;margin:40px auto;padding:24px}
+  h1{font-size:20px;margin:0 0 6px}
+  .sub{color:var(--dim);margin-bottom:20px;font-size:13px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:20px;margin-bottom:16px}
+  #drop{border:2px dashed var(--bd);border-radius:12px;padding:36px;text-align:center;
+        color:var(--dim);cursor:pointer;transition:.15s}
+  #drop.over{border-color:var(--ac);color:var(--ac);background:#10151f}
+  .bar{height:10px;background:#0c0e13;border-radius:6px;overflow:hidden;margin:10px 0}
+  .bar>i{display:block;height:100%;width:0;background:var(--ac);transition:width .12s linear}
+  .grid{display:flex;gap:18px;flex-wrap:wrap;color:var(--dim);font-size:12px;margin-top:6px}
+  .grid b{color:var(--fg);font-weight:600}
+  button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:9px 18px;
+         font-size:14px;cursor:pointer;margin-right:8px}
+  button:disabled{background:#39404d;color:#7c8391;cursor:not-allowed}
+  button.ghost{background:transparent;border:1px solid var(--bd);color:var(--fg)}
+  pre{background:#0c0e13;border:1px solid var(--bd);border-radius:8px;padding:12px;
+      overflow:auto;font-size:12px;color:#c8d0dc;max-height:340px;margin:0}
+  .tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:12px}
+  .ok{background:rgba(63,185,80,.16);color:var(--ok)}
+  .warn{background:rgba(210,153,34,.16);color:var(--warn)}
+  .bad{background:rgba(248,81,73,.16);color:#f85149}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>上传 IPA · 自动体检</h1>
+  <div class="sub">1 MB 一片上传，带实时进度。传完会自动检查：是否脱壳加密、架构是否 arm64e、<code>il2cpp_*</code> 符号是否还在。<b>文件只落到本地沙箱，不会外传。</b></div>
+
+  <div class="card">
+    <div id="drop">点此选择 IPA，或把文件拖进来</div>
+    <input type="file" id="file" accept=".ipa" style="display:none">
+    <div id="meta" style="margin-top:14px;display:none">
+      <div><b id="fname"></b></div>
+      <div class="grid">
+        <span>大小：<b id="fsize"></b></span>
+        <span>分片：<b id="fchunks"></b> × 1 MB</span>
+        <span>已传：<b id="fdone">0</b> 片</span>
+      </div>
+      <div class="bar"><i id="bar"></i></div>
+      <div class="grid">
+        <span>速度：<b id="spd">-</b></span>
+        <span>剩余：<b id="eta">-</b></span>
+        <span id="pct">0%</span>
+      </div>
+      <div style="margin-top:14px">
+        <button id="start">开始上传</button>
+        <button id="pause" class="ghost" disabled>暂停</button>
+        <button id="resume" class="ghost" disabled>继续</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="resultCard" style="display:none">
+    <div style="margin-bottom:10px"><b>体检结果</b></div>
+    <pre id="report"></pre>
+  </div>
+</div>
+
+<script>
+const CHUNK = 1024 * 1024;                 // 1 MB 一片
+const API = location.origin;
+let file = null, sid = null, chunks = 0;
+let sent = new Set(), paused = false, running = false;
+let tStart = 0, tSentBytes = 0;
+
+const $ = id => document.getElementById(id);
+const fmtSize = b => (b/1048576).toFixed(1) + ' MB';
+
+$('drop').onclick = () => $('file').click();
+$('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('over'); };
+$('drop').ondragleave = () => $('drop').classList.remove('over');
+$('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over'); pick(e.dataTransfer.files[0]); };
+$('file').onchange = e => pick(e.target.files[0]);
+
+function pick(f){
+  if(!f) return;
+  file = f; chunks = Math.ceil(f.size / CHUNK);
+  sid = 's' + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+  sent = new Set();
+  $('meta').style.display = 'block';
+  $('fname').textContent = f.name;
+  $('fsize').textContent = fmtSize(f.size);
+  $('fchunks').textContent = chunks;
+  $('bar').style.width = '0%'; $('pct').textContent = '0%';
+  $('start').disabled = false;
+}
+
+function progress(doneBytes){
+  const pct = Math.min(100, (doneBytes / file.size) * 100);
+  $('bar').style.width = pct + '%';
+  $('pct').textContent = pct.toFixed(1) + '%';
+  $('fdone').textContent = sent.size;
+  const el = (Date.now() - tStart) / 1000;
+  if(el > 0.5){
+    const spd = tSentBytes / el;
+    $('spd').textContent = (spd/1048576).toFixed(1) + ' MB/s';
+    const left = (file.size - tSentBytes) / (spd || 1);
+    $('eta').textContent = left > 1 ? Math.round(left) + ' 秒' : '-';
+  }
+}
+
+function putChunk(i){
+  return new Promise((res, rej) => {
+    const s = i * CHUNK, e = Math.min(file.size, s + CHUNK);
+    const blob = file.slice(s, e);
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', `${API}/api/chunk?sid=${sid}&idx=${i}`);
+    xhr.upload.onprogress = ev => {
+      if(ev.lengthComputable) progress(i * CHUNK + ev.loaded);
+    };
+    xhr.onload = () => xhr.status === 200 ? res() : rej(new Error('HTTP ' + xhr.status));
+    xhr.onerror = () => rej(new Error('网络错误'));
+    xhr.send(blob);
+  });
+}
+
+async function run(){
+  if(!file || running) return;
+  running = true; paused = false;
+  $('start').disabled = true; $('pause').disabled = false;
+
+  if(tStart === 0){ tStart = Date.now(); tSentBytes = 0; }
+
+  while(sent.size < chunks){
+    if(paused) break;
+    for(let i = 0; i < chunks; i++){
+      if(paused) break;
+      if(sent.has(i)) continue;
+      try{
+        await putChunk(i);
+        sent.add(i);
+        tSentBytes += Math.min(CHUNK, file.size - i * CHUNK);
+        progress(tSentBytes);
+      }catch(err){
+        running = false; $('pause').disabled = true; $('resume').disabled = false;
+        alert('第 ' + i + ' 片失败：' + err.message + '\n点【继续】可断点续传。');
+        return;
+      }
+    }
+    if(sent.size >= chunks) break;
+  }
+
+  if(sent.size >= chunks && !paused){
+    $('pause').disabled = true;
+    await finish();
+  }else{
+    running = false;
+    $('resume').disabled = false;
+  }
+}
+
+async function finish(){
+  try{
+    const r = await fetch(`${API}/api/complete?sid=${sid}&name=${encodeURIComponent(file.name)}`,
+                          {method:'POST'});
+    const rep = await r.json();
+    $('resultCard').style.display = 'block';
+    $('report').textContent = JSON.stringify(rep, null, 2);
+    if(rep.ok){
+      const mz = (rep.macho || []);
+      const stillEnc = mz.some(m => m.cryptid && m.cryptid !== 0);
+      const arm64e = mz.some(m => m.arch === 'arm64e');
+      const symOk = mz.some(m => (m.symbol_hits || {})['_il2cpp_domain_get'] > 0);
+      const notes = [];
+      notes.push(stillEnc ? '<span class="tag bad">仍加密=需先脱壳</span>'
+                          : '<span class="tag ok">已脱壳</span>');
+      notes.push(arm64e ? '<span class="tag warn">arm64e（PAC 风险↑）</span>'
+                        : '<span class="tag ok">arm64</span>');
+      notes.push(symOk ? '<span class="tag ok">il2cpp 符号存在</span>'
+                       : '<span class="tag bad">未见 il2cpp 符号</span>');
+      $('report').insertAdjacentHTML('beforebegin',
+        '<div style="margin-bottom:10px">' + notes.join(' ') + '</div>');
+    }
+  }catch(e){
+    alert('合并失败：' + e.message);
+  }
+}
+
+$('start').onclick = run;
+$('pause').onclick = () => { paused = true; $('pause').disabled = true; $('resume').disabled = false; };
+$('resume').onclick = () => { $('resume').disabled = true; paused = false; run(); };
+</script>
+</body>
+</html>

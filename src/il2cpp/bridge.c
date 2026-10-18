@@ -34,14 +34,83 @@ static void sleep_ms(int ms) {
     nanosleep(&ts, NULL);
 }
 
+/* ---------- 日志：syslog + 文件（文件可被 iTunes 文件共享取出，不需越狱） ---------- */
+void nebula_log(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+
+    openlog(NEBULA_LOG_TAG, LOG_PID | LOG_CONS, LOG_USER);
+    syslog(LOG_NOTICE, "%s", buf);
+
+    const char *home = getenv("HOME");
+    if (home) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/Documents/nebula_log.txt", home);
+        FILE *fp = fopen(path, "a");
+        if (fp) { fprintf(fp, "[Nebula-iOS] %s\n", buf); fclose(fp); }
+    }
+}
+
+/* ---------- 符号解析：dlsym 失败时，直接扫 Mach-O 静态符号表 ----------
+ * dlsym 只看【动态导出表】；新版本 Among Us 很可能把 il2cpp_* 从那里移除，
+ * 但静态符号仍在符号表里。这里直接解析 Mach-O 的 LC_SYMTAB 兜底。 */
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+
+static void *lookup_in_image(const struct mach_header *mh, intptr_t slide, const char *want) {
+    if (!mh) return NULL;
+    if (mh->magic != MH_MAGIC_64) return NULL;
+
+    uintptr_t base = (uintptr_t)mh;
+    struct load_command *lc = (struct load_command *)(base + sizeof(struct mach_header_64));
+    uint32_t ncmds = ((struct mach_header_64 *)mh)->ncmds;
+
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (lc->cmd == LC_SYMTAB) {
+            struct symtab_command *st = (struct symtab_command *)lc;
+            struct nlist_64 *syms = (struct nlist_64 *)(base + st->symoff);
+            char *strtab = (char *)(base + st->stroff);
+            for (uint32_t s = 0; s < st->nsyms; s++) {
+                uint32_t strx = syms[s].n_un.n_strx;
+                if (strx == 0) continue;
+                char *nm = strtab + strx;
+                if (nm[0] != '_') continue;              /* Apple 符号带下划线前缀 */
+                if (strcmp(nm + 1, want) == 0 && syms[s].n_value != 0) {
+                    return (void *)((uintptr_t)slide + (uintptr_t)syms[s].n_value);
+                }
+            }
+            return NULL;
+        }
+        lc = (struct load_command *)((uintptr_t)lc + lc->cmdsize);
+    }
+    return NULL;
+}
+
+static void *nebula_resolve_symbol(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+    /* 兜底：遍历所有已加载镜像（主程序 / UnityFramework 等）查静态符号表 */
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        void *r = lookup_in_image(_dyld_get_image_header(i),
+                                  _dyld_get_image_vmaddr_slide(i), name);
+        if (r) return r;
+    }
+    return NULL;
+}
+#else
+static void *nebula_resolve_symbol(const char *name) { return dlsym(RTLD_DEFAULT, name); }
+#endif
+
+
 static void nlog(const char *fmt, ...) {
     char buf[512];
     va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    openlog(NEBULA_LOG_TAG, LOG_PID | LOG_CONS, LOG_USER);
-    syslog(LOG_NOTICE, "%s", buf);
+    va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    nebula_log("%s", buf);   /* 统一走 syslog + 文件 */
 }
 
 /* ===================== libil2cpp API 函数指针 ===================== */
@@ -94,7 +163,7 @@ static int g_api_ok = 0;
 static int g_missing = 0;
 
 static void *sym(const char *name) {
-    void *p = dlsym(RTLD_DEFAULT, name);
+    void *p = nebula_resolve_symbol(name);
     if (!p) g_missing++;
     return p;
 }
@@ -131,8 +200,9 @@ int nebula_il2cpp_init(void) {
         !A.image_get_class_count || !A.image_get_class || !A.class_get_name ||
         !A.class_get_field_from_name || !A.field_get_offset || !A.field_get_type ||
         !A.type_get_name) {
-        nlog("init FAILED: 关键 il2cpp API 缺失（共缺 %d 个符号）。"
-             " 该 IPA 可能剥离了 il2cpp 导出符号，请把这行日志发我，我改用符号扫描方案。", g_missing);
+        nlog("init FAILED: 关键 il2cpp API 缺失（缺 %d 个）。已尝试【动态导出】+"
+             "【Mach-O 静态符号表】两条路都找不到。请把 Packages/Among Us.app/Mach-O 的"
+             "符号情况告诉我（越狱不可用的话，改用 UnityFramework 内部偏移定位）。", g_missing);
         return -1;
     }
     g_api_ok = 1;

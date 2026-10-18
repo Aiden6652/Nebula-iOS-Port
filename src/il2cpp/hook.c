@@ -48,8 +48,7 @@ int nebula_hook_enabled(void) {
 static void hlog(const char *fmt, ...) {
     char buf[512]; va_list ap;
     va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    openlog("Nebula-iOS", LOG_PID | LOG_CONS, LOG_USER);
-    syslog(LOG_NOTICE, "%s", buf);
+    nebula_log("%s", buf);   /* 统一走 syslog + $HOME/Documents/nebula_log.txt */
 }
 
 static void key_of(char *out, size_t n, const char *cls, const char *m) {

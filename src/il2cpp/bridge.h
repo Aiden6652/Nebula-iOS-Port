@@ -20,6 +20,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* 统一日志：同时写 syslog 与 $HOME/Documents/nebula_log.txt。
+   开启 iTunes/Finder 文件共享后无需越狱即可在电脑上取该文件。 */
+void nebula_log(const char *fmt, ...);
+
 /* 初始化：解析 libil2cpp 导出符号。0=成功；-1=有符号缺失（会打印缺失清单）。 */
 int  nebula_il2cpp_init(void);
 
