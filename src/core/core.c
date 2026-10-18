@@ -4,6 +4,7 @@
  */
 
 #include "core.h"
+#include <stdio.h>
 #include <string.h>
 
 static nebula_action_cb_t g_action_cb = NULL;
@@ -33,6 +34,8 @@ void nebula_core_add_player(nebula_game_t *g, uint32_t net_id, nebula_role_t rol
     p->shielded = 0;
     p->revealed = 0;
     p->recruited = 0;
+    p->vanished = 0;
+    p->vanish_cd = 0;
 }
 
 nebula_player_t *nebula_core_find(nebula_game_t *g, uint32_t net_id)
@@ -136,6 +139,15 @@ int nebula_core_use_ability(nebula_game_t *g, uint32_t caster, uint16_t ability,
         c->kill_cd = 40;
         break;
     }
+    case ABILITY_VANISH: {
+        /* 忍者隐身（移植自插件 Ninja.cs 的 vanishButton） */
+        nebula_player_t *c = nebula_core_find(g, caster);
+        if (!c || c->role != ROLE_NINJA || !c->alive) return -1;
+        if (c->vanish_cd > 0) return -1;               /* 冷却中不可用 */
+        c->vanished = 1;
+        c->vanish_cd = 30;                             /* 持续时长（tick 递减） */
+        break;
+    }
     case ABILITY_RECRUIT: {
         /* 豺狼招募：把目标变为跟班（同一阵营） */
         nebula_player_t *c = nebula_core_find(g, caster);
@@ -232,6 +244,11 @@ void nebula_core_tick(nebula_game_t *g)
         nebula_player_t *p = &g->players[i];
         if (p->kill_cd > 0) p->kill_cd--;
         if (p->vent_cd > 0) p->vent_cd--;
+        /* 隐身到时自动现形 */
+        if (p->vanished) {
+            if (p->vanish_cd > 0) p->vanish_cd--;
+            if (p->vanish_cd == 0) p->vanished = 0;
+        }
     }
     if (g->phase == PHASE_PLAY) nebula_core_check_win(g);
 }
@@ -244,12 +261,12 @@ void nebula_core_check_win(nebula_game_t *g)
         nebula_player_t *p = &g->players[i];
         if (!p->alive) continue;
         if (p->role == ROLE_IMPOSTOR || p->role == ROLE_SNIPER
-            || p->role == ROLE_BUBBLEGUNNER) {
-            alive_imp++;                                    /* 内鬼阵营 */
+            || p->role == ROLE_BUBBLEGUNNER || p->role == ROLE_NINJA) {
+            alive_imp++;                                    /* 内鬼阵营（忍者属此） */
         } else if (p->role == ROLE_JACKAL
                    || (p->role == ROLE_SIDEKICK && p->recruited)) {
             alive_jackal++;                                 /* 豺狼阵营（中立） */
-        } else if (p->role == ROLE_JESTER) {
+        } else if (p->role == ROLE_JESTER || p->role == ROLE_OUTSIDER) {
             continue;                                       /* 中立方不计入好人 */
         } else if (p->role == ROLE_MADMATE) {
             continue;                                       /* 狂信者不计入船员，挂改阵营判定 */
@@ -276,4 +293,26 @@ void nebula_core_add_modifier(nebula_game_t *g, uint32_t net_id, uint32_t mod)
 int nebula_core_has_modifier(nebula_player_t *p, uint32_t mod)
 {
     return p && (p->modifiers & mod);
+}
+
+/* 名字后缀：移植自 usefulmodi 插件的 DecorateNameConstantly */
+void nebula_core_decorate_name(const nebula_player_t *p, char *buf, size_t sz)
+{
+    if (!p || !buf || sz == 0) return;
+    struct { uint32_t mod; const char *suf; } tbl[] = {
+        { MOD_NEET,     " N" },
+        { MOD_STAR,     " ★" },
+        { MOD_LIGHTING, " L" },
+        { MOD_SUNGLASS, " S" },
+        { MOD_WATCHING, " W" },
+        { MOD_SENDING,  " E" },
+    };
+    size_t used = strlen(buf);
+    for (size_t i = 0; i < sizeof(tbl) / sizeof(tbl[0]); i++) {
+        if (p->modifiers & tbl[i].mod) {
+            snprintf(buf + used, sz - used, "%s", tbl[i].suf);
+            used += strlen(tbl[i].suf);
+            if (used + 1 >= sz) break;
+        }
+    }
 }

@@ -171,6 +171,45 @@ int main(void)
     for (int i=0;i<29;i++) nebula_core_tick(&g);
     CHECK(nebula_core_find(&g,3)->kill_cd==0, "冷却递减到 0");
 
+    /* ===== 移植自真实插件的职业/修饰 ===== */
+    /* 忍者隐身（Ninja.cs 的 vanishButton） */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 13, ROLE_NINJA);
+    nebula_core_add_player(&g, 2, ROLE_CREW);
+    nebula_core_add_player(&g, 4, ROLE_CREW);   /* 多几名船员，保证本局继续推进 */
+    nebula_core_add_player(&g, 5, ROLE_CREW);
+    CHECK(nebula_core_use_ability(&g, 13, ABILITY_VANISH, 0, 0, 0, 1) == 0, "忍者可隐身");
+    CHECK(nebula_core_find(&g,13)->vanished == 1, "隐身状态已开启");
+    CHECK(nebula_core_use_ability(&g, 13, ABILITY_VANISH, 0, 0, 0, 1) == -1, "冷却中不可再次隐身");
+    for (int i = 0; i < 30; i++) nebula_core_tick(&g);
+    CHECK(nebula_core_find(&g,13)->vanished == 0, "隐身到时自动现形");
+
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 2, ROLE_CREW);
+    CHECK(nebula_core_use_ability(&g, 2, ABILITY_VANISH, 0, 0, 0, 1) == -1, "非忍者不能隐身");
+
+    /* 局外人为中立，不计入好人 */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 14, ROLE_OUTSIDER);
+    nebula_core_add_player(&g, 3, ROLE_IMPOSTOR);
+    nebula_core_add_player(&g, 2, ROLE_CREW);
+    nebula_core_add_player(&g, 4, ROLE_CREW);
+    nebula_core_add_player(&g, 5, ROLE_CREW);
+    nebula_core_tick(&g);
+    CHECK(g.phase == PHASE_PLAY, "局外人为中立，不影响胜负推进");
+
+    /* 名字后缀修饰（usefulmodi 的 DecorateNameConstantly） */
+    nebula_core_init(&g);
+    nebula_core_add_player(&g, 9, ROLE_CREW);
+    nebula_core_add_modifier(&g, 9, MOD_NEET);
+    nebula_core_add_modifier(&g, 9, MOD_STAR);
+    char nm[64] = "小明";
+    nebula_core_decorate_name(nebula_core_find(&g, 9), nm, sizeof(nm));
+    CHECK(strcmp(nm, "小明 N ★") == 0, "名字后缀生效（NEET + Star）");
+    char nm2[64] = "小红";
+    nebula_core_decorate_name(NULL, nm2, sizeof(nm2));
+    CHECK(strcmp(nm2, "小红") == 0, "空玩家不崩溃且不改名字");
+
     printf("\n%s (%d failures)\n", failures==0 ? "ALL PASS" : "HAS FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

@@ -29,6 +29,9 @@ typedef enum {
     ROLE_BUBBLEGUNNER = 10, /* 泡泡枪手：内鬼阵营，泡泡击杀隐藏尸体（不触发报告） */
     ROLE_JACKAL    = 11,  /* 豺狼：中立阵营，可击杀，豺狼方≥其余方即胜 */
     ROLE_SIDEKICK  = 12,  /* 跟班：被豺狼招募前算船员，招募后入豺狼阵营 */
+    /* ↓ 由真实插件 Scripts/*.cs 移植而来（见 docs/ADDONS.md） */
+    ROLE_NINJA     = 13,  /* 忍者（插件 Ninja）：内鬼阵营，可隐身 */
+    ROLE_OUTSIDER  = 14,  /* 局外人（插件 WasteRoles）：中立阵营 */
 } nebula_role_t;
 
 /* 胜负方代码 */
@@ -51,12 +54,20 @@ typedef enum {
 #define ABILITY_SNIPE    9   /* 狙杀：caster 远程击杀 target（无反伤） */
 #define ABILITY_BUBBLE   10  /* 泡泡击杀：caster 远程击杀且隐藏尸体（不触发 BAIT 报告） */
 #define ABILITY_RECRUIT  11  /* 招募：豺狼把 target 变为自己的跟班 */
+#define ABILITY_VANISH   12  /* 隐身（移植自插件 Ninja）：caster 进入隐身 */
 
 /* ===================== 修饰（Auxiliary，位掩码） ===================== */
 #define MOD_NONE     0x0000
 #define MOD_SPEED    0x0001  /* 加速 */
 #define MOD_BAIT     0x0002  /* 被击杀者死后触发会议 */
 #define MOD_GIANT    0x0004  /* 体型变大（演示字段） */
+/* ↓ 移植自真实插件 usefulmodi（均为"名字后缀"类修饰） */
+#define MOD_NEET     0x0008  /* NEET：名字加 " N"，且不计船员任务 */
+#define MOD_STAR     0x0010  /* Star：名字加 " ★" */
+#define MOD_LIGHTING 0x0020  /* Lighting：名字加后缀 */
+#define MOD_SUNGLASS 0x0040  /* Sunglass：名字加后缀 */
+#define MOD_WATCHING 0x0080  /* Watching：名字加后缀 */
+#define MOD_SENDING  0x0100  /* Sending：名字加后缀 */
 
 /* ===================== 阶段 ===================== */
 #define PHASE_PLAY   0
@@ -79,6 +90,8 @@ typedef struct {
     int           shielded;    /* 护盾：免疫一次致死 */
     int           revealed;    /* 阵营已被识破 */
     int           recruited;   /* 是否已被豺狼招募为跟班 */
+    int           vanished;    /* 是否处于隐身（忍者） */
+    int           vanish_cd;   /* 隐身剩余时长（tick 递减） */
 } nebula_player_t;
 
 typedef struct {
@@ -113,6 +126,10 @@ void nebula_core_check_win(nebula_game_t *g);
 
 /* 每帧推进：冷却递减等随时间变化的状态。由 Update hook 每帧调用。 */
 void nebula_core_tick(nebula_game_t *g);
+
+/* 名字后缀（移植自 usefulmodi 插件的 DecorateNameConstantly）：
+   把该玩家生效中的修饰后缀（如 " N"、" ★"）追加到 buf 末尾 */
+void nebula_core_decorate_name(const nebula_player_t *p, char *buf, size_t sz);
 
 /* 修饰 */
 void nebula_core_add_modifier(nebula_game_t *g, uint32_t net_id, uint32_t mod);
