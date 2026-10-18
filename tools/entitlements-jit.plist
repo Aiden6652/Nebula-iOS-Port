@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  开启 JIT 的 entitlements（在基础版之上追加）
+
+  dynamic-codesigning:  允许运行时创建"可写又可执行"的内存（JIT）
+                        —— 我们当前的方案（改字段 / 指针替换）其实不依赖它，
+                           但它保证将来上第 3 级 trampoline 方案时随时可用。
+
+  ⚠️ 注意：dynamic-codesigning 属于受限 entitlement。
+     用免费开发者证书签名时它会被过滤掉 / 导致安装失败；
+     需要付费开发者证书 + 支持该权限的描述文件。
+     如果你的签名工具报错，请退回用 tools/entitlements.plist（基础版）。
+
+  用法：注入脚本加 --jit 参数即自动使用本文件
+-->
+<plist version="1.0">
+<dict>
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.private.skip-library-validation</key>
+	<true/>
+	<key>dynamic-codesigning</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  基础 entitlements（每次签名都带上，省得手工改文件）
+
+  get-task-allow:                              允许调试器附加（开发者签名必需）
+  com.apple.private.skip-library-validation:   ★允许加载我们注入的外部 dylib
+                                               少了这条，iOS 会拒绝加载 nebula dylib
+                                               （表现就是"游戏正常但毫无效果"）
+-->
+<plist version="1.0">
+<dict>
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.private.skip-library-validation</key>
+	<true/>
+</dict>
+</plist>

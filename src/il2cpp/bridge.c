@@ -105,6 +105,35 @@ static void *nebula_resolve_symbol(const char *name) {
 static void *nebula_resolve_symbol(const char *name) { return dlsym(RTLD_DEFAULT, name); }
 #endif
 
+/* ---------- 运行时 ABI 探针：逐个镜像报告 arm64 / arm64e ----------
+ * 硬件(M4)和 iOS 内核/系统 App 是 arm64e，但【本 App 自身】可能是 arm64。
+ * 决定"替换 methodPointer 会不会被 PAC 验签"的，是本 App 的 ABI：
+ *   arm64e  -> 可能有 autia/braa 验签 -> 有 SIGILL 风险
+ *   arm64   -> 编译器不生成验签指令   -> 安全
+ * 所以这里必须在真机上实测，不能靠猜。 */
+void nebula_il2cpp_list_images(void) {
+#if defined(__APPLE__)
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        const char *nm = _dyld_get_image_name(i);
+        if (!mh) continue;
+        int cpu = -1, sub = -1;
+        if (mh->magic == MH_MAGIC_64) {
+            const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+            cpu = (int)h->cputype; sub = (int)(h->cpusubtype & 0xFF);
+        } else {
+            cpu = (int)mh->cputype; sub = (int)(mh->cpusubtype & 0xFF);
+        }
+        const char *arch = (cpu == 0x0100000C)
+                           ? (sub == 2 ? "arm64e (PAC 风险)" : "arm64 (安全)")
+                           : "other";
+        nebula_log("image[%u] %-52s cpu=0x%x sub=%d -> %s",
+                   i, nm ? nm : "?", cpu, sub, arch);
+    }
+#endif
+}
+
 
 static void nlog(const char *fmt, ...) {
     char buf[512];
@@ -332,6 +361,9 @@ int nebula_il2cpp_get_instances(void *klass, void **out, int max) {
 int nebula_il2cpp_dump_report(const char *path, const char **class_hints, int hint_n) {
     if (nebula_il2cpp_init() != 0) return -1;
     if (!nebula_il2cpp_ready()) { nlog("dump: IL2CPP 运行时尚未就绪"); return -1; }
+
+    /* 先报 ABI：arm64 还是 arm64e —— 决定 PAC 风险等级，必须实测 */
+    nebula_il2cpp_list_images();
 
     FILE *fp = path ? fopen(path, "w") : NULL;
     nlog("=== Nebula 自查 dump 开始（类=%d 个线索） ===", hint_n);

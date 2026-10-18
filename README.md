@@ -51,6 +51,33 @@ tools/                insert_dylib + 重签 示意脚本；sim/ 双客户端联�
 - **GitHub Actions（推荐）**：推送即触发，`macos-latest` 用 Xcode 的 iPhoneOS SDK 交叉编译 `nebula_ios_loader.dylib`，产物作为 artifact 上传。
 - **本地**：`cd src/dylib && make`（需 macOS + Xcode 命令行工具）。
 
+## 注入与签名（必须带 entitlements，否则 dylib 不会被加载）
+
+```bash
+./tools/inject.sh <脱壳IPA>          # 基础 entitlements
+./tools/inject.sh <脱壳IPA> --jit    # 追加 JIT entitlements（付费开发者证书）
+```
+
+脚本会自动：识别 `*.app` 与主可执行文件名 → 注入 dylib → 开文件共享 → 打印完整重签命令。
+
+**签名时务必指定 entitlements**（`tools/entitlements.plist` 或 `--jit` 的 JIT 版）。
+其中 `com.apple.private.skip-library-validation` 是关键：
+少了它 iOS 会拒绝加载我们注入的外部 dylib，表现正是**"游戏正常但毫无效果"**。
+
+## 真机验证结论（已对用户上传的 IPA 实测）
+
+剖析对象：Among Us `com.innersloth.amongus`（版本 2026.9.29，ipa 体积 715 MB）。
+
+| 项 | 结果 | 结论 |
+|---|---|---|
+| `cryptid` | **0** | 已脱壳，加密不是障碍 |
+| 架构 | **arm64**（非 arm64e） | PAC 风险低，指针替换型 hook 安全 |
+| 构建类型 | **IL2CPP**（有 `global-metadata.dat`，0 个 Mono DLL） | 与方案假设一致 |
+| `il2cpp_*` 符号 | **存在，共 241 个** | 动态/静态符号都在，方案可跑 |
+| 代码位置 | **`Frameworks/UnityFramework.framework/UnityFramework`（95 MB）** | 主执行文件 `AmongUs` 仅 88 KB，是空壳启动器 |
+
+> 注意：app 名为 **`AmongUs.app`**（无空格），注入时不要按 "Among Us" 去找。
+
 ## 现状
 
 ✅ **本地玩法引擎 + 网络层 + Hook 管理器结构 已落地并测通**（CI 全绿）：
