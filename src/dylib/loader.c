@@ -9,10 +9,12 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include "../net/net_layer.h"
 #include "../net/protocol.h"
 #include "../core/core.h"
+#include "../addon/addon.h"
 #include "../il2cpp/bridge.h"
 #include "../il2cpp/hook.h"
 
@@ -122,11 +124,27 @@ void nebula_port_bridge_start(void) {
     nebula_il2cpp_start_poll(500);
 }
 
+/* ===== 原版插件（Addon）读取 =====
+ * 目录：<App Documents>/addons/ —— 开启文件共享后可在电脑上直接丢插件进去。
+ * 支持 ZIP 包 / 文件夹 / 原生 dylib；原样丢进去即可，不用解压。 */
+void nebula_port_addon_init(void) {
+    const char *home = getenv("HOME");
+    int n = nebula_addon_init(home);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "addons 已加载 %d 个插件%s", n, home ? "" : " (HOME 不可用)");
+    port_log(buf);
+    /* 抽一个真实词条验证插件生效（便于日志确认） */
+    snprintf(buf, sizeof(buf), "样例词条 title.buttons.nebula = %s",
+             nebula_lang_get("title.buttons.nebula"));
+    port_log(buf);
+}
+
 /* ===== dylib 入口：dyld 加载阶段自动执行 ===== */
 __attribute__((constructor))
 static void loader_entry(void) {
     nebula_port_init();
     nebula_port_net_init();
+    nebula_port_addon_init();
     nebula_port_hook_setup();
     nebula_port_bridge_start();
     port_log("dylib loaded");

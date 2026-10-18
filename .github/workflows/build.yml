@@ -17,6 +17,8 @@ jobs:
         run: cd src/core && make test
       - name: Build & run il2cpp bridge tests
         run: cd src/il2cpp && make test
+      - name: Build & run addon (插件读取) tests
+        run: cd src/addon && make test
       - name: Run Python reference simulators
         run: |
           python3 tools/sim/protocol_sim.py

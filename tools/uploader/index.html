@@ -36,11 +36,11 @@
 <body>
 <div class="wrap">
   <h1>上传 IPA · 自动体检</h1>
-  <div class="sub">1 MB 一片上传，带实时进度。传完会自动检查：是否脱壳加密、架构是否 arm64e、<code>il2cpp_*</code> 符号是否还在。<b>文件只落到本地沙箱，不会外传。</b></div>
+  <div class="sub">1 MB 一片上传，带实时进度。<b>IPA / ZIP / dat 等任意文件都能传</b>（IPA 传完会自动体检：是否脱壳、架构、<code>il2cpp_*</code> 符号）。<b>文件只落到本地沙箱，不会外传。</b></div>
 
   <div class="card">
     <div id="drop">点此选择 IPA，或把文件拖进来</div>
-    <input type="file" id="file" accept=".ipa" style="display:none">
+    <input type="file" id="file" style="display:none">   <!-- 不限类型：ipa / zip / dat 都能传 -->
     <div id="meta" style="margin-top:14px;display:none">
       <div><b id="fname"></b></div>
       <div class="grid">
