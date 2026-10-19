@@ -482,6 +482,84 @@ int nebula_il2cpp_set_string_by(void *obj, ptrdiff_t off, const char *utf8)
  *   - 每个 PlayerControl 实例按序分配一个官方职业
  *   - 名字前加 [职业中文名]
  *   - 按职业调整移动速度（字段用自适应定位，不写死字段名） */
+
+/* ★ 把职业名写进【身份/角色显示界面】
+ *
+ * 之前改玩家名字不显示，因为身份显示在专门的 UI（开局介绍页 IntroCutscene、
+ * 任务/身份面板 TaskPanelBehaviour 等），那些文字是 TextMeshProUGUI 的 m_text。
+ *
+ * 这里用【内容识别】定位，不必知道具体是哪个 UI 元素：
+ *   遍历所有 TextMeshProUGUI → 读 m_text →
+ *   若内容等于某个基础职业名（船员/伪装者/Scientist…）→ 换成我们的职业名。
+ *   开局介绍页、任务面板上出现的职业文字都会被命中。
+ */
+int nebula_il2cpp_apply_role_text(void)
+{
+    void *klass = nebula_il2cpp_find_class_by_hint("TextMeshProUGUI");
+    if (!klass) { klass = nebula_il2cpp_find_class_by_hint("TextMeshPro"); }
+    if (!klass) return 0;
+
+    static ptrdiff_t text_off = -1;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        if (nebula_il2cpp_find_field(klass, "m_text", &text_off) != 0)
+            nebula_il2cpp_find_field(klass, "text", &text_off);
+        if (text_off >= 0) nebula_log("role_text: 文本字段 +%td", text_off);
+        else               nebula_log("role_text: 未找到文本字段（将跳过）");
+    }
+    if (text_off < 0) return 0;
+
+    void *insts[256];
+    int n = nebula_il2cpp_get_instances(klass, insts, 256);
+    if (n <= 0) return 0;
+
+    /* 上场职业（与 apply_roles 共用配置） */
+    static int roster[ROLECFG_MAX]; static int roster_n = 0; static int cfg_done = 0;
+    if (!cfg_done) {
+        cfg_done = 1;
+        const char *home = getenv("HOME");
+        char cfg[1024] = {0};
+        if (home) snprintf(cfg, sizeof(cfg), "%s/Documents/nebula_roles.txt", home);
+        nebula_rolecfg_emit_default(home ? cfg : NULL);
+        nebula_rolecfg_load(home ? cfg : NULL, roster, ROLECFG_MAX, &roster_n);
+    }
+    if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);
+
+    /* 需要被替换掉的【基础职业显示名】（中英都列，兼容不同语言） */
+    static const char *base_names[] = {
+        "船员", "伪装者", "内鬼", "科学家", "工程师", "守护天使",
+        "变形者", "幻影", "追踪者", "噪音制造者",
+        "Crewmate", "Impostor", "Scientist", "Engineer", "Guardian Angel",
+        "Shapeshifter", "Phantom", "Tracker", "Noisemaker", NULL
+    };
+
+    int replaced = 0;
+    for (int i = 0; i < n; i++) {
+        char cur[128];
+        if (nebula_il2cpp_get_string_by(insts[i], text_off, cur, sizeof(cur)) != 0) continue;
+        if (!cur[0]) continue;
+        if (strstr(cur, "[")) continue;                 /* 已替换过 */
+
+        for (int b = 0; base_names[b]; b++) {
+            if (strcmp(cur, base_names[b]) == 0) {
+                int rid = nebula_rolecfg_pick(roster, roster_n, replaced);
+                if (rid < 0) break;
+                const char *rname = nebula_role_name(rid);
+                char nn[160];
+                snprintf(nn, sizeof(nn), "[%s]", rname ? rname : "?");
+                if (nebula_il2cpp_set_string_by(insts[i], text_off, nn) == 0) {
+                    nebula_log("role_text: %s -> %s", cur, nn);
+                    replaced++;
+                }
+                break;
+            }
+        }
+    }
+    if (replaced) nebula_log("role_text: 本轮替换 %d 处职业显示", replaced);
+    return replaced;
+}
+
 int nebula_il2cpp_apply_roles(void)
 {
     void *klass = nebula_il2cpp_find_class_by_hint("PlayerControl");
@@ -756,7 +834,8 @@ static void *poll_thread_main(void *arg) {
     nlog("poll: hook 安装结果 %d（0=成功帧级拦截；-1=未找到目标；-2=被开关停用）", installed);
     while (g_poll_run) {
         nebula_il2cpp_apply_speed(1.5f);
-        nebula_il2cpp_apply_roles();   /* 职业应用到游戏对象 */
+        nebula_il2cpp_apply_roles();       /* 职业登记 + 名字/速度 */
+        nebula_il2cpp_apply_role_text();  /* 职业名写进身份显示界面 */
         sleep_ms(pa->interval_ms);
     }
     return NULL;

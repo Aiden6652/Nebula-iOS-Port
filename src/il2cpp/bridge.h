@@ -64,8 +64,11 @@ int  nebula_il2cpp_set_float_by(void *obj, ptrdiff_t off, float v);
 int  nebula_il2cpp_get_string_by(void *obj, ptrdiff_t off, char *out, size_t osz);
 int  nebula_il2cpp_set_string_by(void *obj, ptrdiff_t off, const char *utf8);
 
-/* ★ 把本地引擎的职业应用到游戏对象上（改名字前缀 + 速度） */
+/* ★ 把本地引擎的职业应用到游戏对象上（登记 + 名字前缀 + 速度） */
 int  nebula_il2cpp_apply_roles(void);
+
+/* ★ 把职业名写进身份/角色显示界面（TextMeshProUGUI.m_text 内容识别替换） */
+int  nebula_il2cpp_apply_role_text(void);
 
 /* 启动后台轮询线程：按 interval_ms 周期执行 "第一个可见效果"（如加速）。
    返回 0 表示线程已启动。 */
