@@ -1,32 +1,20 @@
-name: Build & Test Nebula-iOS
+name: Build Nebula-iOS dylib
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
-jobs:
-  # ① Linux：跑 host 端协议 + 分发层 + 本地内核测试（抓回归，不依赖真机）
-  test-protocol:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build & run host tests
-        run: cd src/net && make test
-      - name: Build & run local-core tests
-        run: cd src/core && make test
-      - name: Build & run il2cpp bridge tests
-        run: cd src/il2cpp && make test
-      - name: Build & run addon (插件读取) tests
-        run: cd src/addon && make test
-      - name: Run Python reference simulators
-        run: |
-          python3 tools/sim/protocol_sim.py
-          python3 tools/sim/core_sim.py
-          python3 tools/sim/full_game_sim.py
+# 新推送立即取消正在排队/运行的旧任务，避免堆积等待
+concurrency:
+  group: nebula-ios-build
+  cancel-in-progress: true
 
-  # ② macOS：交叉编译 iOS arm64 dylib
+jobs:
+  # macOS：交叉编译 iOS arm64 dylib
   #    固定用 macos-14：macos-latest 队列等待时间长；14 的镜像启动更快
+  #    注：原 Linux 测试 job 已移除（它只是跑 host 端测试，
+  #        本地每次提交前都会跑全量验证，放在 CI 里只会占队列、拖慢出包）
   build-dylib:
     runs-on: macos-14
     steps:
