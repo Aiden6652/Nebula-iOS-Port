@@ -689,7 +689,9 @@ int nebula_il2cpp_apply_roles(void)
                 if (nebula_il2cpp_get_string_by(info, name_off, cur, sizeof(cur)) == 0
                     && cur[0] && !strstr(cur, "[")) {
                     char buf[160];
-                    snprintf(buf, sizeof(buf), "[%s]%s", rname ? rname : "?", cur);
+                    /* 原版星云舰把职业显示在【名字上方】：
+                       用换行符让第一行是职业、第二行是名字 */
+                    snprintf(buf, sizeof(buf), "[%s]\n%s", rname ? rname : "?", cur);
                     nebula_il2cpp_set_string_by(info, name_off, buf);
                 }
             }
