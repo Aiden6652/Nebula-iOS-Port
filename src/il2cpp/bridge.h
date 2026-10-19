@@ -53,6 +53,20 @@ int  nebula_il2cpp_set_float(void *obj, const char *field, float v);
 int  nebula_il2cpp_get_int(void *obj, const char *field, int *out);
 int  nebula_il2cpp_set_int(void *obj, const char *field, int v);
 
+/* ===== 自适应按名查找（不依赖预先知道的字段名） =====
+ * 在真实类的字段列表里按【名字子串】匹配，返回偏移。
+ * 这样即使不同版本字段名不同，也能自动命中，无需日志。 */
+int  nebula_il2cpp_find_field(void *klass, const char *substr, ptrdiff_t *off_out);
+int  nebula_il2cpp_get_float_by(void *obj, ptrdiff_t off, float *out);
+int  nebula_il2cpp_set_float_by(void *obj, ptrdiff_t off, float v);
+
+/* 字符串字段读写（Il2CppString：UTF-16，长度在 +16，字符从 +20 起） */
+int  nebula_il2cpp_get_string_by(void *obj, ptrdiff_t off, char *out, size_t osz);
+int  nebula_il2cpp_set_string_by(void *obj, ptrdiff_t off, const char *utf8);
+
+/* ★ 把本地引擎的职业应用到游戏对象上（改名字前缀 + 速度） */
+int  nebula_il2cpp_apply_roles(void);
+
 /* 启动后台轮询线程：按 interval_ms 周期执行 "第一个可见效果"（如加速）。
    返回 0 表示线程已启动。 */
 int  nebula_il2cpp_start_poll(int interval_ms);

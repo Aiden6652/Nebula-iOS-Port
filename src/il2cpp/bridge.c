@@ -11,6 +11,7 @@
 #include "bridge.h"
 #include "hook.h"
 
+#include <ctype.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -245,6 +246,7 @@ typedef void *(*fn_class_get_method_from_name)(void *klass, const char *name, in
 typedef const char *(*fn_method_get_name)(void *method);
 typedef int (*fn_method_get_param_count)(void *method);
 typedef void *(*fn_runtime_invoke)(void *method, void *obj, void **params, void **exc);
+typedef void *(*fn_string_new)(const char *str);
 
 typedef struct {
     fn_domain_get                 domain_get;
@@ -267,6 +269,7 @@ typedef struct {
     fn_method_get_name            method_get_name;
     fn_method_get_param_count     method_get_param_count;
     fn_runtime_invoke             runtime_invoke;
+    fn_string_new                string_new;
 } il2cpp_api_t;
 
 static il2cpp_api_t A = {0};
@@ -306,6 +309,7 @@ int nebula_il2cpp_init(void) {
     A.method_get_name       = (fn_method_get_name)sym("il2cpp_method_get_name");
     A.method_get_param_count= (fn_method_get_param_count)sym("il2cpp_method_get_param_count");
     A.runtime_invoke        = (fn_runtime_invoke)sym("il2cpp_runtime_invoke");
+    A.string_new            = (fn_string_new)sym("il2cpp_string_new");   /* 辅助：创建字符串 */
 
     if (!A.domain_get || !A.domain_get_assemblies || !A.assembly_get_image ||
         !A.image_get_class_count || !A.image_get_class || !A.class_get_name ||
@@ -401,6 +405,133 @@ int nebula_il2cpp_set_int(void *obj, const char *field, int v) {
     if (!p) return -1;
     *(int *)p = v;
     return 0;
+}
+
+/* ===================== 自适应字段定位 + 职业应用 ===================== */
+#include "../core/roles.h"
+
+/* 在类的字段列表里按名字子串匹配（忽略大小写），返回 0 并填充偏移 */
+int nebula_il2cpp_find_field(void *klass, const char *substr, ptrdiff_t *off_out)
+{
+    if (!g_api_ok || !klass || !substr || !A.class_get_fields || !A.field_get_name) return -1;
+    size_t sl = strlen(substr);
+    void *iter = NULL;
+    for (void *f = A.class_get_fields(klass, &iter); f; f = A.class_get_fields(klass, &iter)) {
+        const char *fn = A.field_get_name(f);
+        if (!fn) continue;
+        for (size_t i = 0; fn[i]; i++) {          /* 忽略大小写的子串匹配 */
+            size_t j = 0;
+            while (j < sl && fn[i + j] &&
+                   tolower((unsigned char)fn[i + j]) == tolower((unsigned char)substr[j])) j++;
+            if (j == sl) {
+                ptrdiff_t off = A.field_get_offset(f);
+                if (off_out) *off_out = off;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+int nebula_il2cpp_get_float_by(void *obj, ptrdiff_t off, float *out)
+{
+    if (!obj || !out || off < 0) return -1;
+    *out = *(float *)((char *)obj + off);
+    return 0;
+}
+
+int nebula_il2cpp_set_float_by(void *obj, ptrdiff_t off, float v)
+{
+    if (!obj || off < 0) return -1;
+    *(float *)((char *)obj + off) = v;
+    return 0;
+}
+
+/* Il2CppString：klass(8) + monitor(8) + length(int32,+16) + chars(UTF16,+20) */
+int nebula_il2cpp_get_string_by(void *obj, ptrdiff_t off, char *out, size_t osz)
+{
+    if (!obj || !out || osz == 0 || off < 0) return -1;
+    void *s = *(void **)((char *)obj + off);
+    if (!s) { out[0] = '\0'; return -1; }
+    int32_t len = *(int32_t *)((char *)s + 16);
+    const uint16_t *ch = (const uint16_t *)((char *)s + 20);
+    if (len < 0 || len > 4096) len = 0;
+    size_t w = 0;
+    for (int32_t i = 0; i < len && w + 4 < osz; i++) {
+        uint32_t c = ch[i];
+        if (c < 0x80) out[w++] = (char)c;
+        else if (c < 0x800) { out[w++] = (char)(0xC0 | (c >> 6)); out[w++] = (char)(0x80 | (c & 0x3F)); }
+        else { out[w++] = (char)(0xE0 | (c >> 12)); out[w++] = (char)(0x80 | ((c >> 6) & 0x3F)); out[w++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    out[w] = '\0';
+    return 0;
+}
+
+int nebula_il2cpp_set_string_by(void *obj, ptrdiff_t off, const char *utf8)
+{
+    if (!obj || !utf8 || off < 0) return -1;
+    if (!A.string_new) return -1;                 /* 需要 il2cpp_string_new */
+    void *s = A.string_new(utf8);
+    if (!s) return -1;
+    *(void **)((char *)obj + off) = s;
+    return 0;
+}
+
+/* ★ 把本地引擎的职业应用到真实游戏对象：
+ *   - 每个 PlayerControl 实例按序分配一个官方职业
+ *   - 名字前加 [职业中文名]
+ *   - 按职业调整移动速度（字段用自适应定位，不写死字段名） */
+int nebula_il2cpp_apply_roles(void)
+{
+    void *klass = nebula_il2cpp_find_class_by_hint("PlayerControl");
+    if (!klass) return 0;
+
+    void *insts[16];
+    int n = nebula_il2cpp_get_instances(klass, insts, 16);
+    if (n <= 0) return 0;
+
+    static const int pool[] = {
+        ROLE_SHERIFF, ROLE_JACKAL, ROLE_SNIPER, ROLE_MAYOR,
+        ROLE_DOCTOR,  ROLE_SEER,   ROLE_JESTER, ROLE_BAIT
+    };
+    static const float mul[] = { 1.0f, 1.10f, 1.05f, 0.95f, 1.0f, 1.0f, 1.0f, 1.0f };
+    const int pn = (int)(sizeof(pool) / sizeof(pool[0]));
+
+    static ptrdiff_t speed_off = -1, name_off = -1;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        if (nebula_il2cpp_find_field(klass, "speed", &speed_off) == 0)
+            nebula_log("apply_roles: 速度字段 +%td", speed_off);
+        else nebula_log("apply_roles: 未找到含 speed 的字段");
+        if (nebula_il2cpp_find_field(klass, "name", &name_off) == 0)
+            nebula_log("apply_roles: 名字字段 +%td", name_off);
+        else nebula_log("apply_roles: 未找到含 name 的字段");
+    }
+
+    int applied = 0;
+    for (int i = 0; i < n; i++) {
+        int rid = pool[i % pn];
+        const char *rname = nebula_role_name(rid);
+
+        if (speed_off >= 0) {
+            float cur = 0;
+            if (nebula_il2cpp_get_float_by(insts[i], speed_off, &cur) == 0)
+                nebula_il2cpp_set_float_by(insts[i], speed_off, cur * mul[i % pn]);
+        }
+        if (name_off >= 0) {
+            char cur[128];
+            if (nebula_il2cpp_get_string_by(insts[i], name_off, cur, sizeof(cur)) == 0) {
+                if (!strstr(cur, "[")) {           /* 已加过前缀就不再加 */
+                    char nn[160];
+                    snprintf(nn, sizeof(nn), "[%s]%s", rname ? rname : "?", cur);
+                    nebula_il2cpp_set_string_by(insts[i], name_off, nn);
+                }
+            }
+        }
+        applied++;
+    }
+    return applied;
 }
 
 /* ===================== 取类的实例 ===================== */
@@ -550,6 +681,7 @@ static void *poll_thread_main(void *arg) {
     nlog("poll: hook 安装结果 %d（0=成功帧级拦截；-1=未找到目标；-2=被开关停用）", installed);
     while (g_poll_run) {
         nebula_il2cpp_apply_speed(1.5f);
+        nebula_il2cpp_apply_roles();   /* 职业应用到游戏对象 */
         sleep_ms(pa->interval_ms);
     }
     return NULL;
