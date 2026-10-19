@@ -57,6 +57,14 @@ int  nebula_il2cpp_set_int(void *obj, const char *field, int v);
  * 在真实类的字段列表里按【名字子串】匹配，返回偏移。
  * 这样即使不同版本字段名不同，也能自动命中，无需日志。 */
 int  nebula_il2cpp_find_field(void *klass, const char *substr, ptrdiff_t *off_out);
+
+/* ★ 精确定位字段：按完整字段名依次尝试候选（names 以 NULL 结尾）。
+   宁可找不到不写，也绝不匹配到错误字段写坏数据。 */
+int  nebula_il2cpp_find_field_exact(void *klass, const char **names, ptrdiff_t *off_out);
+
+/* ★ 游戏主线程每帧入口（由 hook tick 回调调用），内部已限流。
+   所有 IL2CPP 操作都应通过它执行，不要在后台线程直接调。 */
+void nebula_il2cpp_tick_from_game(void);
 int  nebula_il2cpp_get_float_by(void *obj, ptrdiff_t off, float *out);
 int  nebula_il2cpp_set_float_by(void *obj, ptrdiff_t off, float v);
 

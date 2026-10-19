@@ -112,6 +112,11 @@ nebula_game_t *nebula_get_game(void) { return g_game; }
 /* ===== 每帧回调：由 Update hook 调用，驱动本地引擎推进 ===== */
 static void nebula_port_tick(void) {
     nebula_core_tick(g_game);
+    /* ★ 所有 IL2CPP 操作都在这里做 —— 这是游戏主线程（hook 每帧回调），
+     *   线程安全。内部已限流（默认每 60 帧一次），不会拖慢游戏。
+     *   绝不要在后台轮询线程里直接调 IL2CPP：Unity API 非线程安全，
+     *   之前那样做正是"交互失效/按键无响应"的元凶之一。 */
+    nebula_il2cpp_tick_from_game();
 }
 
 /* 无 Frida 的游戏桥接：dylib 自己解析 libil2cpp 并轮询生效 */

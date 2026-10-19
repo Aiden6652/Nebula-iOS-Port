@@ -437,6 +437,24 @@ int nebula_il2cpp_find_field(void *klass, const char *substr, ptrdiff_t *off_out
     return -1;
 }
 
+/* ★ 精确定位字段：按【完整字段名】依次尝试候选，全部失败才放弃。
+   之前用子串匹配（如 "name"）会命中非目标字段并写入 → 破坏邻近数据。
+   改为精确名后，宁可找不到不写，也绝不错写。 */
+int nebula_il2cpp_find_field_exact(void *klass, const char **names, ptrdiff_t *off_out)
+{
+    if (!g_api_ok || !klass || !names || !A.class_get_field_from_name ||
+        !A.field_get_offset) return -1;
+    for (int i = 0; names[i]; i++) {
+        void *f = A.class_get_field_from_name(klass, names[i]);
+        if (!f) continue;
+        ptrdiff_t off = A.field_get_offset(f);
+        if (off < 0) continue;
+        if (off_out) *off_out = off;
+        return 0;
+    }
+    return -1;
+}
+
 int nebula_il2cpp_get_float_by(void *obj, ptrdiff_t off, float *out)
 {
     if (!obj || !out || off < 0) return -1;
@@ -506,15 +524,18 @@ int nebula_il2cpp_apply_role_text(void)
     static int tried = 0;
     if (!tried) {
         tried = 1;
-        if (nebula_il2cpp_find_field(klass, "m_text", &text_off) != 0)
-            nebula_il2cpp_find_field(klass, "text", &text_off);
+        static const char *tf[] = {"m_text", "text", "m_Text", NULL};
+        nebula_il2cpp_find_field_exact(klass, tf, &text_off);
         if (text_off >= 0) nebula_log("role_text: 文本字段 +%td", text_off);
         else               nebula_log("role_text: 未找到文本字段（将跳过）");
     }
     if (text_off < 0) return 0;
 
-    void *insts[256];
-    int n = nebula_il2cpp_get_instances(klass, insts, 256);
+    /* 开关：放 nebula_no_text.txt 可关闭 UI 文本替换，用于排查 */
+    if (nebula_flag_file("nebula_no_text.txt")) return 0;
+
+    void *insts[128];
+    int n = nebula_il2cpp_get_instances(klass, insts, 128);
     if (n <= 0) return 0;
 
     /* 上场职业（与 apply_roles 共用配置） */
@@ -609,6 +630,8 @@ int nebula_il2cpp_get_players(void **out, int max)
     return nebula_il2cpp_get_instances(klass, out, max);
 }
 
+static float g_base_speed = 0.0f;   /* 基准速度，只记录一次 */
+
 int nebula_il2cpp_apply_roles(void)
 {
     void *klass = nebula_il2cpp_find_class_by_hint("PlayerControl");
@@ -629,20 +652,29 @@ int nebula_il2cpp_apply_roles(void)
     }
     if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);
 
-    /* 速度：PlayerControl.MyPhysics -> PlayerPhysics.speed */
+    /* 速度：PlayerControl.MyPhysics -> PlayerPhysics.speed
+       速度效果默认关闭：历史 bug 就是它每轮 read→×1.5→write，
+       10 秒后速度达 3300 倍，玩家飞出地图、交互全部失效。
+       需要时放 nebula_speed.txt 开启，且用【基准值 × 系数】写入。 */
     static ptrdiff_t phys_off = -1, speed_off = -1;
     static int speed_tried = 0;
-    if (!speed_tried) {
-        speed_tried = 1;
+    if (!nebula_flag_file("nebula_speed.txt")) {
+        if (!speed_tried) {
+            speed_tried = 1;
+            nebula_log("apply_roles: 速度效果默认关闭（放 nebula_speed.txt 开启）");
+        }
+    } else if (speed_off < 0) {
+        /* 只要还没定位成功就重试（游戏刚进场景时对象可能尚未创建）。
+           注意：不能用 speed_tried 一次性锁死，否则"先关后开"会永久失效。 */
         if (nebula_il2cpp_find_field(klass, "MyPhysics", &phys_off) == 0 && n > 0) {
             void *p0 = *(void **)((char *)insts[0] + phys_off);
             if (p0) {
                 void *pk = *(void **)p0;
-                if (nebula_il2cpp_find_field(pk, "speed", &speed_off) == 0)
+                static const char *sp[] = {"Speed", "speed", "MoveSpeed", "moveSpeed", NULL};
+                if (nebula_il2cpp_find_field_exact(pk, sp, &speed_off) == 0)
                     nebula_log("apply_roles: 速度 PlayerPhysics +%td", speed_off);
             }
         }
-        if (speed_off < 0) nebula_log("apply_roles: 速度字段未定位（将跳过）");
     }
 
     /* 名字：PlayerControl.CachedPlayerData -> NetworkedPlayerInfo.PlayerName */
@@ -654,8 +686,8 @@ int nebula_il2cpp_apply_roles(void)
             void *i0 = *(void **)((char *)insts[0] + info_off);
             if (i0) {
                 void *ik = *(void **)i0;
-                if (nebula_il2cpp_find_field(ik, "playername", &name_off) != 0)
-                    nebula_il2cpp_find_field(ik, "name", &name_off);
+                static const char *nm[] = {"PlayerName", "playerName", "playername", NULL};
+                nebula_il2cpp_find_field_exact(ik, nm, &name_off);
                 if (name_off >= 0)
                     nebula_log("apply_roles: 名字 NetworkedPlayerInfo +%td", name_off);
             }
@@ -671,18 +703,23 @@ int nebula_il2cpp_apply_roles(void)
         nebula_team_t team = nebula_role_team(rid);
         nebula_core_register_player((uint32_t)(i + 1), team);
 
+        /* 速度：用【基准值 × 系数】写入，绝不读当前值再乘（那会指数爆炸） */
         if (phys_off >= 0 && speed_off >= 0) {
             void *phys = *(void **)((char *)insts[i] + phys_off);
             if (phys) {
-                float cur = 0;
-                if (nebula_il2cpp_get_float_by(phys, speed_off, &cur) == 0) {
-                    float m = (team == TEAM_IMPOSTOR) ? 1.08f
-                            : (team == TEAM_NEUTRAL)  ? 1.04f : 1.0f;
-                    nebula_il2cpp_set_float_by(phys, speed_off, cur * m);
+                float base = 0;
+                if (nebula_il2cpp_get_float_by(phys, speed_off, &base) == 0 && base > 0.0f) {
+                    /* 基准速度只记录一次（第一次看到的合理值） */
+                    if (g_base_speed <= 0.0f && base < 32.0f) g_base_speed = base;
+                    if (g_base_speed > 0.0f) {
+                        float m = (team == TEAM_IMPOSTOR) ? 1.08f
+                                : (team == TEAM_NEUTRAL)  ? 1.04f : 1.0f;
+                        nebula_il2cpp_set_float_by(phys, speed_off, g_base_speed * m);
+                    }
                 }
             }
         }
-        if (info_off >= 0 && name_off >= 0) {
+        if (info_off >= 0 && name_off >= 0 && !nebula_flag_file("nebula_no_name.txt")) {
             void *info = *(void **)((char *)insts[i] + info_off);
             if (info) {
                 char cur[128];
@@ -873,13 +910,38 @@ static void *poll_thread_main(void *arg) {
         if (installed != 0) sleep_ms(500);
     }
     nlog("poll: hook 安装结果 %d（0=成功帧级拦截；-1=未找到目标；-2=被开关停用）", installed);
+    /* ★ 关键修复：Unity/IL2CPP 的 API 不是线程安全的。
+       以前在这里（后台 pthread）每轮调 FindObjectsOfType / 写字段 / 建字符串，
+       会破坏 Unity 内部状态（表现为交互失效、按键无响应）。
+       现在后台线程【只负责装 hook】，之后所有 IL2CPP 操作都放到
+       hook 的每帧回调里执行 —— 那里是游戏主线程，安全。
+       只有 hook 装不上时才退化到低频轮询（3 秒一次），并明确记日志。 */
+    if (installed == 0) {
+        nlog("poll: hook 已生效，IL2CPP 操作改由游戏主线程每帧回调执行");
+        while (g_poll_run) sleep_ms(1000);      /* 只保活，不碰 IL2CPP */
+        return NULL;
+    }
+
+    nlog("poll: hook 未生效，退化为低频轮询（每 3 秒，跨线程有风险）");
     while (g_poll_run) {
-        nebula_il2cpp_apply_speed(1.5f);
-        nebula_il2cpp_apply_roles();       /* 职业登记 + 名字/速度 */
-        nebula_il2cpp_apply_role_text();  /* 职业名写进身份显示界面 */
-        sleep_ms(pa->interval_ms);
+        nebula_il2cpp_apply_roles();
+        nebula_il2cpp_apply_role_text();
+        sleep_ms(3000);
     }
     return NULL;
+}
+
+/* ★ 游戏主线程每帧调用（由 hook 的 tick 回调驱动）。
+   这里执行 IL2CPP 操作是安全的（在主线程内、且在游戏自己的 Update 里）。
+   内部限流：默认每 60 帧（约 1 秒）真正执行一次，避免每帧扫描拖慢游戏。 */
+void nebula_il2cpp_tick_from_game(void)
+{
+    static int frame = 0;
+    if (++frame < 60) return;
+    frame = 0;
+    if (!nebula_il2cpp_ready()) return;
+    nebula_il2cpp_apply_roles();        /* 职业登记 + 名字前缀（+可选速度） */
+    nebula_il2cpp_apply_role_text();    /* 职业名写进身份显示界面 */
 }
 
 int nebula_il2cpp_start_poll(int interval_ms) {

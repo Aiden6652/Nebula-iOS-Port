@@ -3,6 +3,7 @@
  */
 
 #include "rolecfg.h"
+#include <unistd.h>
 #include "roles.h"
 #include "../il2cpp/bridge.h"   /* nebula_log */
 
@@ -86,6 +87,8 @@ int nebula_rolecfg_load(const char *path, int *out_ids, int max, int *out_n)
 int nebula_rolecfg_emit_default(const char *path)
 {
     if (!path) return -1;
+    /* ★ 已存在就不要覆盖：否则每次启动都会把用户改好的阵容重置成默认值 */
+    if (access(path, F_OK) == 0) return 0;
     int ids[ROLECFG_MAX], n = 0;
     if (nebula_rolecfg_default(ids, ROLECFG_MAX, &n) <= 0) return -1;
     FILE *f = fopen(path, "w");
