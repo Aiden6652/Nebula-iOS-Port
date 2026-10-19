@@ -60,33 +60,63 @@ void nebula_log(const char *fmt, ...) {
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
-/* 计算镜像映射大小（取各 segment 的最大末端），用于符号表越界校验 */
-static size_t image_size(const struct mach_header *mh)
+/* ★ 关键修正：Mach-O 的【文件偏移】不等于【内存地址偏移】。
+ *
+ * 真实案例（用户 IPA 里的 UnityFramework）：
+ *   __DATA     vm=0x5590000 vmsize=0x864000  file=0x5590000 filesize=0x4c8000
+ *              ↑ vm 比 file 大（有零填充段）
+ *   __LINKEDIT vm=0x5df4000                  file=0x5a58000
+ *              ↑ 两者相差 0x29C000
+ *   LC_SYMTAB 的 symoff=0x5bbd260 是【文件偏移】
+ *
+ * 若直接用 "基址 + symoff" 会偏移 0x29C000，读到 __DATA 中间去，
+ * 再按 10957 个符号遍历 + 用错误字符串表索引 → 必然闪退。
+ * 正确做法：找到该偏移所属的 segment，用它的 (vmaddr, fileoff) 做换算：
+ *      地址 = 基址 + seg.vmaddr + (文件偏移 - seg.fileoff)
+ */
+typedef struct { uint64_t vmaddr, vmsize, fileoff, filesize; } seg_t;
+#define MAX_SEGS 8
+
+/* 把文件偏移换算为镜像内相对地址 */
+static int file_off_to_addr(seg_t *segs, int n, uint64_t foff, uint64_t need, uint64_t *out)
+{
+    for (int i = 0; i < n; i++) {
+        if (segs[i].filesize == 0) continue;
+        if (foff >= segs[i].fileoff && foff + need <= segs[i].fileoff + segs[i].filesize) {
+            *out = segs[i].vmaddr + (foff - segs[i].fileoff);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 收集段信息，用于符号表越界校验与地址换算 */
+static int collect_segments(const struct mach_header *mh, seg_t *segs, int max)
 {
     uintptr_t base = (uintptr_t)mh;
     struct load_command *lc = (struct load_command *)(base + sizeof(struct mach_header_64));
     uint32_t ncmds = ((struct mach_header_64 *)mh)->ncmds;
-    uint64_t min_addr = ~0ULL, max_end = 0;
-    for (uint32_t i = 0; i < ncmds; i++) {
-        if ((uintptr_t)lc + sizeof(struct load_command) > base + (1u << 30)) break;
+    int n = 0;
+    for (uint32_t i = 0; i < ncmds && n < max; i++) {
         if (lc->cmd == LC_SEGMENT_64) {
             struct segment_command_64 *sg = (struct segment_command_64 *)lc;
-            if (sg->vmaddr < min_addr) min_addr = sg->vmaddr;
-            if (sg->vmaddr + sg->vmsize > max_end) max_end = sg->vmaddr + sg->vmsize;
+            segs[n].vmaddr = sg->vmaddr; segs[n].vmsize = sg->vmsize;
+            segs[n].fileoff = sg->fileoff; segs[n].filesize = sg->filesize;
+            n++;
         }
         if (lc->cmdsize == 0) break;
         lc = (struct load_command *)((uintptr_t)lc + lc->cmdsize);
     }
-    if (max_end <= min_addr) return 0;
-    return (size_t)(max_end - min_addr);
+    return n;
 }
 
 static void *lookup_in_image(const struct mach_header *mh, intptr_t slide, const char *want) {
     if (!mh) return NULL;
     if (mh->magic != MH_MAGIC_64) return NULL;
 
-    size_t isz = image_size(mh);
-    if (isz == 0) return NULL;
+    seg_t segs[MAX_SEGS];
+    int nseg = collect_segments(mh, segs, MAX_SEGS);
+    if (nseg == 0) return NULL;
 
     uintptr_t base = (uintptr_t)mh;
     struct load_command *lc = (struct load_command *)(base + sizeof(struct mach_header_64));
@@ -95,16 +125,20 @@ static void *lookup_in_image(const struct mach_header *mh, intptr_t slide, const
     for (uint32_t i = 0; i < ncmds; i++) {
         if (lc->cmd == LC_SYMTAB) {
             struct symtab_command *st = (struct symtab_command *)lc;
-            /* ★ 越界校验：很多系统镜像（含 dyld 共享缓存）符号表不完整，
-             *   不校验会读到镜像外直接闪退 */
-            if (st->symoff == 0 || st->stroff == 0) return NULL;
-            if ((size_t)st->symoff + (size_t)st->nsyms * sizeof(struct nlist_64) > isz) return NULL;
-            if ((size_t)st->stroff + (size_t)st->strsize > isz) return NULL;
-            struct nlist_64 *syms = (struct nlist_64 *)(base + st->symoff);
-            char *strtab = (char *)(base + st->stroff);
+            if (st->symoff == 0 || st->stroff == 0 || st->nsyms == 0) return NULL;
+
+            /* ★ 用所属 segment 把文件偏移换算成内存地址（不能直接 base+off） */
+            uint64_t sym_rel = 0, str_rel = 0;
+            if (!file_off_to_addr(segs, nseg, st->symoff,
+                                  (uint64_t)st->nsyms * sizeof(struct nlist_64), &sym_rel)) return NULL;
+            if (!file_off_to_addr(segs, nseg, st->stroff, st->strsize, &str_rel)) return NULL;
+
+            struct nlist_64 *syms = (struct nlist_64 *)(base + sym_rel);
+            char *strtab = (char *)(base + str_rel);
+
             for (uint32_t s = 0; s < st->nsyms; s++) {
                 uint32_t strx = syms[s].n_un.n_strx;
-                if (strx == 0) continue;
+                if (strx == 0 || strx >= st->strsize) continue;   /* 越界保护 */
                 char *nm = strtab + strx;
                 if (nm[0] != '_') continue;              /* Apple 符号带下划线前缀 */
                 if (strcmp(nm + 1, want) == 0 && syms[s].n_value != 0) {
@@ -113,17 +147,36 @@ static void *lookup_in_image(const struct mach_header *mh, intptr_t slide, const
             }
             return NULL;
         }
+        if (lc->cmdsize == 0) break;
         lc = (struct load_command *)((uintptr_t)lc + lc->cmdsize);
     }
     return NULL;
 }
 
+/* ★ 只扫描 App 包内的镜像。
+ * 系统库/dyld 共享缓存里的镜像，其 __LINKEDIT 在共享缓存中是拆分映射的，
+ * 用 "镜像基址 + symoff" 去算会落到未映射区域 → 直接闪退。
+ * 而 il2cpp 只可能存在于 App 自身（主执行文件或 UnityFramework），
+ * 因此系统镜像一律跳过，既安全又更快。 */
+static int image_is_app_image(const char *nm)
+{
+    if (!nm) return 0;
+    /* 例： /var/containers/Bundle/Application/xxx/AmongUs.app/AmongUs
+     *     .../AmongUs.app/Frameworks/UnityFramework.framework/UnityFramework */
+    return strstr(nm, ".app/") != NULL ? 1 : 0;
+}
+
 static void *nebula_resolve_symbol(const char *name) {
     void *p = dlsym(RTLD_DEFAULT, name);
     if (p) return p;
-    /* 兜底：遍历所有已加载镜像（主程序 / UnityFramework 等）查静态符号表 */
+    /* 开关：放 nebula_no_scan.txt 可彻底关掉静态符号表扫描（只用 dlsym），
+       用于排查闪退是否来自扫描 */
+    if (nebula_flag_file("nebula_no_scan.txt")) return NULL;
+    /* 兜底：仅遍历 App 包内镜像（主程序 / UnityFramework）查静态符号表 */
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
+        const char *inm = _dyld_get_image_name(i);
+        if (!image_is_app_image(inm)) continue;
         void *r = lookup_in_image(_dyld_get_image_header(i),
                                   _dyld_get_image_vmaddr_slide(i), name);
         if (r) return r;
@@ -459,10 +512,11 @@ static volatile int g_poll_run = 0;
 
 static void *poll_thread_main(void *arg) {
     poll_arg_t *pa = (poll_arg_t *)arg;
+    /* ★ 先静置几秒：让 Unity 完成自己的初始化，再开始任何 IL2CPP 相关动作
+       （符号解析、ready 探测、dump、hook 全部放到这之后） */
+    sleep_ms(5000);
     if (nebula_il2cpp_init() != 0) return NULL;
 
-    /* ★ 先静置几秒：Unity 有自己的初始化顺序，太早碰 il2cpp 会闪退 */
-    sleep_ms(5000);
     for (int i = 0; i < 300 && !nebula_il2cpp_ready(); i++) sleep_ms(200);
     if (!nebula_il2cpp_ready()) { nlog("poll: 等待 IL2CPP 就绪超时"); return NULL; }
     nlog("poll: IL2CPP 已就绪，开始轮询（每 %d ms）", pa->interval_ms);
