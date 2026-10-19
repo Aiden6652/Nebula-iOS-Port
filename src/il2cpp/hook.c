@@ -49,9 +49,14 @@ int nebula_flag_file(const char *filename) {
 
 int nebula_hook_enabled(void) {
 #if defined(__APPLE__)
-    return nebula_flag_file("nebula_no_hook.txt") ? 0 : 1;
+    /* ★ 默认【不装】hook。
+       职业显示靠轮询就够了，而 hook 一旦调用约定处理不当会破坏
+       PlayerControl.FixedUpdate —— 表现为"交互失效/按键常亮"。
+       确认需要每帧执行逻辑时，主动放 nebula_hook.txt 才启用。 */
+    return nebula_flag_file("nebula_hook.txt") ? 1 : 0;
 #else
-    return 1;   /* 非 Apple 平台无该机制：始终允许安装 */
+    (void)0;
+    return 0;   /* 非 Apple 平台：不装 */
 #endif
 }
 

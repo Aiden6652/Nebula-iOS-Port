@@ -17,10 +17,22 @@ set -e
 IPA="${1:-}"
 OUTDIR="${2:-build}"
 USE_JIT=0
-for a in "$@"; do [ "$a" = "--jit" ] && USE_JIT=1; done
+FLAGS=()
+ARGS=("$@")
+_i=0
+while [ $_i -lt ${#ARGS[@]} ]; do
+  case "${ARGS[$_i]}" in
+    --jit)  USE_JIT=1 ;;
+    --flag) _i=$((_i+1)); [ -n "${ARGS[$_i]:-}" ] && FLAGS+=("${ARGS[$_i]}") ;;
+  esac
+  _i=$((_i+1))
+done
 
 if [ -z "$IPA" ] || [ ! -f "$IPA" ]; then
-  echo "用法: $0 <脱壳IPA> [--jit]"; exit 1
+  echo "用法: $0 <脱壳IPA> [输出目录] [--jit] [--flag <开关文件> ...]"
+  echo "例:   $0 game.ipa --flag nebula_no_text.txt"
+  echo "可用开关见 tools/flags/"
+  exit 1
 fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -73,8 +85,25 @@ if [ -f "$PLIST" ]; then
   echo "[*] 已尝试开启文件共享（电脑上可取 Documents/nebula_log.txt）"
 fi
 
-# （可选）熔断：放进这个文件即停用 hook，退回纯轮询
-# touch "$APP/nebula_no_hook.txt"
+# ---------- 4.5 开关文件（--flag 指定，可多次） ----------
+# 可用开关见 tools/flags/：
+#   nebula_hook.txt      启用每帧 hook（默认关闭）
+#   nebula_speed.txt     启用按职业调速（默认关闭）
+#   nebula_no_name.txt   不写玩家名字
+#   nebula_no_text.txt   不做 UI 文本替换
+#   nebula_no_bridge.txt 完全不启动游戏桥
+if [ ${#FLAGS[@]} -gt 0 ]; then
+  for f in "${FLAGS[@]}"; do
+    SRC="$HERE/flags/$f"
+    if [ -f "$SRC" ]; then
+      cp "$SRC" "$APP/$f" && echo "[*] 已放入开关: $f"
+    else
+      echo "[!] 未知开关: $f（可选项见 tools/flags/）"
+    fi
+  done
+else
+  echo "[*] 未指定开关，使用默认（不装 hook、不改速度、只显示职业名）"
+fi
 
 # ---------- 5. entitlements ----------
 if [ "$USE_JIT" = "1" ]; then

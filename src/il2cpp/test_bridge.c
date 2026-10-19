@@ -46,7 +46,9 @@ int main(void) {
     nebula_hook_set_tick(fake_tick);
     CHECK(nebula_hook_orig("GameManager", "Update") == NULL, "未安装时查原入口返回 NULL");
     CHECK(nebula_hook_install("GameManager", "Update", NULL, NULL) == -1, "参数非法时返回 -1");
-    CHECK(nebula_hook_install_game_update() == -1, "无 il2cpp 时安装 hook 返回 -1");
+    /* hook 默认【不启用】（除非放 nebula_hook.txt）：-2=被开关停用。
+       这是有意为之——hook 可能破坏 FixedUpdate，默认不装最安全。 */
+    CHECK(nebula_hook_install_game_update() == -2, "hook 默认不启用（返回 -2=被开关停用）");
     CHECK(nebula_hook_count() == 0, "失败后未产生脏记录");
     CHECK(g_tick_hits == 0, "未 hook 成功时不误调 tick 回调");
 
