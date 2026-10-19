@@ -463,6 +463,16 @@ int nebula_il2cpp_dump_report(const char *path, const char **class_hints, int hi
             nlog("    field %s : %s @ +%td", fn ? fn : "?", tn ? tn : "?", off);
             if (fp) fprintf(fp, "%-40s %-24s +%td\n", fn ? fn : "?", tn ? tn : "?", off);
         }
+        /* 同时输出方法名 —— 要 hook 职业分配/会议流程就得靠它 */
+        if (A.class_get_methods && A.method_get_name) {
+            void *miter = NULL; int mn = 0;
+            for (void *m = A.class_get_methods(klass, &miter); m && mn < 60;
+                 m = A.class_get_methods(klass, &miter), mn++) {
+                const char *mnm = A.method_get_name(m);
+                nlog("    method %s", mnm ? mnm : "?");
+                if (fp) fprintf(fp, "  method %s\n", mnm ? mnm : "?");
+            }
+        }
     }
     if (fp) { fclose(fp); nlog("（同时写入文件 %s）", path); }
     nlog("=== 自查 dump 结束 ===");
@@ -521,9 +531,15 @@ static void *poll_thread_main(void *arg) {
     if (!nebula_il2cpp_ready()) { nlog("poll: 等待 IL2CPP 就绪超时"); return NULL; }
     nlog("poll: IL2CPP 已就绪，开始轮询（每 %d ms）", pa->interval_ms);
 
-    /* 就绪后才做自查 dump（类名/字段名/偏移），此时调 IL2CPP 才安全 */
-    static const char *hints[] = { "PlayerControl", "GameManager", "ShipStatus", "GameData" };
-    nebula_il2cpp_dump_report(NULL, hints, 4);
+    /* 就绪后才做自查 dump（类名/字段名/偏移），此时调 IL2CPP 才安全。
+       范围要覆盖：玩家/职业/数据/会议/ HUD —— 这些正是接线新职业要用到的类 */
+    static const char *hints[] = {
+        "PlayerControl", "GameManager", "ShipStatus", "GameData",
+        "RoleBehaviour", "PlayerInfo",  "MeetingHud", "AmongUsClient",
+        "HudManager",    "PlayerPhysics", "ExileController"
+    };
+    nebula_il2cpp_dump_report(NULL, hints,
+                              (int)(sizeof(hints) / sizeof(hints[0])));
 
     /* 等级 2：安装指针替换型 hook（无 JIT / 无 Frida），失败则继续纯轮询 */
     int tries = 0, installed = -1;
