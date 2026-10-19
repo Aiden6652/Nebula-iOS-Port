@@ -26,12 +26,18 @@ jobs:
           python3 tools/sim/full_game_sim.py
 
   # ② macOS：交叉编译 iOS arm64 dylib
+  #    固定用 macos-14：macos-latest 队列等待时间长；14 的镜像启动更快
   build-dylib:
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+        # macos-14 上 Xcode 路径可能是 Xcode_15.x.app，逐个探测而不是写死
+        run: |
+          XC=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "使用 Xcode: $XC"
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcrun --sdk iphoneos --show-sdk-path
       - name: Build dylib (arm64-ios)
         run: cd src/dylib && make
       - name: Verify artifact
