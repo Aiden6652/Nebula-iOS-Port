@@ -11,6 +11,9 @@
 #include "bridge.h"
 #include "hook.h"
 
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>      /* GCD：把操作排到游戏主线程，无需 hook */
+#endif
 #include <ctype.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -531,8 +534,10 @@ int nebula_il2cpp_apply_role_text(void)
     }
     if (text_off < 0) return 0;
 
-    /* 开关：放 nebula_no_text.txt 可关闭 UI 文本替换，用于排查 */
-    if (nebula_flag_file("nebula_no_text.txt")) return 0;
+    /* 默认【关闭】：它每轮要扫全场景的 TextMeshProUGUI 文本（上百个实例），
+       既重又容易触发 Unity 内部状态问题。确认需要身份界面显示时，
+       放 nebula_role_text.txt 开启。 */
+    if (!nebula_flag_file("nebula_role_text.txt")) return 0;
 
     void *insts[128];
     int n = nebula_il2cpp_get_instances(klass, insts, 128);
@@ -922,13 +927,35 @@ static void *poll_thread_main(void *arg) {
         return NULL;
     }
 
-    nlog("poll: hook 未生效，退化为低频轮询（每 3 秒，跨线程有风险）");
+    nlog("poll: 用 GCD 主队列低频轮询（每 3 秒），IL2CPP 操作在主线程执行");
     while (g_poll_run) {
-        nebula_il2cpp_apply_roles();
-        nebula_il2cpp_apply_role_text();
+        nebula_il2cpp_apply_all_async();
         sleep_ms(3000);
     }
     return NULL;
+}
+
+/* 一次性把职业应用到游戏（名字显示 + 可选的身份界面文本替换） */
+void nebula_il2cpp_apply_all(void)
+{
+    nebula_il2cpp_apply_roles();
+    nebula_il2cpp_apply_role_text();
+}
+
+/* ★ 把 IL2CPP 操作排到【游戏主线程】执行。
+   Unity/IL2CPP 的 API 不是线程安全的，绝不能在后台 pthread 里直接调用
+   （会破坏 Unity 内部状态，表现为交互失效、按键无响应）。
+   用 GCD 主队列就能排到主线程，且【不依赖 hook】—— 这是官方 API，
+   比 hook 侵入式接管 FixedUpdate 安全得多。 */
+void nebula_il2cpp_apply_all_async(void)
+{
+#if defined(__APPLE__) && defined(__BLOCKS__)
+    dispatch_async(dispatch_get_main_queue(), ^{
+        nebula_il2cpp_apply_all();
+    });
+#else
+    nebula_il2cpp_apply_all();      /* 非 Apple（本地测试无 GCD）：直接执行 */
+#endif
 }
 
 /* ★ 游戏主线程每帧调用（由 hook 的 tick 回调驱动）。

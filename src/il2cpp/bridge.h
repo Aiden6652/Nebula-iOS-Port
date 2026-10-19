@@ -65,6 +65,11 @@ int  nebula_il2cpp_find_field_exact(void *klass, const char **names, ptrdiff_t *
 /* ★ 游戏主线程每帧入口（由 hook tick 回调调用），内部已限流。
    所有 IL2CPP 操作都应通过它执行，不要在后台线程直接调。 */
 void nebula_il2cpp_tick_from_game(void);
+
+/* 一次性应用全部职业效果；_async 版本会把它排到【游戏主线程】执行
+   （Apple 上走 GCD 主队列，不依赖 hook） */
+void nebula_il2cpp_apply_all(void);
+void nebula_il2cpp_apply_all_async(void);
 int  nebula_il2cpp_get_float_by(void *obj, ptrdiff_t off, float *out);
 int  nebula_il2cpp_set_float_by(void *obj, ptrdiff_t off, float v);
 
