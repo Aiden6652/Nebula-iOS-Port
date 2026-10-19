@@ -93,6 +93,7 @@ const char *nebula_role_key(int role);   /* 官方英文 id，如 sheriff */
 int  nebula_role_count(void);             /* 职业总数 */
 int  nebula_role_id_at(int idx);          /* 按序号取枚举值，便于遍历 */
 const char *nebula_role_enum_name(int role); /* 枚举名，如 ROLE_SHERIFF */
+const char *nebula_role_color(int role);  /* 职业颜色 #RRGGBB */
 int  nebula_role_id_by_key(const char *key);   /* 官方英文 id -> 枚举值，如 sheriff */
 
 #endif /* NEBULA_ROLES_H */

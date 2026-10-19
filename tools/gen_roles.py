@@ -43,6 +43,38 @@ NEUTRAL  = {"jackal","sidekick","jester","arsonist","vulture","avenger",
             "scarletLover","obsessional","secret","secretInGame","metaRole",
             "extraMission","bloody"}
 
+
+# ---- 职业颜色（用户指定 + 常见默认 + 阵营兜底）----
+ROLE_COLOR = {
+    # 用户明确要求
+    "sheriff": "#FFA500",        # 警长 橙色
+    "jackal":  "#1D95F9",        # 豺狼 蓝色
+    "sidekick":"#1D95F9",        # 跟班 蓝色
+    # 内鬼阵营：红色（用户要求"内鬼全部都是红色"）
+    "impostor":"#FF1919", "sniper":"#FF1919", "bubblegun":"#FF1919",
+    "morphing":"#FF1919", "camouflager":"#FF1919", "cleaner":"#FF1919",
+    "effacer":"#FF1919", "necromancer":"#FF1919", "evilGuesser":"#FF1919",
+    "evilTracker":"#FF1919", "evilTrapper":"#FF1919", "raider":"#FF1919",
+    "noiseghost":"#FF1919", "destroyer":"#FF1919", "cannon":"#FF1919",
+    "clog":"#FF1919", "disturber":"#FF1919", "jailer":"#FF1919",
+    # 常见船员职业（各自颜色）
+    "doctor":"#00FF7F", "seer":"#B48EFF", "mayor":"#FFD700",
+    "bait":"#FF69B4", "crewmate":"#FFFFFF", "niceGuesser":"#FFFF99",
+    "niceTrapper":"#99FF99", "niceTracker":"#CCFFFF", "psychic":"#E6E6FA",
+    "busker":"#FFB6C1", "thurifer":"#FFE4B5", "provocateur":"#FF8C00",
+    "justice":"#FFF8DC", "hadar":"#C0C0C0", "echo":"#DDA0DD",
+    # 常见中立
+    "jester":"#B0B0B0", "vulture":"#8B5A2B", "arsonist":"#FF4500",
+    "avenger":"#808080", "chainShifter":"#7FFFD4", "lover":"#FFC0CB",
+    "alien":"#98FB98", "comet":"#87CEEB", "grudge":"#696969",
+    "chainshifter":"#7FFFD4", "confused":"#D3D3D3",
+}
+TEAM_COLOR = {"TEAM_IMPOSTOR":"#FF1919", "TEAM_NEUTRAL":"#C0C0C0", "TEAM_CREW":"#FFFFFF"}
+
+def color_of(rid, team):
+    if rid in ROLE_COLOR: return ROLE_COLOR[rid]
+    return TEAM_COLOR.get(team, "#FFFFFF")
+
 def team_of(rid):
     if rid in IMPOSTOR: return "TEAM_IMPOSTOR"
     if rid in NEUTRAL:  return "TEAM_NEUTRAL"
@@ -73,6 +105,7 @@ out_h.append("const char *nebula_role_key(int role);   /* 官方英文 id，如 
 out_h.append("int  nebula_role_count(void);             /* 职业总数 */")
 out_h.append("int  nebula_role_id_at(int idx);          /* 按序号取枚举值，便于遍历 */")
 out_h.append("const char *nebula_role_enum_name(int role); /* 枚举名，如 ROLE_SHERIFF */")
+out_h.append("const char *nebula_role_color(int role);  /* 职业颜色 #RRGGBB */")
 out_h.append("int  nebula_role_id_by_key(const char *key);   /* 官方英文 id -> 枚举值，如 sheriff */")
 out_h.append("")
 out_h.append("#endif /* NEBULA_ROLES_H */")
@@ -81,11 +114,11 @@ out_c = ["/* roles.c — 官方职业表（自动生成） */",
          '#include "roles.h"',
          '#include <string.h>',
          "",
-         "typedef struct { int id; const char *key; const char *name; nebula_team_t team; } role_row_t;",
+         "typedef struct { int id; const char *key; const char *name; nebula_team_t team; const char *color; } role_row_t;",
          "",
          "static const role_row_t ROLES[] = {"]
 for rid in ids:
-    out_c.append('    { %-30s "%s", "%s", %s },' % (enum_name[rid] + ",", rid, roles[rid], team_of(rid)))
+    out_c.append('    { %-30s "%s", "%s", %s, "%s" },' % (enum_name[rid] + ",", rid, roles[rid], team_of(rid), color_of(rid, team_of(rid))))
 out_c.append("};")
 out_c.append("")
 out_c.append("static const int ROLE_N = (int)(sizeof(ROLES)/sizeof(ROLES[0]));")
@@ -116,6 +149,11 @@ out_c.append("int nebula_role_id_by_key(const char *key) {")
 out_c.append("    if (!key) return -1;")
 out_c.append("    for (int i=0;i<ROLE_N;i++) if (ROLES[i].key && strcmp(ROLES[i].key, key)==0) return ROLES[i].id;")
 out_c.append("    return -1;")
+out_c.append("}")
+out_c.append("")
+out_c.append("const char *nebula_role_color(int role) {")
+out_c.append("    for (int i=0;i<ROLE_N;i++) if (ROLES[i].id==role) return ROLES[i].color;")
+out_c.append('    return "#FFFFFF";')
 out_c.append("}")
 out_c.append("")
 out_c.append("const char *nebula_role_enum_name(int role) {")
