@@ -73,11 +73,14 @@ out_h.append("const char *nebula_role_key(int role);   /* 官方英文 id，如 
 out_h.append("int  nebula_role_count(void);             /* 职业总数 */")
 out_h.append("int  nebula_role_id_at(int idx);          /* 按序号取枚举值，便于遍历 */")
 out_h.append("const char *nebula_role_enum_name(int role); /* 枚举名，如 ROLE_SHERIFF */")
+out_h.append("int  nebula_role_id_by_key(const char *key);   /* 官方英文 id -> 枚举值，如 sheriff */")
 out_h.append("")
 out_h.append("#endif /* NEBULA_ROLES_H */")
 
 out_c = ["/* roles.c — 官方职业表（自动生成） */",
-         '#include "roles.h"', "",
+         '#include "roles.h"',
+         '#include <string.h>',
+         "",
          "typedef struct { int id; const char *key; const char *name; nebula_team_t team; } role_row_t;",
          "",
          "static const role_row_t ROLES[] = {"]
@@ -109,6 +112,12 @@ out_c.append("};")
 out_c.append("")
 out_c.append("int nebula_role_count(void) { return ROLE_N; }")
 out_c.append("int nebula_role_id_at(int idx) { return (idx>=0 && idx<ROLE_N) ? ROLES[idx].id : 0; }")
+out_c.append("int nebula_role_id_by_key(const char *key) {")
+out_c.append("    if (!key) return -1;")
+out_c.append("    for (int i=0;i<ROLE_N;i++) if (ROLES[i].key && strcmp(ROLES[i].key, key)==0) return ROLES[i].id;")
+out_c.append("    return -1;")
+out_c.append("}")
+out_c.append("")
 out_c.append("const char *nebula_role_enum_name(int role) {")
 out_c.append("    for (int i=0;i<ROLE_N;i++) if (ROLES[i].id==role) return ENUM_NAMES[i];")
 out_c.append('    return "";')

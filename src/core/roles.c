@@ -1,5 +1,6 @@
 /* roles.c — 官方职业表（自动生成） */
 #include "roles.h"
+#include <string.h>
 
 typedef struct { int id; const char *key; const char *name; nebula_team_t team; } role_row_t;
 
@@ -182,6 +183,12 @@ static const char *ENUM_NAMES[] = {
 
 int nebula_role_count(void) { return ROLE_N; }
 int nebula_role_id_at(int idx) { return (idx>=0 && idx<ROLE_N) ? ROLES[idx].id : 0; }
+int nebula_role_id_by_key(const char *key) {
+    if (!key) return -1;
+    for (int i=0;i<ROLE_N;i++) if (ROLES[i].key && strcmp(ROLES[i].key, key)==0) return ROLES[i].id;
+    return -1;
+}
+
 const char *nebula_role_enum_name(int role) {
     for (int i=0;i<ROLE_N;i++) if (ROLES[i].id==role) return ENUM_NAMES[i];
     return "";

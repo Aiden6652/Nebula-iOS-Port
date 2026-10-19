@@ -11,6 +11,29 @@ static nebula_action_cb_t g_action_cb = NULL;
 
 void nebula_core_set_action_cb(nebula_action_cb_t cb) { g_action_cb = cb; }
 
+static nebula_game_t g_default_game;
+static int g_default_inited = 0;
+
+nebula_game_t *nebula_core_default_game(void)
+{
+    if (!g_default_inited) {
+        nebula_core_init(&g_default_game);
+        g_default_inited = 1;
+    }
+    return &g_default_game;
+}
+
+void nebula_core_register_player(uint32_t net_id, int team)
+{
+    nebula_game_t *g = nebula_core_default_game();
+    if (nebula_core_find(g, net_id)) return;          /* 已登记 */
+    /* 阵营映射：0船员 1内鬼 2中立（nebula_team_t） */
+    nebula_role_t r = (team == 1) ? ROLE_IMPOSTOR
+                    : (team == 2) ? ROLE_JESTER      /* 中立代表 */
+                    : ROLE_CREW;
+    nebula_core_add_player(g, net_id, r);
+}
+
 void nebula_core_init(nebula_game_t *g)
 {
     if (!g) return;

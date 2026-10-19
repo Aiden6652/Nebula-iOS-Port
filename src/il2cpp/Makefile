@@ -4,7 +4,7 @@ CC      ?= gcc
 CFLAGS  ?= -std=gnu11 -O2 -Wall -Wextra
 LDLIBS  ?= -ldl -lpthread
 TARGET  := test_bridge
-SRC     := test_bridge.c bridge.c hook.c ../core/roles.c
+SRC     := test_bridge.c bridge.c hook.c ../core/roles.c ../core/rolecfg.c ../core/core.c
 
 .PHONY: test clean
 

@@ -36,7 +36,7 @@ typedef struct {
 static il2cpp_ctx_t g_ctx = {0};
 
 /* ===== 本地玩法内核（纯本地逻辑，联机时只广播动作） ===== */
-static nebula_game_t g_game = {0};
+static nebula_game_t *g_game = NULL;
 
 /* 本地动作回调：本地发起的技能 → 编码成 RPC_ABILITY_USE → 走网络层广播 */
 static void on_local_action(uint32_t caster, uint16_t ability,
@@ -55,7 +55,7 @@ static void on_ability_recv(const uint8_t *payload, size_t len) {
     uint32_t caster, target; uint16_t ability; float x, y;
     if (nebula_unpack_ability(payload, (uint16_t)len,
                               &caster, &ability, &target, &x, &y) == 0) {
-        nebula_core_use_ability(&g_game, caster, ability, target, x, y, 0);
+        nebula_core_use_ability(g_game, caster, ability, target, x, y, 0);
     }
 }
 
@@ -95,7 +95,7 @@ void nebula_port_hook_setup(void) {
 
 /* ===== 自洽网络层 + 本地内核 ===== */
 void nebula_port_net_init(void) {
-    nebula_core_init(&g_game);
+    g_game = nebula_core_default_game();
     nebula_core_set_action_cb(on_local_action);   /* 本地动作 → 广播 */
     nebula_net_set_transport(transport_send_stub);
     nebula_net_register(RPC_ROLE_ASSIGN, on_role_assign);
@@ -104,14 +104,14 @@ void nebula_port_net_init(void) {
 }
 
 /* ===== 供 Frida/JS 桥接：返回本地游戏实例指针 ===== */
-nebula_game_t *nebula_get_game(void) { return &g_game; }
+nebula_game_t *nebula_get_game(void) { return g_game; }
 
 /* ===== 无 Frida 的游戏桥接：dylib 自己解析 libil2cpp 并轮询生效 =====
  * 不再依赖 Frida Gadget（用户环境没有），也不需要越狱；
  * 只读/写游戏对象字段与调用原版方法，不需要 JIT。 */
 /* ===== 每帧回调：由 Update hook 调用，驱动本地引擎推进 ===== */
 static void nebula_port_tick(void) {
-    nebula_core_tick(&g_game);
+    nebula_core_tick(g_game);
 }
 
 /* 无 Frida 的游戏桥接：dylib 自己解析 libil2cpp 并轮询生效 */

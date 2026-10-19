@@ -409,6 +409,7 @@ int nebula_il2cpp_set_int(void *obj, const char *field, int v) {
 
 /* ===================== 自适应字段定位 + 职业应用 ===================== */
 #include "../core/roles.h"
+#include "../core/rolecfg.h"
 
 /* 在类的字段列表里按名字子串匹配（忽略大小写），返回 0 并填充偏移 */
 int nebula_il2cpp_find_field(void *klass, const char *substr, ptrdiff_t *off_out)
@@ -490,39 +491,55 @@ int nebula_il2cpp_apply_roles(void)
     int n = nebula_il2cpp_get_instances(klass, insts, 16);
     if (n <= 0) return 0;
 
-    static const int pool[] = {
-        ROLE_SHERIFF, ROLE_JACKAL, ROLE_SNIPER, ROLE_MAYOR,
-        ROLE_DOCTOR,  ROLE_SEER,   ROLE_JESTER, ROLE_BAIT
-    };
-    static const float mul[] = { 1.0f, 1.10f, 1.05f, 0.95f, 1.0f, 1.0f, 1.0f, 1.0f };
-    const int pn = (int)(sizeof(pool) / sizeof(pool[0]));
+    /* ① 上场职业来自配置 Documents/nebula_roles.txt（可在电脑上改） */
+    static int roster[ROLECFG_MAX]; static int roster_n = 0; static int cfg_done = 0;
+    if (!cfg_done) {
+        cfg_done = 1;
+        const char *home = getenv("HOME");
+        char cfg[1024] = {0};
+        if (home) snprintf(cfg, sizeof(cfg), "%s/Documents/nebula_roles.txt", home);
+        nebula_rolecfg_emit_default(home ? cfg : NULL);   /* 首次生成，便于电脑上改 */
+        nebula_rolecfg_load(home ? cfg : NULL, roster, ROLECFG_MAX, &roster_n);
+    }
+    if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);
 
+    /* ② 字段（自适应定位，只找一次） */
     static ptrdiff_t speed_off = -1, name_off = -1;
     static int tried = 0;
     if (!tried) {
         tried = 1;
         if (nebula_il2cpp_find_field(klass, "speed", &speed_off) == 0)
             nebula_log("apply_roles: 速度字段 +%td", speed_off);
-        else nebula_log("apply_roles: 未找到含 speed 的字段");
+        else nebula_log("apply_roles: 未找到含 speed 的字段（速度效果跳过）");
         if (nebula_il2cpp_find_field(klass, "name", &name_off) == 0)
             nebula_log("apply_roles: 名字字段 +%td", name_off);
-        else nebula_log("apply_roles: 未找到含 name 的字段");
+        else nebula_log("apply_roles: 未找到含 name 的字段（名字前缀跳过）");
     }
 
     int applied = 0;
     for (int i = 0; i < n; i++) {
-        int rid = pool[i % pn];
+        int rid = nebula_rolecfg_pick(roster, roster_n, i);
+        if (rid < 0) continue;
         const char *rname = nebula_role_name(rid);
+        nebula_team_t team = nebula_role_team(rid);
 
+        /* ③ 按阵营登记进本地引擎，让胜负判定真正生效 */
+        nebula_core_register_player((uint32_t)(i + 1), team);
+
+        /* ④ 速度：按阵营微调（船员/内鬼/中立各不同，便于肉眼分辨） */
         if (speed_off >= 0) {
             float cur = 0;
-            if (nebula_il2cpp_get_float_by(insts[i], speed_off, &cur) == 0)
-                nebula_il2cpp_set_float_by(insts[i], speed_off, cur * mul[i % pn]);
+            if (nebula_il2cpp_get_float_by(insts[i], speed_off, &cur) == 0) {
+                float m = (team == TEAM_IMPOSTOR) ? 1.08f
+                        : (team == TEAM_NEUTRAL)  ? 1.04f : 1.0f;
+                nebula_il2cpp_set_float_by(insts[i], speed_off, cur * m);
+            }
         }
+        /* ⑤ 名字前缀：[官方中文职业名] */
         if (name_off >= 0) {
             char cur[128];
             if (nebula_il2cpp_get_string_by(insts[i], name_off, cur, sizeof(cur)) == 0) {
-                if (!strstr(cur, "[")) {           /* 已加过前缀就不再加 */
+                if (!strstr(cur, "[")) {
                     char nn[160];
                     snprintf(nn, sizeof(nn), "[%s]%s", rname ? rname : "?", cur);
                     nebula_il2cpp_set_string_by(insts[i], name_off, nn);

@@ -131,6 +131,13 @@ void nebula_core_tick(nebula_game_t *g);
    把该玩家生效中的修饰后缀（如 " N"、" ★"）追加到 buf 末尾 */
 void nebula_core_decorate_name(const nebula_player_t *p, char *buf, size_t sz);
 
+/* 默认对局实例（dylib 全局唯一），各模块共用一份 */
+nebula_game_t *nebula_core_default_game(void);
+
+/* 按阵营登记一名玩家（team: 0船员 1内鬼 2中立），已登记则跳过。
+   让职业分配的阵营信息进入引擎，胜负判定才生效。 */
+void nebula_core_register_player(uint32_t net_id, int team);
+
 /* 修饰 */
 void nebula_core_add_modifier(nebula_game_t *g, uint32_t net_id, uint32_t mod);
 int  nebula_core_has_modifier(nebula_player_t *p, uint32_t mod);
