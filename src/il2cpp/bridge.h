@@ -64,6 +64,9 @@ int  nebula_il2cpp_set_float_by(void *obj, ptrdiff_t off, float v);
 int  nebula_il2cpp_get_string_by(void *obj, ptrdiff_t off, char *out, size_t osz);
 int  nebula_il2cpp_set_string_by(void *obj, ptrdiff_t off, const char *utf8);
 
+/* ★ 取所有玩家（优先静态 AllPlayerControls，兜底 FindObjectsOfType） */
+int  nebula_il2cpp_get_players(void **out, int max);
+
 /* ★ 把本地引擎的职业应用到游戏对象上（登记 + 名字前缀 + 速度） */
 int  nebula_il2cpp_apply_roles(void);
 

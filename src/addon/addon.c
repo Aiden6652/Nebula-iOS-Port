@@ -373,11 +373,24 @@ static void scan_once(const char *dir, int builtin_only)
     closedir(d);
 }
 
+/* 统一的 addons 目录：<base>/Documents/addons
+   （iOS 上直接建在容器根目录可能失败；Documents 稳定可写，且能被文件共享访问） */
+static void addons_dir(const char *base_dir, char *out, size_t osz)
+{
+    if (!base_dir) { if (osz) out[0] = '\0'; return; }
+    char doc[1024];
+    snprintf(doc, sizeof(doc), "%s/Documents", base_dir);
+    struct stat st;
+    if (stat(doc, &st) != 0) mkdir(doc, 0755);
+    snprintf(out, osz, "%s/addons", doc);
+}
+
 int nebula_addon_emit_builtin_langpack(const char *base_dir)
 {
     if (!base_dir) return -1;
     char dir[1024], path[1024];
-    snprintf(dir,  sizeof(dir),  "%s/%s", base_dir, NEBULA_ADDON_DIR);
+    addons_dir(base_dir, dir, sizeof(dir));
+    mkdir(dir, 0755);
     snprintf(path, sizeof(path), "%s/lang_zh_CN.naddon", dir);
     FILE *f = fopen(path, "w");
     if (!f) return -1;
@@ -393,8 +406,12 @@ int nebula_addon_init(const char *base_dir)
     load_builtin_zh();
     if (!base_dir) return -1;
 
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/%s", base_dir, NEBULA_ADDON_DIR);
+    char doc[1024], dir[1024];
+    /* iOS 上直接建在容器根目录可能失败，统一放到 Documents 下（也可被文件共享访问） */
+    snprintf(doc, sizeof(doc), "%s/Documents", base_dir);
+    struct stat dst;
+    if (stat(doc, &dst) != 0) mkdir(doc, 0755);
+    snprintf(dir, sizeof(dir), "%s/addons", doc);
     struct stat st;
     if (stat(dir, &st) != 0 && mkdir(dir, 0755) != 0) {
         nebula_log("addon: 目录不可用 %s", dir);

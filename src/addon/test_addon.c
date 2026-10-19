@@ -31,8 +31,8 @@ int main(int argc, char **argv) {
     /* 2) 准备临时 addons 目录 */
     const char *base = "/tmp/nebula_addon_test";
     char dir[512];
-    snprintf(dir, sizeof(dir), "%s/%s", base, NEBULA_ADDON_DIR);
-    system("rm -rf /tmp/nebula_addon_test && mkdir -p /tmp/nebula_addon_test/addons");
+    snprintf(dir, sizeof(dir), "%s/Documents/%s", base, NEBULA_ADDON_DIR);
+    system("rm -rf /tmp/nebula_addon_test && mkdir -p /tmp/nebula_addon_test/Documents/addons");
 
     /* 3) 放一个覆盖角色名的插件 */
     char f1[512]; snprintf(f1, sizeof(f1), "%s/my_zh.naddon", dir);

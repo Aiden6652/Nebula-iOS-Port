@@ -119,12 +119,24 @@ static void *update_hook(void *instance, void *method) {
     return orig ? orig(instance, method) : NULL;      /* 继续调用原函数 */
 }
 
+/* 目标回退链：GameManager 在新版里没有 Update，依次尝试其它真实存在的入口 */
+static const struct { const char *cls; const char *mth; } hook_targets[] = {
+    { "PlayerControl", "FixedUpdate" },
+    { "PlayerControl", "Update" },
+    { "ShipStatus",    "Update" },
+    { "GameManager",   "Update" },
+};
+
 int nebula_hook_install_game_update(void) {
     if (!nebula_hook_enabled()) {
         hlog("hook: 检测到关闭标记，已停用 hook，退回纯轮询模式（不崩但无帧级逻辑）");
         return -2;
     }
-    int rc = nebula_hook_install("GameManager", "Update", update_hook, NULL);
+    int rc = -1;
+    for (size_t i = 0; i < sizeof(hook_targets)/sizeof(hook_targets[0]); i++) {
+        rc = nebula_hook_install(hook_targets[i].cls, hook_targets[i].mth, update_hook, NULL);
+        if (rc == 0) { hlog("hook: 已挂到 %s.%s", hook_targets[i].cls, hook_targets[i].mth); break; }
+    }
     if (rc == 0) hlog("hook: 每帧逻辑已接入游戏 Update（指针替换，无 JIT/无 Frida）");
     return rc;
 }

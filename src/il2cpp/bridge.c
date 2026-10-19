@@ -247,6 +247,7 @@ typedef const char *(*fn_method_get_name)(void *method);
 typedef int (*fn_method_get_param_count)(void *method);
 typedef void *(*fn_runtime_invoke)(void *method, void *obj, void **params, void **exc);
 typedef void *(*fn_string_new)(const char *str);
+typedef void  (*fn_field_static_get)(void *field, void *value);
 
 typedef struct {
     fn_domain_get                 domain_get;
@@ -270,6 +271,7 @@ typedef struct {
     fn_method_get_param_count     method_get_param_count;
     fn_runtime_invoke             runtime_invoke;
     fn_string_new                string_new;
+    fn_field_static_get          field_static_get;
 } il2cpp_api_t;
 
 static il2cpp_api_t A = {0};
@@ -310,6 +312,7 @@ int nebula_il2cpp_init(void) {
     A.method_get_param_count= (fn_method_get_param_count)sym("il2cpp_method_get_param_count");
     A.runtime_invoke        = (fn_runtime_invoke)sym("il2cpp_runtime_invoke");
     A.string_new            = (fn_string_new)sym("il2cpp_string_new");   /* 辅助：创建字符串 */
+    A.field_static_get      = (fn_field_static_get)sym("il2cpp_field_static_get_value"); /* 读静态字段 */
 
     if (!A.domain_get || !A.domain_get_assemblies || !A.assembly_get_image ||
         !A.image_get_class_count || !A.image_get_class || !A.class_get_name ||
@@ -560,16 +563,61 @@ int nebula_il2cpp_apply_role_text(void)
     return replaced;
 }
 
+/* ---- 读取静态字段（如 PlayerControl.AllPlayerControls） ---- */
+static int static_field_ptr(void *klass, const char *name, void **out)
+{
+    if (!g_api_ok || !klass || !name || !A.class_get_field_from_name || !A.field_static_get) return -1;
+    void *f = A.class_get_field_from_name(klass, name);
+    if (!f) return -1;
+    void *v = NULL;
+    A.field_static_get(f, &v);
+    if (!v) return -1;
+    if (out) *out = v;
+    return 0;
+}
+
+/* ---- 读取 List<T>：返回元素指针数组 ---- */
+static int list_elements(void *list_obj, void **out, int max)
+{
+    if (!list_obj || !out || max <= 0) return -1;
+    void *klass = *(void **)list_obj;
+    if (!klass) return -1;
+    ptrdiff_t items_off = -1, size_off = -1;
+    if (nebula_il2cpp_find_field(klass, "_items", &items_off) != 0) return -1;
+    nebula_il2cpp_find_field(klass, "_size", &size_off);
+    void *arr = *(void **)((char *)list_obj + items_off);
+    if (!arr) return -1;
+    int size = (size_off >= 0) ? *(int *)((char *)list_obj + size_off) : 0;
+    if (size <= 0) size = *(int32_t *)((char *)arr + 0x18);
+    if (size <= 0) return -1;
+    if (size > max) size = max;
+    for (int i = 0; i < size; i++)
+        out[i] = *(void **)((char *)arr + 0x20 + (size_t)i * sizeof(void *));
+    return size;
+}
+
+/* ★ 取所有玩家：优先静态 PlayerControl.AllPlayerControls，退化为 FindObjectsOfType */
+int nebula_il2cpp_get_players(void **out, int max)
+{
+    void *klass = nebula_il2cpp_find_class_by_hint("PlayerControl");
+    if (!klass) return -1;
+    void *list = NULL;
+    if (static_field_ptr(klass, "AllPlayerControls", &list) == 0 && list) {
+        int n = list_elements(list, out, max);
+        if (n > 0) return n;
+    }
+    return nebula_il2cpp_get_instances(klass, out, max);
+}
+
 int nebula_il2cpp_apply_roles(void)
 {
     void *klass = nebula_il2cpp_find_class_by_hint("PlayerControl");
     if (!klass) return 0;
 
     void *insts[16];
-    int n = nebula_il2cpp_get_instances(klass, insts, 16);
+    int n = nebula_il2cpp_get_players(insts, 16);
     if (n <= 0) return 0;
 
-    /* ① 上场职业来自配置 Documents/nebula_roles.txt */
     static int roster[ROLECFG_MAX]; static int roster_n = 0; static int cfg_done = 0;
     if (!cfg_done) {
         cfg_done = 1;
@@ -581,42 +629,38 @@ int nebula_il2cpp_apply_roles(void)
     }
     if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);
 
-    /* ② 名字字段：真实结构里名字在 PlayerInfo/GameData 的 PlayerName，
-          不在 PlayerControl（PlayerControl 的 name 是引擎属性，非托管字段） */
-    static void *name_class = NULL; static ptrdiff_t name_off = -1; static int name_tried = 0;
-    if (!name_tried) {
-        name_tried = 1;
-        const char *cls_cands[] = { "PlayerInfo", "GameData", "PlayerControl" };
-        const char *fld_cands[] = { "playername", "name" };
-        for (int ci = 0; ci < 3 && name_off < 0; ci++) {
-            void *kc = nebula_il2cpp_find_class_by_hint(cls_cands[ci]);
-            if (!kc) continue;
-            for (int fi = 0; fi < 2; fi++) {
-                if (nebula_il2cpp_find_field(kc, fld_cands[fi], &name_off) == 0) {
-                    name_class = kc;
-                    nebula_log("apply_roles: 名字 %s.%s 偏移 +%td",
-                               cls_cands[ci], fld_cands[fi], name_off);
-                    break;
-                }
-            }
-        }
-        if (name_off < 0) nebula_log("apply_roles: 未定位到名字字段（名字前缀将跳过）");
-    }
-
-    /* ③ 速度字段：真实结构里速度在 PlayerPhysics */
-    static void *speed_class = NULL; static ptrdiff_t speed_off = -1; static int speed_tried = 0;
+    /* 速度：PlayerControl.MyPhysics -> PlayerPhysics.speed */
+    static ptrdiff_t phys_off = -1, speed_off = -1;
+    static int speed_tried = 0;
     if (!speed_tried) {
         speed_tried = 1;
-        const char *cls_cands[] = { "PlayerPhysics", "PlayerControl" };
-        for (int ci = 0; ci < 2 && speed_off < 0; ci++) {
-            void *kc = nebula_il2cpp_find_class_by_hint(cls_cands[ci]);
-            if (!kc) continue;
-            if (nebula_il2cpp_find_field(kc, "speed", &speed_off) == 0) {
-                speed_class = kc;
-                nebula_log("apply_roles: 速度 %s 偏移 +%td", cls_cands[ci], speed_off);
+        if (nebula_il2cpp_find_field(klass, "MyPhysics", &phys_off) == 0 && n > 0) {
+            void *p0 = *(void **)((char *)insts[0] + phys_off);
+            if (p0) {
+                void *pk = *(void **)p0;
+                if (nebula_il2cpp_find_field(pk, "speed", &speed_off) == 0)
+                    nebula_log("apply_roles: 速度 PlayerPhysics +%td", speed_off);
             }
         }
-        if (speed_off < 0) nebula_log("apply_roles: 未定位到速度字段（速度效果将跳过）");
+        if (speed_off < 0) nebula_log("apply_roles: 速度字段未定位（将跳过）");
+    }
+
+    /* 名字：PlayerControl.CachedPlayerData -> NetworkedPlayerInfo.PlayerName */
+    static ptrdiff_t info_off = -1, name_off = -1;
+    static int name_tried = 0;
+    if (!name_tried) {
+        name_tried = 1;
+        if (nebula_il2cpp_find_field(klass, "CachedPlayerData", &info_off) == 0 && n > 0) {
+            void *i0 = *(void **)((char *)insts[0] + info_off);
+            if (i0) {
+                void *ik = *(void **)i0;
+                if (nebula_il2cpp_find_field(ik, "playername", &name_off) != 0)
+                    nebula_il2cpp_find_field(ik, "name", &name_off);
+                if (name_off >= 0)
+                    nebula_log("apply_roles: 名字 NetworkedPlayerInfo +%td", name_off);
+            }
+        }
+        if (name_off < 0) nebula_log("apply_roles: 名字字段未定位（将跳过）");
     }
 
     int applied = 0;
@@ -625,34 +669,28 @@ int nebula_il2cpp_apply_roles(void)
         if (rid < 0) continue;
         const char *rname = nebula_role_name(rid);
         nebula_team_t team = nebula_role_team(rid);
-
         nebula_core_register_player((uint32_t)(i + 1), team);
 
-        /* 速度（按阵营微调） */
-        if (speed_class && speed_off >= 0) {
-            void *sobj[16];
-            int sn = nebula_il2cpp_get_instances(speed_class, sobj, 16);
-            if (sn > 0 && i < sn) {
+        if (phys_off >= 0 && speed_off >= 0) {
+            void *phys = *(void **)((char *)insts[i] + phys_off);
+            if (phys) {
                 float cur = 0;
-                if (nebula_il2cpp_get_float_by(sobj[i], speed_off, &cur) == 0) {
+                if (nebula_il2cpp_get_float_by(phys, speed_off, &cur) == 0) {
                     float m = (team == TEAM_IMPOSTOR) ? 1.08f
                             : (team == TEAM_NEUTRAL)  ? 1.04f : 1.0f;
-                    nebula_il2cpp_set_float_by(sobj[i], speed_off, cur * m);
+                    nebula_il2cpp_set_float_by(phys, speed_off, cur * m);
                 }
             }
         }
-        /* 名字前缀 */
-        if (name_class && name_off >= 0) {
-            void *nobj[16];
-            int nn = nebula_il2cpp_get_instances(name_class, nobj, 16);
-            if (nn > 0 && i < nn) {
+        if (info_off >= 0 && name_off >= 0) {
+            void *info = *(void **)((char *)insts[i] + info_off);
+            if (info) {
                 char cur[128];
-                if (nebula_il2cpp_get_string_by(nobj[i], name_off, cur, sizeof(cur)) == 0) {
-                    if (cur[0] && !strstr(cur, "[")) {
-                        char buf[160];
-                        snprintf(buf, sizeof(buf), "[%s]%s", rname ? rname : "?", cur);
-                        nebula_il2cpp_set_string_by(nobj[i], name_off, buf);
-                    }
+                if (nebula_il2cpp_get_string_by(info, name_off, cur, sizeof(cur)) == 0
+                    && cur[0] && !strstr(cur, "[")) {
+                    char buf[160];
+                    snprintf(buf, sizeof(buf), "[%s]%s", rname ? rname : "?", cur);
+                    nebula_il2cpp_set_string_by(info, name_off, buf);
                 }
             }
         }
@@ -699,13 +737,11 @@ int nebula_il2cpp_get_instances(void *klass, void **out, int max) {
     void *objClass = unity_object_class();
     if (!objClass) { nlog("get_instances: 找不到 UnityEngine.Object"); return -1; }
 
-    /* 找 FindObjectsOfType 的单参数重载 */
-    void *iter = NULL, *method = NULL;
-    for (void *m = A.class_get_methods(objClass, &iter); m; m = A.class_get_methods(objClass, &iter)) {
-        const char *mn = A.method_get_name ? A.method_get_name(m) : NULL;
-        if (mn && strcmp(mn, "FindObjectsOfType") == 0 && A.method_get_param_count(m) == 1) {
-            method = m; break;
-        }
+    /* 直接用 IL2CPP 接口按名取方法（比遍历方法表可靠） */
+    void *method = NULL;
+    if (A.class_get_method_from_name) {
+        method = A.class_get_method_from_name(objClass, "FindObjectsOfType", 1);
+        if (!method) method = A.class_get_method_from_name(objClass, "FindObjectsByType", 1);
     }
     if (!method) { nlog("get_instances: 找不到 FindObjectsOfType(Type)"); return -1; }
 
