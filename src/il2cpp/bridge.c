@@ -633,6 +633,30 @@ int nebula_ui_switch_requested(void) __attribute__((weak));
    必须持续重试，否则用户永远看不到按钮。 */
 int nebula_ui_install_now(void) __attribute__((weak));
 
+/* ★ 配置热重载：用户在 iPad「文件」App 里改了 nebula_roles.txt /
+   nebula_freeplay.txt，1 秒内生效，不用重启游戏。
+   这也是面板万一装不上时的兜底手段（改 role xxx 就能指定职业）。 */
+#include <sys/stat.h>
+static time_t nebula_file_mtime(const char *path)
+{
+    struct stat st;
+    if (!path || !path[0]) return 0;
+    return (stat(path, &st) == 0) ? st.st_mtime : 0;
+}
+
+static void reload_if_changed(const char *path, time_t *last_mtime,
+                              int (*reload)(const char *), const char *tag)
+{
+    if (!path || !path[0] || !last_mtime || !reload) return;
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (st.st_mtime == *last_mtime) return;
+    int first = (*last_mtime == 0);
+    *last_mtime = st.st_mtime;
+    reload(path);
+    if (!first) nebula_log("%s: 检测到配置改动，已热重载", tag);
+}
+
 /* 每轮都试着装一次面板，装好后就不再试（开销极小） */
 static void freeplay_try_install_ui(void)
 {
@@ -954,7 +978,8 @@ int nebula_il2cpp_apply_roles(void)
     /* ★ 上场职业来自【权重表】（267 个职业，由游戏内「职业」面板调整）。
        每轮重新展开：面板里点了 +/- 之后 1 秒内就生效，不用重启游戏。 */
     static int roster[512]; static int roster_n = 0; static int cfg_done = 0;
-    static char g_roles_path[1024] = {0};
+    static char g_roles_path[1024] = {0}, g_fp_path[1024] = {0};
+    static time_t g_roles_mtime = 0, g_fp_mtime = 0;
     if (!cfg_done) {
         cfg_done = 1;
         const char *home = getenv("HOME");
@@ -962,14 +987,19 @@ int nebula_il2cpp_apply_roles(void)
                            "%s/Documents/nebula_roles.txt", home);
         nebula_rolecfg_emit_default(home ? g_roles_path : NULL);   /* 首次生成默认清单 */
         nebula_weight_load(home ? g_roles_path : NULL);
+        g_roles_mtime = nebula_file_mtime(g_roles_path);
         /* ★ 自由模式（星云舰 Solo Free Play）：存在 nebula_freeplay.txt 即开启 */
         if (home) {
             char fp[1024] = {0};
             snprintf(fp, sizeof(fp), "%s/Documents/nebula_freeplay.txt", home);
             if (nebula_freeplay_load(fp) != 0)
                 nebula_freeplay_emit_sample(fp);   /* 首次生成示例（默认关闭） */
+            snprintf(g_fp_path, sizeof(g_fp_path), "%s", fp);
+            g_fp_mtime = nebula_file_mtime(fp);
         }
     }
+    reload_if_changed(g_roles_path, &g_roles_mtime, nebula_weight_load, "roleweight");
+    reload_if_changed(g_fp_path,    &g_fp_mtime,    nebula_freeplay_load, "freeplay");
     roster_n = nebula_weight_expand(roster, 512);
     /* 自由模式：先把房间人数补齐（单人也能开局） */
     freeplay_fill_room(n);
