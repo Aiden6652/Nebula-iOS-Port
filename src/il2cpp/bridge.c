@@ -556,12 +556,25 @@ int nebula_il2cpp_apply_role_text(void)
     if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);
 
     /* 需要被替换掉的【基础职业显示名】（中英都列，兼容不同语言） */
-    static const char *base_names[] = {
-        "船员", "伪装者", "内鬼", "科学家", "工程师", "守护天使",
-        "变形者", "幻影", "追踪者", "噪音制造者",
-        "Crewmate", "Impostor", "Scientist", "Engineer", "Guardian Angel",
-        "Shapeshifter", "Phantom", "Tracker", "Noisemaker", NULL
+    /* ★ 槽位映射：原版角色设置界面有 11 个固定槽位，
+       把每个槽位的文字换成我们阵容里【对应顺序】的职业名。
+       这样你在【编辑房间】里看到的就是我们的职业，且能直接调数量
+       （原版列表是硬编码加不进条目，只能借它的槽位显示）。 */
+    static const char *slots[][3] = {
+        {"科学家",   "Scientist",     "Scientist"},
+        {"工程师",   "Engineer",      "Engineer"},
+        {"守护天使", "Guardian Angel","GuardianAngel"},
+        {"变形者",   "Shapeshifter",  "Shapeshifter"},
+        {"幻影",     "Phantom",       "Phantom"},
+        {"追踪者",   "Tracker",       "Tracker"},
+        {"噪音制造者","Noisemaker",   "Noisemaker"},
+        {"侦探",     "Detective",     "Detective"},
+        {"审判官",   "Judge",         "Judge"},
+        {"通灵师",   "SpiritGuide",   "SpiritGuide"},
+        {"毒蛇",     "Viper",         "Viper"},
+        {NULL, NULL, NULL}
     };
+    static const char *team_names[] = {"船员", "伪装者", "内鬼", "Crewmate", "Impostor", NULL};
 
     int replaced = 0;
     for (int i = 0; i < n; i++) {
@@ -570,22 +583,35 @@ int nebula_il2cpp_apply_role_text(void)
         if (!cur[0]) continue;
         if (strstr(cur, "[")) continue;                 /* 已替换过 */
 
-        for (int b = 0; base_names[b]; b++) {
-            if (strcmp(cur, base_names[b]) == 0) {
-                int rid = nebula_rolecfg_pick(roster, roster_n, replaced);
-                if (rid < 0) break;
-                const char *rname = nebula_role_name(rid);
+        /* ① 阵营名不动（船员/伪装者） */
+        int is_team = 0;
+        for (int t = 0; team_names[t]; t++)
+            if (strcmp(cur, team_names[t]) == 0) { is_team = 1; break; }
+        if (is_team) continue;
+
+        /* ② 命中哪个槽位 → 换成对应顺序的职业名 */
+        for (int k = 0; slots[k][0]; k++) {
+            if (strcmp(cur, slots[k][0]) == 0 ||
+                strcmp(cur, slots[k][1]) == 0 ||
+                strcmp(cur, slots[k][2]) == 0) {
+
+                int rid = (k < roster_n) ? roster[k] : -1;
+                const char *rname = rid >= 0 ? nebula_role_name(rid) : NULL;
                 char nn[160];
-                snprintf(nn, sizeof(nn), "[%s]", rname ? rname : "?");
+                if (rname)
+                    snprintf(nn, sizeof(nn), "[%s]", rname);
+                else
+                    snprintf(nn, sizeof(nn), "[空位%d]", k + 1);   /* 该槽位未分配 */
+
                 if (nebula_il2cpp_set_string_by(insts[i], text_off, nn) == 0) {
-                    nebula_log("role_text: %s -> %s", cur, nn);
+                    nebula_log("role_text: 槽位%d %s -> %s", k + 1, cur, nn);
                     replaced++;
                 }
                 break;
             }
         }
     }
-    if (replaced) nebula_log("role_text: 本轮替换 %d 处职业显示", replaced);
+    if (replaced) nebula_log("role_text: 本轮替换 %d 处（槽位→职业）", replaced);
     return replaced;
 }
 
@@ -644,7 +670,15 @@ int nebula_il2cpp_apply_roles(void)
 
     void *insts[16];
     int n = nebula_il2cpp_get_players(insts, 16);
-    if (n <= 0) return 0;
+    if (n <= 0) {
+        /* 取不到玩家 = 当前不在对局内（大厅/编辑房间没有 PlayerControl 实例）。
+           这是正常的：职业显示在【局内玩家名字上方】，局外本来就没有。 */
+        static int miss_log = 0;
+        if (++miss_log % 10 == 1)
+            nebula_log("apply_roles: 当前无玩家实例(第%d次) —— 若一直为 0，说明尚未进入对局",
+                       miss_log);
+        return 0;
+    }
 
     static int roster[ROLECFG_MAX]; static int roster_n = 0; static int cfg_done = 0;
     if (!cfg_done) {
@@ -733,15 +767,30 @@ int nebula_il2cpp_apply_roles(void)
                     char buf[160];
                     /* 原版星云舰样式：职业在名字【上方】、字号更小、带职业专属颜色
                        用 TextMeshPro 富文本：<size> 缩小 + <color> 上色 */
-                    const char *col = nebula_role_color(rid);
-                    snprintf(buf, sizeof(buf),
-                             "<size=70%%><color=%s>[%s]</color></size>\n%s",
-                             col ? col : "#FFFFFF", rname ? rname : "?", cur);
+                    if (nebula_flag_file("nebula_plain_name.txt")) {
+                        /* 纯文本模式：万一 TMP 没开富文本，标签会原样显示成乱码，
+                           用它可对比排查（只有职业名 + 换行，无 <size>/<color>） */
+                        snprintf(buf, sizeof(buf), "[%s]\n%s",
+                                 rname ? rname : "?", cur);
+                    } else {
+                        const char *col = nebula_role_color(rid);
+                        snprintf(buf, sizeof(buf),
+                                 "<size=70%%><color=%s>[%s]</color></size>\n%s",
+                                 col ? col : "#FFFFFF", rname ? rname : "?", cur);
+                    }
                     nebula_il2cpp_set_string_by(info, name_off, buf);
                 }
             }
         }
         applied++;
+    }
+    {
+        static int round = 0;
+        if (++round % 10 == 1)
+            nebula_log("apply_roles: 玩家=%d 已应用=%d | 名字字段%s 速度字段%s",
+                       n, applied,
+                       name_off  >= 0 ? "已定位" : "未定位",
+                       speed_off >= 0 ? "已定位" : "未定位(默认关)");
     }
     return applied;
 }

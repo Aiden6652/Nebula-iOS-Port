@@ -34,11 +34,32 @@ void nebula_core_register_player(uint32_t net_id, int team)
     nebula_core_add_player(g, net_id, r);
 }
 
+int nebula_core_set_judged(nebula_game_t *g, const uint32_t *targets, int n)
+{
+    if (!g || !targets || n < 1 || n > 4) return -1;
+    g->judged_n = 0;
+    for (int i = 0; i < n; i++) {
+        nebula_player_t *p = nebula_core_find(g, targets[i]);
+        if (!p || !p->alive) continue;                 /* 跳过已死/不存在的 */
+        g->judged[g->judged_n++] = targets[i];
+    }
+    return g->judged_n > 0 ? 0 : -1;
+}
+
+int nebula_core_is_judged(nebula_game_t *g, uint32_t net_id)
+{
+    if (!g) return 0;
+    for (int i = 0; i < g->judged_n; i++)
+        if (g->judged[i] == net_id) return 1;
+    return 0;
+}
+
 void nebula_core_init(nebula_game_t *g)
 {
     if (!g) return;
     memset(g, 0, sizeof(*g));
     g->meeting_by = -1;
+    g->judged_n    = 0;
 }
 
 void nebula_core_add_player(nebula_game_t *g, uint32_t net_id, nebula_role_t role)
@@ -162,6 +183,14 @@ int nebula_core_use_ability(nebula_game_t *g, uint32_t caster, uint16_t ability,
         c->kill_cd = 40;
         break;
     }
+    case ABILITY_JUDGE: {
+        /* 审判：本次会议指定被告。这里以 target 为首个被告，
+           多目标可通过连续调用追加（judged_n < 4）。 */
+        if (g->phase != PHASE_MEET) return -1;
+        uint32_t t = target;
+        if (nebula_core_set_judged(g, &t, 1) != 0) return -1;
+        break;
+    }
     case ABILITY_VANISH: {
         /* 忍者隐身（移植自插件 Ninja.cs 的 vanishButton） */
         nebula_player_t *c = nebula_core_find(g, caster);
@@ -253,9 +282,23 @@ int nebula_core_resolve_meeting(nebula_game_t *g)
         if (g->players[ej].role == ROLE_JESTER) {
             g->phase = PHASE_OVER; g->winner = WIN_JESTER; return ejected;
         }
+    } else if (maxc > 0 && tie && g->judged_n > 0) {
+        /* ★ 审判长规则：审判中若平票，所有平票者【一起飞】 */
+        for (int j = 0; j < g->n_players; j++) {
+            if (cnt[j] != maxc || !g->players[j].alive) continue;
+            g->players[j].alive = 0;
+            if (ejected < 0) ejected = j;
+            if (g->players[j].role == ROLE_JESTER) {
+                g->phase = PHASE_OVER; g->winner = WIN_JESTER;
+                g->judged_n = 0; g->meeting_by = -1;
+                return ejected;
+            }
+        }
     }
+
     g->phase = PHASE_PLAY;
     g->meeting_by = -1;
+    g->judged_n = 0;
     nebula_core_check_win(g);
     return ejected;
 }

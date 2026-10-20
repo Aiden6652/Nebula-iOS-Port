@@ -55,6 +55,7 @@ typedef enum {
 #define ABILITY_BUBBLE   10  /* 泡泡击杀：caster 远程击杀且隐藏尸体（不触发 BAIT 报告） */
 #define ABILITY_RECRUIT  11  /* 招募：豺狼把 target 变为自己的跟班 */
 #define ABILITY_VANISH   12  /* 隐身（移植自插件 Ninja）：caster 进入隐身 */
+#define ABILITY_JUDGE    13  /* 审判（审判长）：开会时指定 1~4 名"被告"，本次会议只能投给他们 */
 
 /* ===================== 修饰（Auxiliary，位掩码） ===================== */
 #define MOD_NONE     0x0000
@@ -100,6 +101,9 @@ typedef struct {
     int            phase;
     int            winner;       /* 0=未定 1=船员 2=内鬼 4=小丑 */
     int            meeting_by;   /* 发起会议者 net_id，-1 无 */
+    /* 审判长：本次会议被审判的对象（最多 4 名） */
+    uint32_t       judged[4];
+    int            judged_n;     /* 0 = 本次会议不是审判 */
     uint32_t       mod_defs[NEBULA_MAX_MODS]; /* 修饰效果参数表（演示） */
 } nebula_game_t;
 
@@ -118,6 +122,11 @@ int  nebula_core_use_ability(nebula_game_t *g, uint32_t caster, uint16_t ability
 
 /* 会议 / 投票 */
 void nebula_core_call_meeting(nebula_game_t *g, uint32_t caster, int local);
+
+/* 审判长：指定本次会议的"被告"（1~4 名）。只在会议阶段有效。 */
+int  nebula_core_set_judged(nebula_game_t *g, const uint32_t *targets, int n);
+/* 某人是否正在被审判 */
+int  nebula_core_is_judged(nebula_game_t *g, uint32_t net_id);
 void nebula_core_cast_vote(nebula_game_t *g, uint32_t voter, uint32_t target, int local);
 /* 结算会议：驱逐得票最高者；返回被驱逐者 net_id，-1 表示无人出局 */
 int  nebula_core_resolve_meeting(nebula_game_t *g);
