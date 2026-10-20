@@ -95,6 +95,24 @@ int main(void) {
     nebula_freeplay_load(p);
     CHECK(!nebula_freeplay_enabled(), "写 off 可关闭自由模式");
 
+    /* ⑩ 悬浮按钮手动切换：立即换下一个，且不会立刻被自动轮换再次跳过 */
+    wr(p, "rotate 20\n");
+    nebula_freeplay_load(p);
+    CHECK(nebula_freeplay_role(0, ids, n) == ids[0], "按钮切换前是第 1 个");
+    nebula_freeplay_next(n);
+    CHECK(nebula_freeplay_role(0, ids, n) == ids[1], "点一次按钮 → 第 2 个职业");
+    nebula_freeplay_next(n);
+    CHECK(nebula_freeplay_role(0, ids, n) == ids[2], "再点一次 → 第 3 个职业");
+    CHECK(nebula_freeplay_tick(n, (long)nebula_freeplay_state()->last_switch) == 0,
+          "刚手动切换完，自动轮换不会紧接着又跳");
+
+    /* 固定职业时按钮不切换（用户盯着一个职业测） */
+    wr(p, "role sheriff\n");
+    nebula_freeplay_load(p);
+    int fr = nebula_freeplay_role(0, ids, n);
+    nebula_freeplay_next(n);
+    CHECK(nebula_freeplay_role(0, ids, n) == fr, "固定职业时按钮不切换");
+
     printf("\n%s (%d failures)\n", failures==0 ? "ALL PASS" : "HAS FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

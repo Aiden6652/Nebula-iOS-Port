@@ -163,6 +163,17 @@ int nebula_freeplay_tick(int total, long now_sec)
     return 1;
 }
 
+/* 手动切换（悬浮按钮）：立即换下一个，并重置自动轮换计时 */
+void nebula_freeplay_next(int total)
+{
+    if (!g_fp.enabled || g_fp.role != FP_ROLE_NONE) return;   /* 固定职业不切换 */
+    if (total > 0) g_fp.total = total;
+    int n = (total > 0) ? total : g_fp.total;
+    if (n > 0) g_fp.cursor = (g_fp.cursor + 1) % n;
+    else       g_fp.cursor++;
+    g_fp.last_switch = (long)time(NULL);   /* 重置：按钮切完不会紧接着自动又跳 */
+}
+
 int nebula_freeplay_progress(char *out, size_t osz)
 {
     if (!out || osz == 0) return 0;

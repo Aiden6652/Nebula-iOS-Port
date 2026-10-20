@@ -624,6 +624,20 @@ int nebula_il2cpp_get_player_name(void *info_obj, char *out, size_t osz)
 /* ★ 自由模式：把房间人数自动补齐到目标人数。
    调原版 GameData.AddDummy（游戏自带方法，不是我们造的）。
    每轮只补【一个】：一次补一堆容易触发游戏内部同步问题/卡顿。 */
+/* iOS 悬浮按钮（src/ui/overlay.m 提供）：自由模式下点它切换职业。
+   weak 符号 —— 没链接 overlay.m 时为 NULL，调用处必须判空。 */
+int nebula_ui_switch_requested(void) __attribute__((weak));
+
+/* 是否在大厅：LobbyBehaviour 只在大厅场景存在。
+   大厅里不写职业名 —— 没开局就亮出 [警长] 等于剧透自己（真机截图已证实）。 */
+static int in_lobby(void)
+{
+    void *lk = nebula_il2cpp_find_class_by_hint("LobbyBehaviour");
+    if (!lk) return 0;
+    void *li[2];
+    return nebula_il2cpp_get_instances(lk, li, 2) > 0;
+}
+
 /* ★ 调用无参方法并取 int 返回值（用于 GameData.get_PlayerCount）。
    IL2CPP 里 int 返回是【装箱对象】：对象头(klass 8 + monitor 8)之后是值。 */
 int nebula_il2cpp_call_int(void *obj, const char *method, int *out)
@@ -997,6 +1011,14 @@ int nebula_il2cpp_apply_roles(void)
         if (name_off < 0) nebula_log("apply_roles: 名字字段未定位（将跳过）");
     }
 
+    /* 自由模式：点悬浮按钮 → 立即切换到下一个职业（星云舰 FreeplayPopover 的对应做法） */
+    if (nebula_freeplay_enabled() && nebula_ui_switch_requested
+        && nebula_ui_switch_requested()) {
+        nebula_freeplay_next(roster_n);
+        int nr = nebula_freeplay_role(0, roster, roster_n);
+        nebula_log("freeplay: 按钮 → 切换职业 -> %s",
+                   nr >= 0 && nebula_role_name(nr) ? nebula_role_name(nr) : "?");
+    }
     /* 自由模式：到点就换清单里的下一个职业（一个人逐个试用） */
     if (nebula_freeplay_tick(roster_n, 0)) {
         int nr = nebula_freeplay_role(0, roster, roster_n);
@@ -1054,8 +1076,10 @@ int nebula_il2cpp_apply_roles(void)
         /* 名字：新版 AU 的 PlayerName 是【属性(方法)】不是字段
            （NetworkedPlayerInfo.set_PlayerName），真实数据在 Outfits 字典里，
            所以必须用方法调用写入，不能靠字段偏移。 */
-        /* 自由模式下强制显示职业名（用户要靠它确认试的是哪个职业） */
-        int show_name = nebula_freeplay_enabled() || !nebula_flag_file("nebula_no_name.txt");
+        /* 自由模式下强制显示职业名（用户要靠它确认试的是哪个职业）；
+           但【大厅除外】—— 没开局就亮职业是剧透（真机已证实此 bug）。 */
+        int show_name = !in_lobby() &&
+                        (nebula_freeplay_enabled() || !nebula_flag_file("nebula_no_name.txt"));
         if (info && show_name) {
             char cur[192]; cur[0] = 0;
             if (name_off >= 0) nebula_il2cpp_get_string_by(info, name_off, cur, sizeof(cur));

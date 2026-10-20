@@ -4,7 +4,7 @@
 CC      ?= clang
 TARGET  := arm64-apple-ios14.0
 SYSROOT := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
-SRC     := loader.c ../net/protocol.c ../net/dispatch.c ../core/core.c ../core/roles.c ../core/rolecfg.c ../core/rolemapping.c ../core/freeplay.c ../il2cpp/bridge.c ../il2cpp/hook.c ../addon/addon.c
+SRC     := loader.c ../net/protocol.c ../net/dispatch.c ../core/core.c ../core/roles.c ../core/rolecfg.c ../core/rolemapping.c ../core/freeplay.c ../ui/overlay.m ../il2cpp/bridge.c ../il2cpp/hook.c ../addon/addon.c
 OUT     := nebula_ios_loader.dylib
 CFLAGS  := -target $(TARGET) -isysroot $(SYSROOT) -fPIC -O2 -Wall
 
