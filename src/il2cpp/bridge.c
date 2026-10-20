@@ -15,6 +15,12 @@
 #include <dispatch/dispatch.h>      /* GCD：把操作排到游戏主线程，无需 hook */
 #endif
 #include <ctype.h>
+
+/* 日志文件上限：超过即截断重写。
+   日志每轮都写，长期运行会撑满设备存储（进而引发 OOM / 卡死），必须限。 */
+#ifndef NEBULA_LOG_MAX_BYTES
+#define NEBULA_LOG_MAX_BYTES  (2 * 1024 * 1024)   /* 2 MB */
+#endif
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -51,6 +57,19 @@ void nebula_log(const char *fmt, ...) {
     if (home) {
         char path[1024];
         snprintf(path, sizeof(path), "%s/Documents/nebula_log.txt", home);
+        /* ★ 存储防护：日志不能无限增长（每轮都写，久了会撑满磁盘）。
+           超过上限就截断重写，只保留最新内容。 */
+        FILE *chk = fopen(path, "rb");
+        if (chk) {
+            fseek(chk, 0, SEEK_END);
+            long sz = ftell(chk);
+            fclose(chk);
+            if (sz > NEBULA_LOG_MAX_BYTES) {
+                FILE *tr = fopen(path, "w");       /* 超限：清空重来 */
+                if (tr) { fprintf(tr, "[Nebula-iOS] （日志超过 %d KB，已截断，以下为最新）\n",
+                                  NEBULA_LOG_MAX_BYTES / 1024); fclose(tr); }
+            }
+        }
         FILE *fp = fopen(path, "a");
         if (fp) { fprintf(fp, "[Nebula-iOS] %s\n", buf); fclose(fp); }
     }
@@ -416,6 +435,7 @@ int nebula_il2cpp_set_int(void *obj, const char *field, int v) {
 /* ===================== 自适应字段定位 + 职业应用 ===================== */
 #include "../core/roles.h"
 #include "../core/rolecfg.h"
+#include "../core/rolemapping.h"
 
 /* 在类的字段列表里按名字子串匹配（忽略大小写），返回 0 并填充偏移 */
 int nebula_il2cpp_find_field(void *klass, const char *substr, ptrdiff_t *off_out)
@@ -462,6 +482,20 @@ int nebula_il2cpp_get_float_by(void *obj, ptrdiff_t off, float *out)
 {
     if (!obj || !out || off < 0) return -1;
     *out = *(float *)((char *)obj + off);
+    return 0;
+}
+
+int nebula_il2cpp_set_int_by(void *obj, ptrdiff_t off, int v)
+{
+    if (!obj || off < 0) return -1;
+    *(int *)((char *)obj + off) = v;
+    return 0;
+}
+
+int nebula_il2cpp_get_int_by(void *obj, ptrdiff_t off, int *out)
+{
+    if (!obj || !out || off < 0) return -1;
+    *out = *(int *)((char *)obj + off);
     return 0;
 }
 
@@ -576,8 +610,12 @@ int nebula_il2cpp_apply_role_text(void)
     };
     static const char *team_names[] = {"船员", "伪装者", "内鬼", "Crewmate", "Impostor", NULL};
 
+    /* ★ 内存防护：每轮最多新建这么多个字符串。
+       il2cpp_string_new 每次都从托管堆分配，若游戏把名字重置回去，
+       我们会反复分配；限流后即使发生也不会堆积成 OOM。 */
+    const int ALLOC_BUDGET = 8;
     int replaced = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n && replaced < ALLOC_BUDGET; i++) {
         char cur[128];
         if (nebula_il2cpp_get_string_by(insts[i], text_off, cur, sizeof(cur)) != 0) continue;
         if (!cur[0]) continue;
@@ -716,6 +754,24 @@ int nebula_il2cpp_apply_roles(void)
         }
     }
 
+    /* 底层角色类型：NetworkedPlayerInfo.RoleType（原版 RoleTypes 枚举） */
+    static ptrdiff_t rt_off = -1;
+    static int rt_tried = 0, rt_logged = 0;
+    if (!rt_tried) {
+        rt_tried = 1;
+        ptrdiff_t io = -1;                       /* 块内局部定位，避免依赖后面的变量 */
+        if (nebula_il2cpp_find_field(klass, "CachedPlayerData", &io) == 0 && n > 0) {
+            void *i0 = *(void **)((char *)insts[0] + io);
+            if (i0) {
+                void *ik = *(void **)i0;
+                static const char *rt[] = {"RoleType", "roleType", NULL};
+                if (nebula_il2cpp_find_field_exact(ik, rt, &rt_off) == 0)
+                    nebula_log("apply_roles: 底层角色字段 RoleType +%td", rt_off);
+            }
+        }
+        if (rt_off < 0) nebula_log("apply_roles: 未找到 RoleType 字段（底层映射跳过）");
+    }
+
     /* 名字：PlayerControl.CachedPlayerData -> NetworkedPlayerInfo.PlayerName */
     static ptrdiff_t info_off = -1, name_off = -1;
     static int name_tried = 0;
@@ -754,6 +810,26 @@ int nebula_il2cpp_apply_roles(void)
                         float m = (team == TEAM_IMPOSTOR) ? 1.08f
                                 : (team == TEAM_NEUTRAL)  ? 1.04f : 1.0f;
                         nebula_il2cpp_set_float_by(phys, speed_off, g_base_speed * m);
+                    }
+                }
+            }
+        }
+        /* ★ 底层枚举映射：把我们的职业伪装成原版 RoleTypes。
+           带刀（内鬼/豺狼/警长）→ Impostor，功能型 → Crewmate。
+           不这样做的话，豺狼和警长在游戏底层是 Crewmate，拿不到击杀按钮。 */
+        if (info_off >= 0 && rt_off >= 0) {
+            void *info = *(void **)((char *)insts[i] + info_off);
+            if (info) {
+                int underlying = nebula_role_underlying(
+                        rid, nebula_role_key(rid), team == TEAM_IMPOSTOR);
+                int cur_rt = -1;
+                if (nebula_il2cpp_get_int_by(info, rt_off, &cur_rt) != 0 || cur_rt != underlying) {
+                    if (nebula_il2cpp_set_int_by(info, rt_off, underlying) == 0) {
+                        if (!rt_logged) {
+                            rt_logged = 1;
+                            nebula_log("apply_roles: 底层角色映射已生效（带刀→Impostor=%d，功能型→Crewmate=%d）",
+                                       RT_IMPOSTOR, RT_CREWMATE);
+                        }
                     }
                 }
             }
