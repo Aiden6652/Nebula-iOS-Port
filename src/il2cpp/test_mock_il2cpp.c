@@ -30,6 +30,8 @@
    rolecfg.h 已声明 nebula_core_register_player，由 core.c 提供实现。 */
 #include "../core/roles.h"
 #include "../core/rolecfg.h"
+#include "../core/rolemapping.h"
+#include "../core/freeplay.h"
 
 /* ---------------- 可调开关（覆盖 hook.c 的实现，不链接 hook.c） ---------------- */
 static int g_flag_speed = 0;   /* 模拟 nebula_speed.txt */
@@ -52,6 +54,7 @@ typedef struct { const char *ns; const char *name; MField *f; int nf; } MClass;
 #define OFF_MyPhysics         208
 /* 模拟偏移（真机上未知，取合理值即可，不影响逻辑验证） */
 #define OFF_PlayerName        24
+#define OFF_RoleType          32      /* 紧跟 PlayerName 指针之后（真机也有此字段） */
 #define OFF_Speed             32
 
 static MField f_pc[] = {
@@ -61,7 +64,8 @@ static MField f_pc[] = {
     {"AllPlayerControls", 0, "List<PlayerControl>"},
     {NULL, 0, NULL}
 };
-static MField f_npi[] = { {"PlayerName", OFF_PlayerName, "System.String"}, {NULL,0,NULL} };
+static MField f_npi[] = { {"PlayerName", OFF_PlayerName, "System.String"},
+                         {"RoleType",   OFF_RoleType,   "RoleTypes"}, {NULL,0,NULL} };
 static MField f_pp[]  = { {"Speed", OFF_Speed, "System.Single"}, {NULL,0,NULL} };
 static MField f_list[] = { {"_size", 0x10, "System.Int32"}, {"_items", 0x18, "System.Object[]"}, {NULL,0,NULL} };
 static MField f_tmp[] = { {"m_text", 0x40, "System.String"}, {NULL,0,NULL} };
@@ -69,7 +73,7 @@ static MField f_obj[] = { {NULL,0,NULL} };
 
 static MClass g_classes[] = {
     {"", "PlayerControl", f_pc, 4},
-    {"", "NetworkedPlayerInfo", f_npi, 1},
+    {"", "NetworkedPlayerInfo", f_npi, 2},   /* PlayerName + RoleType（真机两者都有） */
     {"", "PlayerPhysics", f_pp, 1},
     {"", "List_PlayerControl", f_list, 2},
     {"UnityEngine", "Object", f_obj, 0},
@@ -102,6 +106,7 @@ static void build_world(void) {
         *(void    **)g_pp_mem[i]  = (void *)&g_classes[2];   /* PlayerPhysics */
         *(uint8_t  *)((char *)pc_obj(i) + OFF_PlayerId)         = (uint8_t)(i + 1);
         *(void    **)((char *)pc_obj(i) + OFF_CachedPlayerData) = (void *)g_npi_mem[i];
+        *(int32_t  *)((char *)g_npi_mem[i] + OFF_RoleType)      = 0;   /* Crewmate */
         *(void    **)((char *)pc_obj(i) + OFF_MyPhysics)        = (void *)g_pp_mem[i];
         *(float    *)((char *)g_pp_mem[i] + OFF_Speed)          = 5.0f;   /* 基准速度 */
         /* PlayerName 初值 */
@@ -154,15 +159,25 @@ void il2cpp_field_static_get_value(void *f, void *out) {
     else *(void **)out = NULL;
 }
 
-/* 方法相关：一律返回 NULL，让 get_instances 失败 → 走 AllPlayerControls 路线 */
+/* 方法：仅支持 set_PlayerName（新版 AU 改名字的真实方式），
+   其余返回 NULL（让 get_instances 走 AllPlayerControls 路线） */
+#define MOCK_SET_NAME ((void *)1)
 void *il2cpp_class_get_method_from_name(void *k, const char *n, int c) {
-    (void)k; (void)n; (void)c; return NULL;
+    (void)k; (void)c;
+    if (n && strcmp(n, "set_PlayerName") == 0) return MOCK_SET_NAME;
+    return NULL;
 }
 void *il2cpp_class_get_methods(void *k, void **it) { (void)k; (void)it; return NULL; }
 const char *il2cpp_method_get_name(void *m) { (void)m; return NULL; }
 void *il2cpp_class_get_type(void *k) { return k; }
 void *il2cpp_type_get_object(void *t) { return t; }
+int g_setname_calls = 0;      /* 供测试断言：确实调用了 set_PlayerName */
 void *il2cpp_runtime_invoke(void *m, void *o, void **p, void **e) {
+    if (m == MOCK_SET_NAME && o && p && p[0]) {
+        /* 模拟：把新字符串写进对象的 PlayerName 字段 */
+        *(void **)((char *)o + OFF_PlayerName) = p[0];
+        g_setname_calls++;
+    }
     (void)m; (void)o; (void)p; if (e) *e = NULL; return NULL;
 }
 void *il2cpp_string_new(const char *s) { return mock_str_new(s); }
@@ -171,11 +186,26 @@ void *il2cpp_string_new(const char *s) { return mock_str_new(s); }
 static void *mock_str_new(const char *s) {
     size_t n = s ? strlen(s) : 0;
     unsigned char *b = (unsigned char *)calloc(1, 20 + (n + 1) * 2);
-    *(int32_t *)(b + 16) = (int32_t)n;
     uint16_t *ch = (uint16_t *)(b + 20);
-    for (size_t i = 0; i < n; i++) ch[i] = (uint16_t)(unsigned char)s[i];
+    size_t k = 0;
+    /* UTF-8 → UTF-16：不转的话中文名字会变乱码（模拟环境和真机必须一致） */
+    for (size_t i = 0; i < n; ) {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t cp = c;
+        if (c >= 0xF0)      { cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(s[i+1] & 0x3F) << 12) | ((uint32_t)(s[i+2] & 0x3F) << 6) | (s[i+3] & 0x3F); i += 4; }
+        else if (c >= 0xE0) { cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(s[i+1] & 0x3F) << 6) | (s[i+2] & 0x3F); i += 3; }
+        else if (c >= 0xC0) { cp = ((uint32_t)(c & 0x1F) << 6) | (s[i+1] & 0x3F); i += 2; }
+        else                { cp = c; i += 1; }
+        if (cp > 0xFFFF) { cp -= 0x10000; ch[k++] = (uint16_t)(0xD800 + (cp >> 10)); ch[k++] = (uint16_t)(0xDC00 + (cp & 0x3FF)); }
+        else             { ch[k++] = (uint16_t)cp; }
+    }
+    *(int32_t *)(b + 16) = (int32_t)k;
     return (void *)b;
 }
+
+/* 官方字符串读取 API（真机也有）：让"读名字"路径在模拟环境里也能跑 */
+int32_t il2cpp_string_length(void *str) { return str ? *(int32_t *)((char *)str + 16) : 0; }
+uint16_t *il2cpp_string_chars(void *str) { return str ? (uint16_t *)((char *)str + 20) : NULL; }
 
 /* ---------------- 测试 ---------------- */
 static int failures = 0;
@@ -187,6 +217,8 @@ static void name_of(int i, char *out, size_t osz) {
     nebula_il2cpp_get_string_by((void *)g_npi_mem[i], OFF_PlayerName, out, osz);
 }
 
+static int rt_of(int i) { return *(int32_t *)((char *)g_npi_mem[i] + OFF_RoleType); }
+
 int main(void) {
     printf("=== 模拟 IL2CPP 环境：验证职业应用不会把游戏改坏 ===\n");
 
@@ -195,6 +227,9 @@ int main(void) {
     system("mkdir -p /tmp/nebula_mock_home/Documents");
     { FILE *f = fopen("/tmp/nebula_mock_home/Documents/nebula_roles.txt", "w");
       if (f) { fputs("impostor\ncrewmate\n", f); fclose(f); } }
+    /* ★ 自由模式（星云舰 Solo Free Play）：自己固定拿警长，用来单独试用职业 */
+    { FILE *f = fopen("/tmp/nebula_mock_home/Documents/nebula_freeplay.txt", "w");
+      if (f) { fputs("role sheriff\nfill 10\n", f); fclose(f); } }
 
     build_world();
     CHECK(nebula_il2cpp_init() == 0, "模拟环境：IL2CPP 初始化成功");
@@ -237,8 +272,18 @@ int main(void) {
     /* ③ 名字前缀只加一次 */
     char nm[128]; name_of(0, nm, sizeof(nm));
     int bracket = 0; for (char *p = nm; *p; p++) if (*p == '[') bracket++;
+    CHECK(g_setname_calls >= 1, "名字经 set_PlayerName 方法写入");
     CHECK(bracket == 1, "名字前缀只加了一次（未反复叠加）");
     CHECK(strstr(nm, "Player") != NULL, "原名字仍在（未被覆盖丢失）");
+
+    /* ③b 自由模式（星云舰 Solo Free Play）：自己拿到指定职业 + 底层映射开启 */
+    {
+        char nm0[160]; name_of(0, nm0, sizeof(nm0));
+        CHECK(strstr(nm0, "警长") != NULL, "自由模式：自己拿到指定职业（警长）");
+        CHECK(strstr(nm0, "Player") != NULL, "自由模式：原名字仍在（未被冲掉）");
+        /* 警长带刀 → 底层必须伪装成 Impostor，否则拿不到击杀按钮 */
+        CHECK(rt_of(0) == RT_IMPOSTOR, "自由模式：带刀职业底层映射为 Impostor（能拿到刀）");
+    }
 
     /* ④ 无关字段未被破坏 */
     CHECK(*(uint8_t *)((char *)pc_obj(0) + OFF_PlayerId) == 1, "PlayerId 未被写坏");

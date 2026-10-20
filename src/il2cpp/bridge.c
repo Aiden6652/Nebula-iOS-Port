@@ -10,6 +10,7 @@
 
 #include "bridge.h"
 #include "hook.h"
+#include "../core/freeplay.h"
 
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>      /* GCD：把操作排到游戏主线程，无需 hook */
@@ -268,6 +269,8 @@ typedef void *(*fn_class_get_method_from_name)(void *klass, const char *name, in
 typedef const char *(*fn_method_get_name)(void *method);
 typedef int (*fn_method_get_param_count)(void *method);
 typedef void *(*fn_runtime_invoke)(void *method, void *obj, void **params, void **exc);
+typedef int      (*fn_string_length)(void *str);
+typedef uint16_t *(*fn_string_chars)(void *str);
 typedef void *(*fn_string_new)(const char *str);
 typedef void  (*fn_field_static_get)(void *field, void *value);
 
@@ -292,6 +295,8 @@ typedef struct {
     fn_method_get_name            method_get_name;
     fn_method_get_param_count     method_get_param_count;
     fn_runtime_invoke             runtime_invoke;
+    fn_string_length              string_length;
+    fn_string_chars               string_chars;
     fn_string_new                string_new;
     fn_field_static_get          field_static_get;
 } il2cpp_api_t;
@@ -333,6 +338,8 @@ int nebula_il2cpp_init(void) {
     A.method_get_name       = (fn_method_get_name)sym("il2cpp_method_get_name");
     A.method_get_param_count= (fn_method_get_param_count)sym("il2cpp_method_get_param_count");
     A.runtime_invoke        = (fn_runtime_invoke)sym("il2cpp_runtime_invoke");
+    A.string_length         = (fn_string_length)sym("il2cpp_string_length");
+    A.string_chars          = (fn_string_chars)sym("il2cpp_string_chars");
     A.string_new            = (fn_string_new)sym("il2cpp_string_new");   /* 辅助：创建字符串 */
     A.field_static_get      = (fn_field_static_get)sym("il2cpp_field_static_get_value"); /* 读静态字段 */
 
@@ -526,6 +533,129 @@ int nebula_il2cpp_get_string_by(void *obj, ptrdiff_t off, char *out, size_t osz)
     return 0;
 }
 
+
+/* ★ 设置玩家名字：新版 AU 里 PlayerName 不是字段，而是属性
+   （NetworkedPlayerInfo.get_PlayerName / set_PlayerName），
+   真实数据存在 Outfits 字典里的 PlayerOutfit 中。
+   所以不能靠字段偏移写，必须【调用方法】。 */
+int nebula_il2cpp_set_player_name(void *info_obj, const char *utf8)
+{
+    if (!g_api_ok || !info_obj || !utf8) return -1;
+    void *klass = *(void **)info_obj;
+    if (!klass) return -1;
+    if (!A.class_get_method_from_name || !A.runtime_invoke || !A.string_new) return -1;
+
+    void *m = A.class_get_method_from_name(klass, "set_PlayerName", 1);
+    if (!m) m = A.class_get_method_from_name(klass, "SetPlayerName", 1);
+    if (!m) return -1;
+
+    void *s = A.string_new(utf8);
+    if (!s) return -1;
+    void *params[1] = { s };
+    void *exc = NULL;
+    A.runtime_invoke(m, info_obj, params, &exc);
+    return exc ? -1 : 0;
+}
+
+/* ★ 调用【无参】方法（返回 void 或忽略返回值）。
+   用途：调原版自带的 GameData.AddDummy 补齐房间人数 ——
+   星云舰自由模式就是靠这类 dummy 把房间填满，让一个人也能开局。 */
+int nebula_il2cpp_call_void(void *obj, const char *method)
+{
+    if (!g_api_ok || !obj || !method) return -1;
+    void *klass = *(void **)obj;
+    if (!klass) return -1;
+    if (!A.class_get_method_from_name || !A.runtime_invoke) return -1;
+
+    void *m = A.class_get_method_from_name(klass, method, -1);
+    if (!m) m = A.class_get_method_from_name(klass, method, 0);
+    if (!m) return -1;
+
+    void *params[1] = { NULL };
+    void *exc = NULL;
+    A.runtime_invoke(m, obj, params, &exc);
+    return exc ? -1 : 0;
+}
+
+/* ★ 读玩家真名：新版 AU 里名字是【属性】（get_PlayerName），字段读不到时用它。
+   必须能读到真名，否则写名字会把玩家的昵称冲掉。 */
+int nebula_il2cpp_get_player_name(void *info_obj, char *out, size_t osz)
+{
+    if (!g_api_ok || !info_obj || !out || osz == 0) return -1;
+    void *klass = *(void **)info_obj;
+    if (!klass) return -1;
+    if (!A.class_get_method_from_name || !A.runtime_invoke) return -1;
+    if (!A.string_length || !A.string_chars) return -1;
+
+    void *m = A.class_get_method_from_name(klass, "get_PlayerName", -1);
+    if (!m) m = A.class_get_method_from_name(klass, "GetPlayerName", -1);
+    if (!m) return -1;
+
+    void *params[1] = { NULL };
+    void *exc = NULL;
+    void *ret = A.runtime_invoke(m, info_obj, params, &exc);
+    if (exc || !ret) return -1;
+
+    int len = A.string_length(ret);
+    const uint16_t *ch = A.string_chars(ret);
+    if (len <= 0 || !ch) return -1;
+    if ((size_t)len > osz - 1) len = (int)osz - 1;
+
+    /* UTF-16 → UTF-8（BMP 足够：玩家名不会用 emoji 平面外的字符） */
+    size_t o = 0;
+    for (int i = 0; i < len && o + 4 < osz; i++) {
+        uint32_t c = ch[i];
+        if (c == 0) break;
+        if (c < 0x80) {
+            out[o++] = (char)c;
+        } else if (c < 0x800) {
+            out[o++] = (char)(0xC0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            out[o++] = (char)(0xE0 | (c >> 12));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    out[o] = 0;
+    return o > 0 ? 0 : -1;
+}
+
+/* ★ 自由模式：把房间人数自动补齐到目标人数。
+   调原版 GameData.AddDummy（游戏自带方法，不是我们造的）。
+   每轮只补【一个】：一次补一堆容易触发游戏内部同步问题/卡顿。 */
+static int freeplay_fill_room(int current_players)
+{
+    int target = nebula_freeplay_fill();
+    if (target <= 0) return 0;
+    if (current_players >= target) return 0;
+
+    static int failed = 0;
+    if (failed) return 0;               /* 试过一次失败就不再试（防每轮抛异常） */
+
+    void *gdk = nebula_il2cpp_find_class_by_hint("GameData");
+    if (!gdk) return 0;
+    void *inst[4];
+    int m = nebula_il2cpp_get_instances(gdk, inst, 4);
+    if (m <= 0) {
+        static int miss = 0;
+        if (++miss % 10 == 1)
+            nebula_log("freeplay: 取不到 GameData 实例(第%d次) —— 暂无法补齐人数", miss);
+        return 0;
+    }
+    if (nebula_il2cpp_call_void(inst[0], "AddDummy") != 0) {
+        failed = 1;
+        nebula_log("freeplay: AddDummy 调用失败 —— 停止补齐（不影响正常游戏）");
+        return 0;
+    }
+    static int added = 0;
+    added++;
+    if (added <= 3 || added % 5 == 0)
+        nebula_log("freeplay: 已补 %d 个 dummy（目标 %d 人，当前 %d）",
+                   added, target, current_players);
+    return 1;
+}
+
 int nebula_il2cpp_set_string_by(void *obj, ptrdiff_t off, const char *utf8)
 {
     if (!obj || !utf8 || off < 0) return -1;
@@ -577,7 +707,28 @@ int nebula_il2cpp_apply_role_text(void)
 
     void *insts[128];
     int n = nebula_il2cpp_get_instances(klass, insts, 128);
-    if (n <= 0) return 0;
+    if (n <= 0) {
+        /* 诊断：枚举不到实例是"没有职业显示"的最常见原因，必须能看到 */
+        static int miss = 0;
+        if (++miss % 10 == 1)
+            nebula_log("role_text: 取不到 UI 文本实例(第%d次，n=%d) —— 职业名替换无法进行",
+                       miss, n);
+        return 0;
+    }
+    /* 诊断：把实际看到的文本打出来，便于核对槽位名是否匹配（中文/英文/带符号） */
+    {
+        static int dumped = 0;
+        if (!dumped) {
+            dumped = 1;
+            char sample[128]; int shown = 0;
+            for (int i = 0; i < n && shown < 10; i++) {
+                if (nebula_il2cpp_get_string_by(insts[i], text_off, sample, sizeof(sample)) != 0) continue;
+                if (!sample[0]) continue;
+                nebula_log("role_text: 文本样本[%d] = %s", shown, sample);
+                shown++;
+            }
+        }
+    }
 
     /* 上场职业（与 apply_roles 共用配置） */
     static int roster[ROLECFG_MAX]; static int roster_n = 0; static int cfg_done = 0;
@@ -736,7 +887,16 @@ int nebula_il2cpp_apply_roles(void)
         if (home) snprintf(cfg, sizeof(cfg), "%s/Documents/nebula_roles.txt", home);
         nebula_rolecfg_emit_default(home ? cfg : NULL);
         nebula_rolecfg_load(home ? cfg : NULL, roster, ROLECFG_MAX, &roster_n);
+        /* ★ 自由模式（星云舰 Solo Free Play）：存在 nebula_freeplay.txt 即开启 */
+        if (home) {
+            char fp[1024] = {0};
+            snprintf(fp, sizeof(fp), "%s/Documents/nebula_freeplay.txt", home);
+            if (nebula_freeplay_load(fp) != 0)
+                nebula_freeplay_emit_sample(fp);   /* 首次生成示例（默认关闭） */
+        }
     }
+    /* 自由模式：先把房间人数补齐（单人也能开局） */
+    freeplay_fill_room(n);
     if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);
 
     /* 速度：PlayerControl.MyPhysics -> PlayerPhysics.speed
@@ -766,8 +926,10 @@ int nebula_il2cpp_apply_roles(void)
 
     /* 底层角色类型：NetworkedPlayerInfo.RoleType（原版 RoleTypes 枚举） */
     static ptrdiff_t rt_off = -1;
-    static int rt_tried = 0, rt_logged = 0;
-    if (!rt_tried) {
+    static int rt_tried = 0, rt_logged = 0, name_logged = 0;
+    /* 自由模式下允许反复重试：大厅阶段玩家数为 0 定位不到字段，
+       不重试的话进局后映射就永远失效（带刀职业拿不到击杀按钮）。 */
+    if (!rt_tried || (nebula_freeplay_enabled() && rt_off < 0)) {
         rt_tried = 1;
         ptrdiff_t io = -1;                       /* 块内局部定位，避免依赖后面的变量 */
         if (nebula_il2cpp_find_field(klass, "CachedPlayerData", &io) == 0 && n > 0) {
@@ -800,9 +962,17 @@ int nebula_il2cpp_apply_roles(void)
         if (name_off < 0) nebula_log("apply_roles: 名字字段未定位（将跳过）");
     }
 
+    /* 自由模式：到点就换清单里的下一个职业（一个人逐个试用） */
+    if (nebula_freeplay_tick(roster_n, 0)) {
+        int nr = nebula_freeplay_role(0, roster, roster_n);
+        const char *rn = nr >= 0 ? nebula_role_name(nr) : NULL;
+        nebula_log("freeplay: 切换试用职业 -> %s", rn ? rn : "?");
+    }
+
     int applied = 0;
     for (int i = 0; i < n; i++) {
-        int rid = nebula_rolecfg_pick(roster, roster_n, i);
+        /* 自由模式下：0 号（自己）拿固定/轮换的职业，其余按清单排 */
+        int rid = nebula_freeplay_role(i, roster, roster_n);
         if (rid < 0) continue;
         const char *rname = nebula_role_name(rid);
         nebula_team_t team = nebula_role_team(rid);
@@ -844,27 +1014,47 @@ int nebula_il2cpp_apply_roles(void)
                 }
             }
         }
-        if (info_off >= 0 && name_off >= 0 && !nebula_flag_file("nebula_no_name.txt")) {
-            void *info = *(void **)((char *)insts[i] + info_off);
-            if (info) {
-                char cur[128];
-                if (nebula_il2cpp_get_string_by(info, name_off, cur, sizeof(cur)) == 0
-                    && cur[0] && !strstr(cur, "[")) {
-                    char buf[160];
-                    /* 原版星云舰样式：职业在名字【上方】、字号更小、带职业专属颜色
-                       用 TextMeshPro 富文本：<size> 缩小 + <color> 上色 */
-                    if (nebula_flag_file("nebula_plain_name.txt")) {
-                        /* 纯文本模式：万一 TMP 没开富文本，标签会原样显示成乱码，
-                           用它可对比排查（只有职业名 + 换行，无 <size>/<color>） */
-                        snprintf(buf, sizeof(buf), "[%s]\n%s",
-                                 rname ? rname : "?", cur);
-                    } else {
-                        const char *col = nebula_role_color(rid);
-                        snprintf(buf, sizeof(buf),
-                                 "<size=70%%><color=%s>[%s]</color></size>\n%s",
-                                 col ? col : "#FFFFFF", rname ? rname : "?", cur);
+        void *info = (info_off >= 0) ? *(void **)((char *)insts[i] + info_off) : NULL;
+
+        /* 名字：新版 AU 的 PlayerName 是【属性(方法)】不是字段
+           （NetworkedPlayerInfo.set_PlayerName），真实数据在 Outfits 字典里，
+           所以必须用方法调用写入，不能靠字段偏移。 */
+        /* 自由模式下强制显示职业名（用户要靠它确认试的是哪个职业） */
+        int show_name = nebula_freeplay_enabled() || !nebula_flag_file("nebula_no_name.txt");
+        if (info && show_name) {
+            char cur[192]; cur[0] = 0;
+            if (name_off >= 0) nebula_il2cpp_get_string_by(info, name_off, cur, sizeof(cur));
+            /* 字段读不到（新版 AU 名字是属性）→ 走 get_PlayerName 方法，
+               必须拿到真名，否则会把玩家的昵称冲掉。 */
+            if (!cur[0]) nebula_il2cpp_get_player_name(info, cur, sizeof(cur));
+            /* 剥掉我们自己加过的前缀：取最后一个换行之后 = 玩家本名 */
+            const char *base = strrchr(cur, '\n');
+            base = base ? base + 1 : cur;
+
+            /* 只在【期望名字 ≠ 当前名字】时才写：
+               既避免反复分配字符串（防 OOM），又保证自由模式轮换职业后名字会更新。 */
+            {
+                /* 自由模式轮换时把进度写进名字：一眼看出试到第几个 */
+                char prog[32] = {0}, label[64];
+                if (i == 0 && nebula_freeplay_progress(prog, sizeof(prog)))
+                    snprintf(label, sizeof(label), "%s %s", prog, rname ? rname : "?");
+                else
+                    snprintf(label, sizeof(label), "%s", rname ? rname : "?");
+
+                char want[192];
+                if (nebula_flag_file("nebula_plain_name.txt")) {
+                    snprintf(want, sizeof(want), "[%s]\n%s", label, base);
+                } else {
+                    const char *col = nebula_role_color(rid);
+                    snprintf(want, sizeof(want),
+                             "<size=70%%><color=%s>[%s]</color></size>\n%s",
+                             col ? col : "#FFFFFF", label, base);
+                }
+                if (strcmp(cur, want) != 0) {
+                    if (nebula_il2cpp_set_player_name(info, want) == 0 && !name_logged) {
+                        name_logged = 1;
+                        nebula_log("apply_roles: 名字已写入（走 set_PlayerName 方法）");
                     }
-                    nebula_il2cpp_set_string_by(info, name_off, buf);
                 }
             }
         }
@@ -911,9 +1101,11 @@ static void *unity_object_class(void)
 
 int nebula_il2cpp_get_instances(void *klass, void **out, int max) {
     if (!g_api_ok || !klass || !out || max <= 0) return -1;
-    if (!A.class_get_type || !A.type_get_object || !A.runtime_invoke ||
-        !A.class_get_methods || !A.method_get_name || !A.method_get_param_count) {
-        nlog("get_instances: 辅助 API 缺失，无法枚举实例");
+    /* ★ method_get_param_count 只用于辅助过滤，不能因为它缺失就放弃枚举。
+       之前把它列为必需项，一旦解析不到就整个枚举失败 ——
+       导致 apply_role_text 取不到任何 UI 文本，职业名替换完全不生效。 */
+    if (!A.class_get_type || !A.type_get_object || !A.runtime_invoke) {
+        nlog("get_instances: 关键 API 缺失，无法枚举实例");
         return -1;
     }
     void *objClass = unity_object_class();

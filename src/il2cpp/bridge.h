@@ -77,9 +77,16 @@ int  nebula_il2cpp_set_float_by(void *obj, ptrdiff_t off, float v);
 
 /* 字符串字段读写（Il2CppString：UTF-16，长度在 +16，字符从 +20 起） */
 int  nebula_il2cpp_get_string_by(void *obj, ptrdiff_t off, char *out, size_t osz);
+/* 读玩家真名（新版 AU 名字是属性 get_PlayerName，字段读不到时用） */
+int  nebula_il2cpp_get_player_name(void *info_obj, char *out, size_t osz);
+
 int  nebula_il2cpp_set_string_by(void *obj, ptrdiff_t off, const char *utf8);
 
 /* ★ 取所有玩家（优先静态 AllPlayerControls，兜底 FindObjectsOfType） */
+/* 调用对象上的【无参】方法（返回 void 或忽略返回值）。
+   用于调原版自带的 GameData.AddDummy —— 自由模式靠它补齐房间人数。 */
+int  nebula_il2cpp_call_void(void *obj, const char *method);
+
 int  nebula_il2cpp_get_players(void **out, int max);
 
 /* ★ 把本地引擎的职业应用到游戏对象上（登记 + 名字前缀 + 速度） */
