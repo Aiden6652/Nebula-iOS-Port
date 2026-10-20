@@ -622,6 +622,44 @@ int nebula_il2cpp_get_player_name(void *info_obj, char *out, size_t osz)
     return o > 0 ? 0 : -1;
 }
 
+/* ★ 自由模式：把【开局最小人数】从 4 改成 1。
+   原版 GameStartManager 要求房间里至少 4 个人才能按开始 ——
+   这是"开了自由模式也启动不了"的直接原因（一个人永远凑不够 4）。
+   字段按名动态查找，不需要预先知道偏移。 */
+static void freeplay_lower_min_players(void)
+{
+    if (!nebula_freeplay_enabled()) return;
+
+    static int done = 0, miss = 0;
+    if (done) return;
+
+    void *klass = nebula_il2cpp_find_class_by_hint("GameStartManager");
+    if (!klass) {
+        if (++miss % 20 == 1)
+            nebula_log("freeplay: 未找到 GameStartManager 类（第%d次）", miss);
+        return;
+    }
+    void *inst[4];
+    int n = nebula_il2cpp_get_instances(klass, inst, 4);
+    if (n <= 0) return;                      /* 不在大厅就没有实例，正常 */
+
+    ptrdiff_t off = -1;
+    if (nebula_il2cpp_find_field(klass, "MinPlayers", &off) != 0) {
+        if (++miss % 20 == 1)
+            nebula_log("freeplay: GameStartManager 里没有 MinPlayers 字段（第%d次）", miss);
+        return;
+    }
+    int cur = -1;
+    if (nebula_il2cpp_get_int_by(inst[0], off, &cur) == 0 && cur != 1) {
+        if (nebula_il2cpp_set_int_by(inst[0], off, 1) == 0) {
+            done = 1;
+            nebula_log("freeplay: 开局最小人数 %d → 1（一个人也能开始）", cur);
+        }
+    } else if (cur == 1) {
+        done = 1;
+    }
+}
+
 /* ★ 自由模式：把房间人数自动补齐到目标人数。
    调原版 GameData.AddDummy（游戏自带方法，不是我们造的）。
    每轮只补【一个】：一次补一堆容易触发游戏内部同步问题/卡顿。 */
@@ -1003,6 +1041,8 @@ int nebula_il2cpp_apply_roles(void)
     roster_n = nebula_weight_expand(roster, 512);
     /* 自由模式：先把房间人数补齐（单人也能开局） */
     freeplay_fill_room(n);
+    /* 再把原版"至少 4 人才开始"的限制降到 1 人 */
+    freeplay_lower_min_players();
     if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);
 
     /* 速度：PlayerControl.MyPhysics -> PlayerPhysics.speed
@@ -1366,7 +1406,8 @@ static void main_init_once(void)
         "HudManager",    "PlayerPhysics", "ExileController",
         /* ★ 官方内置模组 API（iOS 版也有！）—— 摸清它的结构就能：
            显示模组标记(合规)、注册模组、甚至让官方服务器认这是模组房 */
-        "ModManager", "ModStamp"
+        "ModManager", "ModStamp",
+        "GameStartManager", "LobbyBehaviour"   /* 大厅/开局相关（自由模式要用） */
     };
     nebula_il2cpp_dump_report(NULL, hints, (int)(sizeof(hints)/sizeof(hints[0])));
 
