@@ -89,14 +89,62 @@ ADDON_COLOR = {k: v[2] for k, v in ADDON_ROLES.items()}
 def is_addon(rid):
     return rid in ADDON_ROLES
 
+
+# ---- 补充职业：NOS 内置但汉化包未覆盖的（阵营取自 Nebula.dll 的
+#      Nebula.Roles.<Crewmate|Impostor|Neutral|Complex> 命名空间）----
+# 中文名暂译（nos 里这些职业只有英文名），可用汉化包/插件词条覆盖
+SUPPLEMENT = {
+    # Complex（特殊阵营，按中立处理）
+    "swapper":      ("交换者",   "TEAM_NEUTRAL"),
+    "trapper":      ("陷阱师",   "TEAM_NEUTRAL"),
+    "nexus":        ("枢纽",     "TEAM_NEUTRAL"),
+    # Crewmate
+    "climber":      ("攀登者",   "TEAM_CREW"),
+    "doppelganger": ("二重身",   "TEAM_CREW"),
+    "fixer":        ("修理工",   "TEAM_CREW"),
+    "investigator": ("调查员",   "TEAM_CREW"),
+    "jekyllandhyde":("双重人格", "TEAM_CREW"),
+    "navvy":        ("杂役",     "TEAM_CREW"),
+    "nicetracker":  ("正义追踪者","TEAM_CREW"),
+    "oracle":       ("神谕者",   "TEAM_CREW"),
+    # Impostor
+    "amalgam":      ("融合体",   "TEAM_IMPOSTOR"),
+    "creeping":     ("潜行者",   "TEAM_IMPOSTOR"),
+    "cupid":        ("丘比特",   "TEAM_IMPOSTOR"),
+    "eviltracker":  ("邪恶追踪者","TEAM_IMPOSTOR"),
+    "gimlet":       ("钻头",     "TEAM_IMPOSTOR"),
+    "graffiti":     ("涂鸦者",   "TEAM_IMPOSTOR"),
+    "nightmare":    ("梦魇",     "TEAM_IMPOSTOR"),
+    "quack":        ("庸医",     "TEAM_IMPOSTOR"),
+    "rokurokubi":   ("辘轳首",   "TEAM_IMPOSTOR"),
+    "sculptor":     ("雕塑家",   "TEAM_IMPOSTOR"),
+    "snatcher":     ("掠夺者",   "TEAM_IMPOSTOR"),
+    "whammy":       ("厄运师",   "TEAM_IMPOSTOR"),
+    "zeal":         ("狂热者",   "TEAM_IMPOSTOR"),
+    "balloonholder":("气球持有者","TEAM_IMPOSTOR"),
+    # Neutral
+    "opportunist":  ("机会主义者","TEAM_NEUTRAL"),
+    "gambler":      ("赌徒",     "TEAM_NEUTRAL"),
+    "plague":       ("瘟疫",     "TEAM_NEUTRAL"),
+    "spectre":      ("幽灵",     "TEAM_NEUTRAL"),
+    "vanity":       ("虚荣者",   "TEAM_NEUTRAL"),
+    "chainshifter": ("链移者",   "TEAM_NEUTRAL"),
+    "tyrant":       ("暴君",     "TEAM_NEUTRAL"),
+}
+SUPP_TEAM = {k: v[1] for k, v in SUPPLEMENT.items()}
+
 def team_of(rid):
     if rid in ADDON_TEAM: return ADDON_TEAM[rid]      # addons 扩展职业优先
+    if rid in SUPP_TEAM:  return SUPP_TEAM[rid]       # 汉化包未覆盖的内置职业
     if rid in IMPOSTOR: return "TEAM_IMPOSTOR"
     if rid in NEUTRAL:  return "TEAM_NEUTRAL"
     return "TEAM_CREW"
 
 # 合并 addons 扩展职业（中文名）
 for _k, _v in ADDON_ROLES.items():
+    roles.setdefault(_k, _v[0])
+# 合并汉化包未覆盖的内置职业（中文名暂译，可被插件词条覆盖）
+for _k, _v in SUPPLEMENT.items():
     roles.setdefault(_k, _v[0])
 _ = is_addon                      # 保留引用
 
