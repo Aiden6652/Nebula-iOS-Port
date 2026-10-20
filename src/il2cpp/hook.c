@@ -112,7 +112,12 @@ int nebula_hook_count(void) { return g_nhooks; }
 
 void nebula_hook_set_tick(void (*tick_cb)(void)) { g_tick_cb = tick_cb; }
 
-/* ---- GameManager.Update 的每帧 hook ---- */
+/* ★ 安装时保存下来的【真实原入口】。
+   以前这里是写死查 "GameManager.Update"，而实际装的是 FixedUpdate，
+   查不到 → orig=NULL → 原函数永远不执行 → 物理停摆、交互全失效。
+   必须用它，不能用写死的类名/方法名去查。 */
+static nebula_method_fn_t g_update_orig = NULL;
+
 static void *update_hook(void *instance, void *method) {
     static unsigned long frames = 0;
     frames++;
@@ -120,8 +125,8 @@ static void *update_hook(void *instance, void *method) {
 
     if (g_tick_cb) g_tick_cb();                       /* ★ 每帧跑本地引擎逻辑 */
 
-    nebula_method_fn_t orig = nebula_hook_orig("GameManager", "Update");
-    return orig ? orig(instance, method) : NULL;      /* 继续调用原函数 */
+    /* 一定要把原函数调用回去，否则被 Hook 的方法就变成空操作 */
+    return g_update_orig ? g_update_orig(instance, method) : NULL;
 }
 
 /* 目标回退链：GameManager 在新版里没有 Update，依次尝试其它真实存在的入口 */
@@ -139,8 +144,21 @@ int nebula_hook_install_game_update(void) {
     }
     int rc = -1;
     for (size_t i = 0; i < sizeof(hook_targets)/sizeof(hook_targets[0]); i++) {
-        rc = nebula_hook_install(hook_targets[i].cls, hook_targets[i].mth, update_hook, NULL);
-        if (rc == 0) { hlog("hook: 已挂到 %s.%s", hook_targets[i].cls, hook_targets[i].mth); break; }
+        nebula_method_fn_t orig = NULL;
+        rc = nebula_hook_install(hook_targets[i].cls, hook_targets[i].mth, update_hook, &orig);
+        if (rc == 0) {
+            g_update_orig = orig;    /* ★ 保存真实原入口，供 update_hook 回调 */
+            hlog("hook: 已挂到 %s.%s（原入口=%.8s...）", hook_targets[i].cls, hook_targets[i].mth,
+                 orig ? "已保存" : "缺失");
+            break;
+        }
+    }
+    if (rc == 0 && !g_update_orig) {
+        hlog("hook: 危险——未取到原入口，撤销安装（否则原方法会变空操作）");
+        /* 还原所有已安装的 hook */
+        for (int i = 0; i < g_nhooks; i++) *(nebula_method_fn_t *)g_hooks[i].method = g_hooks[i].orig;
+        g_nhooks = 0;
+        return -3;
     }
     if (rc == 0) hlog("hook: 每帧逻辑已接入游戏 Update（指针替换，无 JIT/无 Frida）");
     return rc;

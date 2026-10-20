@@ -894,40 +894,11 @@ static void *poll_thread_main(void *arg) {
     sleep_ms(5000);
     if (nebula_il2cpp_init() != 0) return NULL;
 
-    for (int i = 0; i < 300 && !nebula_il2cpp_ready(); i++) sleep_ms(200);
-    if (!nebula_il2cpp_ready()) { nlog("poll: 等待 IL2CPP 就绪超时"); return NULL; }
-    nlog("poll: IL2CPP 已就绪，开始轮询（每 %d ms）", pa->interval_ms);
-
-    /* 就绪后才做自查 dump（类名/字段名/偏移），此时调 IL2CPP 才安全。
-       范围要覆盖：玩家/职业/数据/会议/ HUD —— 这些正是接线新职业要用到的类 */
-    static const char *hints[] = {
-        "PlayerControl", "GameManager", "ShipStatus", "GameData",
-        "RoleBehaviour", "PlayerInfo",  "MeetingHud", "AmongUsClient",
-        "HudManager",    "PlayerPhysics", "ExileController"
-    };
-    nebula_il2cpp_dump_report(NULL, hints,
-                              (int)(sizeof(hints) / sizeof(hints[0])));
-
-    /* 等级 2：安装指针替换型 hook（无 JIT / 无 Frida），失败则继续纯轮询 */
-    int tries = 0, installed = -1;
-    while (tries++ < 20 && installed != 0) {
-        installed = nebula_hook_install_game_update();
-        if (installed != 0) sleep_ms(500);
-    }
-    nlog("poll: hook 安装结果 %d（0=成功帧级拦截；-1=未找到目标；-2=被开关停用）", installed);
-    /* ★ 关键修复：Unity/IL2CPP 的 API 不是线程安全的。
-       以前在这里（后台 pthread）每轮调 FindObjectsOfType / 写字段 / 建字符串，
-       会破坏 Unity 内部状态（表现为交互失效、按键无响应）。
-       现在后台线程【只负责装 hook】，之后所有 IL2CPP 操作都放到
-       hook 的每帧回调里执行 —— 那里是游戏主线程，安全。
-       只有 hook 装不上时才退化到低频轮询（3 秒一次），并明确记日志。 */
-    if (installed == 0) {
-        nlog("poll: hook 已生效，IL2CPP 操作改由游戏主线程每帧回调执行");
-        while (g_poll_run) sleep_ms(1000);      /* 只保活，不碰 IL2CPP */
-        return NULL;
-    }
-
-    nlog("poll: 用 GCD 主队列低频轮询（每 3 秒），IL2CPP 操作在主线程执行");
+    /* 后台线程到此为止：只负责定时把任务投递到主线程。
+       ★ 这里【一个 IL2CPP 调用都不能有】—— 连 ready() 都不查，
+       因为它内部会调 il2cpp_domain_get()。就绪判断改在主线程的
+       main_init_once() 里做（未就绪就下次再试，安全且无跨线程调用）。 */
+    nlog("poll: 已启动（%d ms 一次），IL2CPP 操作全部经 GCD 投递到游戏主线程", pa->interval_ms);
     while (g_poll_run) {
         nebula_il2cpp_apply_all_async();
         sleep_ms(3000);
@@ -935,9 +906,32 @@ static void *poll_thread_main(void *arg) {
     return NULL;
 }
 
+/* ★ 只在【主线程】做一次的重活：自查 dump + 安装 hook。
+   以前放在后台 pthread 里 —— dump 要扫 11 个类的全部字段与方法
+   （上千次 IL2CPP 调用），跨线程会破坏 Unity 内部状态，
+   正是"默认配置下游戏依然异常"的真凶。现在挪到主线程。 */
+static int g_main_inited = 0;
+static void main_init_once(void)
+{
+    if (g_main_inited) return;
+    if (!nebula_il2cpp_ready()) return;      /* 未就绪就下次再试，不硬来 */
+    g_main_inited = 1;
+
+    static const char *hints[] = {
+        "PlayerControl", "GameManager", "ShipStatus", "GameData",
+        "RoleBehaviour", "PlayerInfo",  "MeetingHud", "AmongUsClient",
+        "HudManager",    "PlayerPhysics", "ExileController"
+    };
+    nebula_il2cpp_dump_report(NULL, hints, (int)(sizeof(hints)/sizeof(hints[0])));
+
+    int rc = nebula_hook_install_game_update();
+    nlog("主线程初始化: hook 安装结果 %d（0=成功；-2=默认停用；-3=未取到原入口已撤销）", rc);
+}
+
 /* 一次性把职业应用到游戏（名字显示 + 可选的身份界面文本替换） */
 void nebula_il2cpp_apply_all(void)
 {
+    main_init_once();
     nebula_il2cpp_apply_roles();
     nebula_il2cpp_apply_role_text();
 }
@@ -945,7 +939,7 @@ void nebula_il2cpp_apply_all(void)
 /* ★ 把 IL2CPP 操作排到【游戏主线程】执行。
    Unity/IL2CPP 的 API 不是线程安全的，绝不能在后台 pthread 里直接调用
    （会破坏 Unity 内部状态，表现为交互失效、按键无响应）。
-   用 GCD 主队列就能排到主线程，且【不依赖 hook】—— 这是官方 API，
+   用 GCD 主队列即可排到主线程，且【不依赖 hook】—— 官方 API，
    比 hook 侵入式接管 FixedUpdate 安全得多。 */
 void nebula_il2cpp_apply_all_async(void)
 {
