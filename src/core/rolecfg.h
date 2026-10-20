@@ -30,6 +30,9 @@ int  nebula_rolecfg_default(int *out_ids, int max, int *out_n);
 /* 首次运行把默认阵容写到 path，便于用户在电脑上改 */
 int  nebula_rolecfg_emit_default(const char *path);
 
+/* 导出全部职业清单（key 中文名 阵营）到 path，便于在电脑上查看与挑选 */
+int  nebula_rolecfg_export_all(const char *path);
+
 /* 取第 idx 个上场职业（超出则回绕），便于给玩家循环分配 */
 int  nebula_rolecfg_pick(const int *ids, int n, int idx);
 

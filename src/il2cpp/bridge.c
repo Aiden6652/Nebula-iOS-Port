@@ -568,10 +568,12 @@ int nebula_il2cpp_apply_role_text(void)
     }
     if (text_off < 0) return 0;
 
-    /* 默认【关闭】：它每轮要扫全场景的 TextMeshProUGUI 文本（上百个实例），
-       既重又容易触发 Unity 内部状态问题。确认需要身份界面显示时，
-       放 nebula_role_text.txt 开启。 */
-    if (!nebula_flag_file("nebula_role_text.txt")) return 0;
+    /* 默认【开启】：把原版职业槽位的文字换成我们的职业名。
+       这样【编辑房间（局外）】和身份界面都能看到我们的职业 —— 用户要求
+       "必须在局内能看到、知道开了什么"。
+       已做防护：主线程执行(GCD) + 每轮最多新建 8 个字符串 + 实例数上限 128。
+       若要关闭，放 nebula_no_text.txt。 */
+    if (nebula_flag_file("nebula_no_text.txt")) return 0;
 
     void *insts[128];
     int n = nebula_il2cpp_get_instances(klass, insts, 128);
@@ -586,6 +588,14 @@ int nebula_il2cpp_apply_role_text(void)
         if (home) snprintf(cfg, sizeof(cfg), "%s/Documents/nebula_roles.txt", home);
         nebula_rolecfg_emit_default(home ? cfg : NULL);
         nebula_rolecfg_load(home ? cfg : NULL, roster, ROLECFG_MAX, &roster_n);
+        /* 导出全部职业清单，便于在 iPad「文件」App 里查看有什么职业可挑 */
+        if (home) {
+            char allp[1024];
+            snprintf(allp, sizeof(allp), "%s/Documents/nebula_roles_all.txt", home);
+            if (nebula_rolecfg_export_all(allp) == 0)
+                nebula_log("已导出全部职业清单: Documents/nebula_roles_all.txt（%d 个）",
+                           nebula_role_count());
+        }
     }
     if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);
 

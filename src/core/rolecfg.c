@@ -84,6 +84,38 @@ int nebula_rolecfg_load(const char *path, int *out_ids, int max, int *out_n)
 }
 
 /* 首次运行把默认阵容落盘，便于用户在电脑上直接改 */
+
+/* 导出全部职业清单到文件：key  中文名  阵营。
+   用途：用户在 iPad 的「文件」App（已开文件共享）里就能查看全部职业，
+   挑想要的 key 写进 nebula_roles.txt 上场。解决"不知道有什么职业"。 */
+int nebula_rolecfg_export_all(const char *path)
+{
+    if (!path) return -1;
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    fprintf(f, "# 星云舰 iOS 移植 —— 全部职业清单\n");
+    fprintf(f, "# 共 %d 个职业\n\n", nebula_role_count());
+    fprintf(f, "# 格式：  key(英文id)    中文名    阵营\n");
+    fprintf(f, "# 用法：把想要的 key 抄到 nebula_roles.txt（一行一个，可写 xN 指定数量）\n");
+    fprintf(f, "#        改完重启游戏生效。\n\n");
+
+    for (int i = 0; i < nebula_role_count(); i++) {
+        int rid = nebula_role_id_at(i);
+        const char *k = nebula_role_key(rid);
+        const char *n = nebula_role_name(rid);
+        const char *t = "?";
+        switch (nebula_role_team(rid)) {
+            case TEAM_IMPOSTOR: t = "内鬼"; break;
+            case TEAM_NEUTRAL:  t = "中立"; break;
+            default:            t = "船员"; break;
+        }
+        fprintf(f, "%-24s %-16s %s\n", k ? k : "", n ? n : "", t);
+    }
+    fclose(f);
+    return 0;
+}
+
 int nebula_rolecfg_emit_default(const char *path)
 {
     if (!path) return -1;
