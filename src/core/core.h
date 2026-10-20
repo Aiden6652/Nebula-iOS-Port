@@ -55,7 +55,12 @@ typedef enum {
 #define ABILITY_BUBBLE   10  /* 泡泡击杀：caster 远程击杀且隐藏尸体（不触发 BAIT 报告） */
 #define ABILITY_RECRUIT  11  /* 招募：豺狼把 target 变为自己的跟班 */
 #define ABILITY_VANISH   12  /* 隐身（移植自插件 Ninja）：caster 进入隐身 */
-#define ABILITY_JUDGE    13  /* 审判（审判长）：开会时指定 1~4 名"被告"，本次会议只能投给他们 */
+#define ABILITY_JUDGE    13
+/* 审判长：被告最多 4 名（源码 JusticePlusMaxPlayer 默认 4） */
+#define JUDGE_MAX_TARGETS 4
+/* 审判长：得票数 >= 最高票 - 该值 的被告一起被放逐
+   （源码 exileNeedDifferenceMaxVote 默认 2；设 0 则仅严格平票才双飞） */
+#define JUDGE_VOTE_DIFF   2  /* 审判（审判长）：开会时指定 1~4 名"被告"，本次会议只能投给他们 */
 
 /* ===================== 修饰（Auxiliary，位掩码） ===================== */
 #define MOD_NONE     0x0000

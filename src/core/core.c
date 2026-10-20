@@ -251,6 +251,8 @@ void nebula_core_cast_vote(nebula_game_t *g, uint32_t voter, uint32_t target, in
     if (!g || g->phase != PHASE_MEET) return;
     nebula_player_t *v = nebula_core_find(g, voter);
     if (!v || !v->alive || v->voted) return;
+    /* ★ 审判长：本次会议若有被告，只能投给被告（弃权 target=0 仍允许） */
+    if (g->judged_n > 0 && target != 0 && !nebula_core_is_judged(g, target)) return;
     v->voted = 1;
     v->vote_target = target;
     if (local) broadcast(voter, ABILITY_VOTE, target, 0, 0);
@@ -283,9 +285,14 @@ int nebula_core_resolve_meeting(nebula_game_t *g)
             g->phase = PHASE_OVER; g->winner = WIN_JESTER; return ejected;
         }
     } else if (maxc > 0 && tie && g->judged_n > 0) {
-        /* ★ 审判长规则：审判中若平票，所有平票者【一起飞】 */
+        /* ★ 审判长(justicePlus) 规则，取自 addons 源码真实配置：
+             JusticePlusMaxPlayer = 4   → 最多拉 4 名被告（judged[4]）
+             exileNeedDifferenceMaxVote = 2
+             → 得票数 【>= 最高票-2】 的被告【一起飞】（不只严格平票）
+           原版内置的大神官(justice)只能拉 2 人，审判长是其升级版。 */
         for (int j = 0; j < g->n_players; j++) {
-            if (cnt[j] != maxc || !g->players[j].alive) continue;
+            if (cnt[j] < maxc - JUDGE_VOTE_DIFF || cnt[j] == 0) continue;
+            if (!g->players[j].alive) continue;
             g->players[j].alive = 0;
             if (ejected < 0) ejected = j;
             if (g->players[j].role == ROLE_JESTER) {

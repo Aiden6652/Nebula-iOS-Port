@@ -1,6 +1,6 @@
 /* roles.h — 由官方汉化包自动生成，请勿手改（改请用 tools/ 下的生成器）
  * 数据来源：Addons/【汉化-基础】SCBaseLangPack.zip → Language/SChinese.dat
- * 共 77 个官方职业，含官方中文名与阵营归属。 */
+ * 共 78 个官方职业，含官方中文名与阵营归属。 */
 #ifndef NEBULA_ROLES_H
 #define NEBULA_ROLES_H
 
@@ -48,6 +48,7 @@ typedef enum {
     ROLE_JAILER,                     /* 狱卒 */
     ROLE_JESTER,                     /* 小丑 */
     ROLE_JUSTICE,                    /* 大神官 */
+    ROLE_JUSTICE_PLUS,               /* 审判长 */
     ROLE_LOVER,                      /* 恋人 */
     ROLE_LUMINE,                     /* 引路魂 */
     ROLE_MADMATE,                    /* 叛徒 */

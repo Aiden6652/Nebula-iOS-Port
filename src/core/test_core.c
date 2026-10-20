@@ -210,6 +210,41 @@ int main(void)
     nebula_core_decorate_name(NULL, nm2, sizeof(nm2));
     CHECK(strcmp(nm2, "小红") == 0, "空玩家不崩溃且不改名字");
 
+    /* ===== 审判长(justicePlus) =====
+       规则取自 addons 源码 JusticePlus.cs：
+         最多 4 名被告 / 只能投被告 / 得票 >= 最高票-2 的一起飞 */
+    {
+        nebula_game_t g; nebula_core_init(&g);
+        nebula_core_add_player(&g, 1, ROLE_CREW);
+        nebula_core_add_player(&g, 2, ROLE_CREW);
+        CHECK(nebula_core_set_judged(&g, (uint32_t[]){2}, 1) == 0, "审判：可选 1 名被告");
+
+        nebula_core_init(&g);
+        for (uint32_t i = 1; i <= 5; i++) nebula_core_add_player(&g, i, ROLE_CREW);
+        uint32_t five[5] = {1,2,3,4,5};
+        CHECK(nebula_core_set_judged(&g, five, 5) == -1, "审判：超过 4 名被拒绝");
+        uint32_t four[4] = {1,2,3,4};
+        CHECK(nebula_core_set_judged(&g, four, 4) == 0, "审判：最多 4 名被告");
+        CHECK(g.judged_n == 4, "审判：被告数=4");
+        CHECK(nebula_core_is_judged(&g, 3) == 1, "审判：3 号在被告中");
+        CHECK(nebula_core_is_judged(&g, 5) == 0, "审判：5 号不在被告中");
+
+        /* 只能投给被告 */
+        nebula_core_call_meeting(&g, 1, 1);
+        nebula_core_cast_vote(&g, 1, 5, 1);            /* 投给非被告 → 无效 */
+        CHECK(g.players[0].voted == 0, "审判：投给非被告无效");
+        nebula_core_cast_vote(&g, 1, 2, 1);            /* 投给被告 → 有效 */
+        CHECK(g.players[0].voted == 1, "审判：投给被告有效");
+
+        /* 平票双飞：1号投2号、2号投3号 → 两者各 1 票(最高票1)，差 0 <= 2 → 一起飞 */
+        nebula_core_cast_vote(&g, 2, 3, 1);
+        int ej = nebula_core_resolve_meeting(&g);
+        CHECK(ej >= 0, "审判：会议可结算");
+        CHECK(nebula_core_find(&g,2)->alive == 0 && nebula_core_find(&g,3)->alive == 0,
+              "★ 审判平票：得票接近的两人【一起飞】");
+        CHECK(nebula_core_find(&g,5)->alive == 1, "审判：非被告不受影响");
+    }
+
     printf("\n%s (%d failures)\n", failures==0 ? "ALL PASS" : "HAS FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

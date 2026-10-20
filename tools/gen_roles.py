@@ -72,13 +72,33 @@ ROLE_COLOR = {
 TEAM_COLOR = {"TEAM_IMPOSTOR":"#FF1919", "TEAM_NEUTRAL":"#C0C0C0", "TEAM_CREW":"#FFFFFF"}
 
 def color_of(rid, team):
+    if rid in ADDON_COLOR: return ADDON_COLOR[rid]    # addons 扩展职业的真实颜色
     if rid in ROLE_COLOR: return ROLE_COLOR[rid]
     return TEAM_COLOR.get(team, "#FFFFFF")
 
+
+# ---- 扩展职业（来自 addons 的 Scripts/*.cs，非 NOS 内置）----
+# 格式: key: (中文名, 阵营, 颜色)
+# 颜色取自源码 base(...) 里的 RGB，阵营取自 RoleCategory/NebulaTeams
+ADDON_ROLES = {
+    "justicePlus": ("审判长", "TEAM_CREW", "#C2F2FF"),
+}
+ADDON_TEAM  = {k: v[1] for k, v in ADDON_ROLES.items()}
+ADDON_COLOR = {k: v[2] for k, v in ADDON_ROLES.items()}
+
+def is_addon(rid):
+    return rid in ADDON_ROLES
+
 def team_of(rid):
+    if rid in ADDON_TEAM: return ADDON_TEAM[rid]      # addons 扩展职业优先
     if rid in IMPOSTOR: return "TEAM_IMPOSTOR"
     if rid in NEUTRAL:  return "TEAM_NEUTRAL"
     return "TEAM_CREW"
+
+# 合并 addons 扩展职业（中文名）
+for _k, _v in ADDON_ROLES.items():
+    roles.setdefault(_k, _v[0])
+_ = is_addon                      # 保留引用
 
 ids = sorted(roles.keys())
 enum_name = {}
