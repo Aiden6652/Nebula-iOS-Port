@@ -803,9 +803,14 @@ static int freeplay_fill_room(int fallback_players)
         return 0;
     }
     added++;
+    /* ★ 补完立刻复查人数：如果 AddDummy 加进去的不算"人头"，
+       那光补是开不了局的（游戏仍认为房里只有你一个）。 */
+    int after = -1;
+    nebula_il2cpp_call_int(inst[0], "get_PlayerCount", &after);
     if (added <= 3 || added % 5 == 0)
-        nebula_log("freeplay: 已补 %d 个 dummy（目标 %d 人，当前 %d）",
-                   added, target, cur);
+        nebula_log("freeplay: 已补 %d 个 dummy（目标 %d 人，补前 %d → 补后 %d）%s",
+                   added, target, cur, after,
+                   (after > cur) ? "" : " ← AddDummy 没让人数增加！");
     return 1;
 }
 
@@ -1072,6 +1077,20 @@ int nebula_il2cpp_apply_roles(void)
     roster_n = nebula_weight_expand(roster, 512);
     /* 自由模式：先把房间人数补齐（单人也能开局） */
     freeplay_fill_room(n);
+    {
+        static int rp = 0;
+        if (++rp % 30 == 1) {
+            int pc = -1;
+            void *gdk = nebula_il2cpp_find_class_by_hint("GameData");
+            if (gdk) {
+                void *gi[4];
+                if (nebula_il2cpp_get_instances(gdk, gi, 4) > 0)
+                    nebula_il2cpp_call_int(gi[0], "get_PlayerCount", &pc);
+            }
+            nebula_log("freeplay: 房间人数=%d（补齐目标 %d，局内玩家实例 %d）",
+                       pc, nebula_freeplay_fill(), n);
+        }
+    }
     /* 再把原版"至少 4 人才开始"的限制降到 1 人 */
     freeplay_lower_min_players();
     if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);

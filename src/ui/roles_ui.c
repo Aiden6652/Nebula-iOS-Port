@@ -18,6 +18,20 @@ static char g_roles_path[1024] = {0};
 static char g_fp_path[1024] = {0};
 static char g_sub_path[1024] = {0};
 
+/* 面板里"当前正在编辑的主职业"：附加职业都挂在它下面 */
+static int g_cur_main = -1;
+
+/* 默认主职业：权重 > 0 的第一个（都没有就用第 0 个）。
+   这样打开面板就能直接勾附加，不必先点职业名。 */
+static void pick_default_main(void)
+{
+    int n = nebula_weight_count();
+    for (int i = 0; i < n; i++) {
+        if (nebula_weight_get(i) > 0) { g_cur_main = i; return; }
+    }
+    g_cur_main = (n > 0) ? 0 : -1;
+}
+
 void nebula_ui_init(const char *docs_dir)
 {
     if (docs_dir) snprintf(g_docs, sizeof(g_docs), "%s", docs_dir);
@@ -29,6 +43,7 @@ void nebula_ui_init(const char *docs_dir)
     nebula_weight_load(g_roles_path);
     nebula_subrole_load(g_sub_path);
     nebula_freeplay_load(g_fp_path);
+    if (g_cur_main < 0) pick_default_main();
 }
 
 int         nebula_ui_role_count(void)     { return nebula_weight_count(); }
@@ -46,9 +61,6 @@ void nebula_ui_role_set(int idx, int w)
     nebula_weight_set(idx, w);
     if (g_roles_path[0]) nebula_weight_save(g_roles_path);
 }
-
-/* 面板里"当前正在编辑的主职业"：附加职业都挂在它下面 */
-static int g_cur_main = -1;
 
 int nebula_ui_current_main(void) { return g_cur_main; }
 
@@ -69,15 +81,21 @@ int nebula_ui_current_main_name(char *out, size_t osz)
 
 int nebula_ui_role_is_sub(int idx)
 {
+    if (g_cur_main < 0) pick_default_main();
     if (g_cur_main < 0) return 0;
     return nebula_subrole_is_on(g_cur_main, idx);
 }
 
 void nebula_ui_role_toggle_sub(int idx)
 {
-    if (g_cur_main < 0) return;            /* 还没选主职业就不动 */
+    if (g_cur_main < 0) pick_default_main();   /* 没选过就自动选一个，别让点击没反应 */
+    if (g_cur_main < 0) return;
     nebula_subrole_toggle(g_cur_main, idx);
     if (g_sub_path[0]) nebula_subrole_save(g_sub_path);
+    nebula_log("面板：主职业[%s] 附加[%s] → %s",
+               nebula_weight_name(g_cur_main) ? nebula_weight_name(g_cur_main) : "?",
+               nebula_weight_name(idx) ? nebula_weight_name(idx) : "?",
+               nebula_subrole_is_on(g_cur_main, idx) ? "已挂上" : "已取消");
 }
 
 int nebula_ui_sub_count(void) { return nebula_subrole_count(); }

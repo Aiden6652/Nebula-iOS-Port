@@ -159,7 +159,10 @@ int nebula_subrole_is_on(int main_idx, int sub_idx)
 void nebula_subrole_toggle(int main_idx, int sub_idx)
 {
     int mid = idx_to_id(main_idx), sid = idx_to_id(sub_idx);
-    if (mid < 0 || mid >= MAX_ROLES || sid < 0 || sid >= MAX_ROLES || mid == sid) return;
+    if (mid < 0 || mid >= MAX_ROLES || sid < 0 || sid >= MAX_ROLES || mid == sid) {
+        nebula_log("subrole: 无法附加（主id=%d 附id=%d：id 无效或自己附加自己）", mid, sid);
+        return;
+    }
 
     for (int k = 0; k < SUB_MAX_PER_ROLE; k++) {
         if (g_sub[mid][k] == sid) {          /* 已挂 → 移除（后面的前移） */
@@ -171,7 +174,7 @@ void nebula_subrole_toggle(int main_idx, int sub_idx)
     for (int k = 0; k < SUB_MAX_PER_ROLE; k++) {   /* 未挂 → 加到空位 */
         if (g_sub[mid][k] < 0) { g_sub[mid][k] = sid; return; }
     }
-    /* 满了：不再加（防越界） */
+    nebula_log("subrole: 达到上限 %d 个，不能再附加", SUB_MAX_PER_ROLE);
 }
 
 void nebula_weight_clear(void)
