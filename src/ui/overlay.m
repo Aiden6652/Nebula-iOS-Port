@@ -19,6 +19,10 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #include "roles_ui.h"
+#include "../il2cpp/bridge.h"   /* nebula_log */
+
+/* 由 bridge 侧反复调用直到装好（weak 链接，见 bridge.c） */
+int nebula_ui_install_now(void);
 
 /* —— 悬浮按钮点击标志（bridge.c 每轮查询） —— */
 static volatile int g_nebula_switch = 0;
@@ -93,6 +97,79 @@ static NSMutableArray *g_weight_labels = nil;   /* 每行的权重 Label，点 +
 }
 
 @end
+
+/* 前置声明：安装函数在 build_panel / docs_dir 定义之前使用它们 */
+static NSString *docs_dir(void);
+static void build_panel(UIWindow *win);
+
+/* 成功装好返回 1，没装成返回 0（调用方可以过一会儿再试）。
+   ⚠ 关键：dylib 加载时 App 往往【还没有 UIWindow】，一次失败就永远没按钮了。
+   所以安装必须能反复重试，直到真的装上。 */
+static int  g_installed = 0;
+static char g_ctl_key = 0;   /* associatedObject 的 key（用地址，不用字符串字面量） */
+
+static UIWindow *find_window(void)
+{
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return nil;
+    /* iOS 13+ 多场景：先找前台活跃的窗口 */
+    for (UIScene *sc in app.connectedScenes) {
+        if ([sc isKindOfClass:[UIWindowScene class]] &&
+            sc.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w) return w;
+        }
+    }
+    /* 兜底 1：任意场景里的任意窗口 */
+    for (UIScene *sc in app.connectedScenes) {
+        if ([sc isKindOfClass:[UIWindowScene class]])
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w) return w;
+    }
+    /* 兜底 2：老 API */
+    if ([app respondsToSelector:@selector(keyWindow)]) return app.keyWindow;
+    return nil;
+}
+
+int nebula_ui_install_now(void)
+{
+    if (g_installed) return 1;
+
+    __block int ok = 0;
+    void (^blk)(void) = ^{
+        @try {
+            UIWindow *win = find_window();
+            if (!win) return;
+            nebula_ui_init([docs_dir() UTF8String]);
+            build_panel(win);
+
+            UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+            btn.frame = CGRectMake(win.bounds.size.width - 100.0, 96.0, 88.0, 36.0);
+            [btn setTitle:@"职业" forState:UIControlStateNormal];
+            btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+            btn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
+            btn.layer.cornerRadius = 10;
+            btn.layer.borderWidth = 1;
+            btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.6].CGColor;
+            btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
+                                   UIViewAutoresizingFlexibleBottomMargin;
+            NebulaPanelCtl *ctl = objc_getAssociatedObject(g_panel, &g_ctl_key);
+            [btn addTarget:ctl action:@selector(onToggle:) forControlEvents:UIControlEventTouchUpInside];
+            [win addSubview:btn];
+            [win bringSubviewToFront:btn];
+            ok = 1;
+        } @catch (NSException *e) {
+            nebula_log("面板：创建异常 %s", [[e reason] UTF8String]);
+        }
+    };
+
+    if ([NSThread isMainThread]) blk();
+    else dispatch_sync(dispatch_get_main_queue(), blk);
+
+    if (ok) {
+        g_installed = 1;
+        nebula_log("面板：已创建（右上角悬浮按钮「职业」）");
+    }
+    return ok;
+}
 
 static NSString *docs_dir(void)
 {
@@ -203,47 +280,18 @@ static void build_panel(UIWindow *win)
     }
     [panel addSubview:list];
 
-    objc_setAssociatedObject(panel, "ctl", ctl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(panel, &g_ctl_key, ctl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     g_list  = list;
     g_panel = panel;
     [win addSubview:panel];
 }
 
 __attribute__((constructor))
-static void nebula_ui_install(void)
+static void nebula_ui_boot(void)
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        nebula_ui_init([docs_dir() UTF8String]);
-
-        UIWindow *win = nil;
-        UIApplication *app = [UIApplication sharedApplication];
-        for (UIScene *sc in app.connectedScenes) {
-            if ([sc isKindOfClass:[UIWindowScene class]] &&
-                sc.activationState == UISceneActivationStateForegroundActive) {
-                win = ((UIWindowScene *)sc).windows.firstObject;
-                if (win) break;
-            }
-        }
-        if (!win) win = app.keyWindow;
-        if (!win) return;
-
-        build_panel(win);
-
-        /* 悬浮按钮：打开/收起面板 */
-        NebulaPanelCtl *ctl = objc_getAssociatedObject(g_panel, "ctl");
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.frame = CGRectMake(win.bounds.size.width - 100.0, 96.0, 88.0, 36.0);
-        [btn setTitle:@"职业" forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-        btn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
-        btn.layer.cornerRadius = 10;
-        btn.layer.borderWidth = 1;
-        btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.6].CGColor;
-        btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
-                               UIViewAutoresizingFlexibleBottomMargin;
-        [btn addTarget:ctl action:@selector(onToggle:) forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:btn];
-    });
+    /* 这里常常拿不到窗口（App 还没起来），失败也没关系 ——
+       bridge 侧会持续重试 nebula_ui_install_now()。 */
+    nebula_ui_install_now();
 }
 
 #endif /* __APPLE__ */

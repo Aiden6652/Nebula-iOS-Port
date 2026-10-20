@@ -629,6 +629,20 @@ int nebula_il2cpp_get_player_name(void *info_obj, char *out, size_t osz)
    weak 符号 —— 没链接 overlay.m 时为 NULL，调用处必须判空。 */
 int nebula_ui_switch_requested(void) __attribute__((weak));
 
+/* 装面板（可反复调用，装好就返回 1）。dylib 加载时常拿不到窗口，
+   必须持续重试，否则用户永远看不到按钮。 */
+int nebula_ui_install_now(void) __attribute__((weak));
+
+/* 每轮都试着装一次面板，装好后就不再试（开销极小） */
+static void freeplay_try_install_ui(void)
+{
+    static int done = 0, tries = 0;
+    if (done || !nebula_ui_install_now) return;
+    if (nebula_ui_install_now()) { done = 1; return; }
+    if (++tries % 20 == 1)
+        nebula_log("面板：第 %d 次尝试创建仍未拿到窗口（会继续重试）", tries);
+}
+
 /* 是否在大厅：LobbyBehaviour 只在大厅场景存在。
    大厅里不写职业名 —— 没开局就亮出 [警长] 等于剧透自己（真机截图已证实）。 */
 static int in_lobby(void)
@@ -918,6 +932,10 @@ static float g_base_speed = 0.0f;   /* 基准速度，只记录一次 */
 
 int nebula_il2cpp_apply_roles(void)
 {
+    /* ★ 必须在最开头：大厅里没有玩家实例，后面的代码会直接 return，
+       放在那儿的话面板按钮永远装不上。 */
+    freeplay_try_install_ui();
+
     void *klass = nebula_il2cpp_find_class_by_hint("PlayerControl");
     if (!klass) return 0;
 
