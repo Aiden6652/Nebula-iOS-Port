@@ -624,14 +624,42 @@ int nebula_il2cpp_get_player_name(void *info_obj, char *out, size_t osz)
 /* ★ 自由模式：把房间人数自动补齐到目标人数。
    调原版 GameData.AddDummy（游戏自带方法，不是我们造的）。
    每轮只补【一个】：一次补一堆容易触发游戏内部同步问题/卡顿。 */
-static int freeplay_fill_room(int current_players)
+/* ★ 调用无参方法并取 int 返回值（用于 GameData.get_PlayerCount）。
+   IL2CPP 里 int 返回是【装箱对象】：对象头(klass 8 + monitor 8)之后是值。 */
+int nebula_il2cpp_call_int(void *obj, const char *method, int *out)
+{
+    if (!g_api_ok || !obj || !method || !out) return -1;
+    void *klass = *(void **)obj;
+    if (!klass) return -1;
+    if (!A.class_get_method_from_name || !A.runtime_invoke) return -1;
+
+    void *m = A.class_get_method_from_name(klass, method, -1);
+    if (!m) return -1;
+
+    void *params[1] = { NULL };
+    void *exc = NULL;
+    void *ret = A.runtime_invoke(m, obj, params, &exc);
+    if (exc || !ret) return -1;
+
+    *out = *(int32_t *)((char *)ret + 16);   /* 装箱 int 的值 */
+    return 0;
+}
+
+/* ★ 自由模式：把房间人数自动补齐到目标人数。
+   调原版 GameData.AddDummy（游戏自带方法，不是我们造的）。
+
+   ⚠ 关键：判断"现在几个人"必须读【房间真实人数】(GameData.get_PlayerCount)，
+   不能用局内 PlayerControl 实例数 —— dummy 未必有 PlayerControl 实例，
+   用后者会永远觉得人不够，每轮补一个把房间撑爆。
+   另外无论读不读得到人数，总补次数都有硬上限，杜绝无限补。 */
+static int freeplay_fill_room(int fallback_players)
 {
     int target = nebula_freeplay_fill();
     if (target <= 0) return 0;
-    if (current_players >= target) return 0;
 
-    static int failed = 0;
-    if (failed) return 0;               /* 试过一次失败就不再试（防每轮抛异常） */
+    static int failed = 0, added = 0;
+    if (failed) return 0;            /* 试过一次失败就不再试（防每轮抛异常） */
+    if (added >= target) return 0;   /* ★ 硬保险：最多补 target 个 */
 
     void *gdk = nebula_il2cpp_find_class_by_hint("GameData");
     if (!gdk) return 0;
@@ -643,16 +671,23 @@ static int freeplay_fill_room(int current_players)
             nebula_log("freeplay: 取不到 GameData 实例(第%d次) —— 暂无法补齐人数", miss);
         return 0;
     }
+
+    int cur = -1;
+    if (nebula_il2cpp_call_int(inst[0], "get_PlayerCount", &cur) == 0) {
+        if (cur >= target) return 0;                 /* 人数已够 */
+    } else if (fallback_players > 0 && fallback_players >= target) {
+        return 0;                                    /* 读不到人数时用局内实例数兜底 */
+    }
+
     if (nebula_il2cpp_call_void(inst[0], "AddDummy") != 0) {
         failed = 1;
         nebula_log("freeplay: AddDummy 调用失败 —— 停止补齐（不影响正常游戏）");
         return 0;
     }
-    static int added = 0;
     added++;
     if (added <= 3 || added % 5 == 0)
         nebula_log("freeplay: 已补 %d 个 dummy（目标 %d 人，当前 %d）",
-                   added, target, current_players);
+                   added, target, cur);
     return 1;
 }
 

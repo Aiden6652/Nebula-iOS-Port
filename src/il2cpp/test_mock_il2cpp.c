@@ -70,6 +70,7 @@ static MField f_pp[]  = { {"Speed", OFF_Speed, "System.Single"}, {NULL,0,NULL} }
 static MField f_list[] = { {"_size", 0x10, "System.Int32"}, {"_items", 0x18, "System.Object[]"}, {NULL,0,NULL} };
 static MField f_tmp[] = { {"m_text", 0x40, "System.String"}, {NULL,0,NULL} };
 static MField f_obj[] = { {NULL,0,NULL} };
+static MField f_gd[]  = { {"AllPlayers", 32, "List<NetworkedPlayerInfo>"}, {NULL,0,NULL} };
 
 static MClass g_classes[] = {
     {"", "PlayerControl", f_pc, 4},
@@ -78,6 +79,8 @@ static MClass g_classes[] = {
     {"", "List_PlayerControl", f_list, 2},
     {"UnityEngine", "Object", f_obj, 0},
     {"TMPro", "TextMeshProUGUI", f_tmp, 1},
+    {"", "GameData", f_gd, 1},                 /* 真机有：AddDummy / get_PlayerCount */
+    {"UnityEngine", "Object", f_obj, 0},
 };
 #define NCLASS ((int)(sizeof(g_classes)/sizeof(g_classes[0])))
 
@@ -89,6 +92,8 @@ static unsigned char g_pc_mem[MAX_PLAYERS][512];
 static unsigned char g_npi_mem[MAX_PLAYERS][256];
 static unsigned char g_pp_mem[MAX_PLAYERS][256];
 static unsigned char g_list_mem[256];
+static unsigned char g_gd_mem[256];      /* GameData 实例（补齐人数要用） */
+static int g_dummy_count = 0;            /* 已补齐的 dummy 数 */
 static unsigned char *g_arr_mem = NULL;
 
 static void *pc_obj(int i) { return (void *)g_pc_mem[i]; }
@@ -112,6 +117,10 @@ static void build_world(void) {
         /* PlayerName 初值 */
         *(void **)((char *)g_npi_mem[i] + OFF_PlayerName) = mock_str_new("Player");
     }
+    /* GameData 实例：对象头必须是 klass 指针，且初始人数 = 真实玩家数 */
+    *(void **)g_gd_mem = (void *)&g_classes[6];   /* GameData */
+    g_dummy_count = 0;
+
     /* List：_size / _items / 数组（同样要有对象头） */
     *(void **)g_list_mem = (void *)&g_classes[3];   /* List_PlayerControl */
     g_arr_mem = (unsigned char *)calloc(1, 0x20 + MAX_PLAYERS * sizeof(void *));
@@ -161,10 +170,18 @@ void il2cpp_field_static_get_value(void *f, void *out) {
 
 /* 方法：仅支持 set_PlayerName（新版 AU 改名字的真实方式），
    其余返回 NULL（让 get_instances 走 AllPlayerControls 路线） */
-#define MOCK_SET_NAME ((void *)1)
+#define MOCK_SET_NAME  ((void *)1)
+#define MOCK_ADD_DUMMY ((void *)2)
+#define MOCK_PLAYER_CNT ((void *)3)
+#define MOCK_FIND      ((void *)4)
 void *il2cpp_class_get_method_from_name(void *k, const char *n, int c) {
     (void)k; (void)c;
-    if (n && strcmp(n, "set_PlayerName") == 0) return MOCK_SET_NAME;
+    if (!n) return NULL;
+    if (strcmp(n, "set_PlayerName") == 0)  return MOCK_SET_NAME;
+    if (strcmp(n, "AddDummy") == 0)        return MOCK_ADD_DUMMY;
+    if (strcmp(n, "get_PlayerCount") == 0) return MOCK_PLAYER_CNT;
+    if (strcmp(n, "FindObjectsOfType") == 0 || strcmp(n, "FindObjectsByType") == 0)
+        return MOCK_FIND;
     return NULL;
 }
 void *il2cpp_class_get_methods(void *k, void **it) { (void)k; (void)it; return NULL; }
@@ -172,11 +189,42 @@ const char *il2cpp_method_get_name(void *m) { (void)m; return NULL; }
 void *il2cpp_class_get_type(void *k) { return k; }
 void *il2cpp_type_get_object(void *t) { return t; }
 int g_setname_calls = 0;      /* 供测试断言：确实调用了 set_PlayerName */
+/* 造一个 FindObjectsOfType 的返回值：数组布局 len@0x18 / data@0x20（与真机宏一致） */
+static void *mock_arr_of(void *elem) {
+    unsigned char *b = (unsigned char *)calloc(1, 0x40);
+    *(uint32_t *)(b + 0x18) = 1;
+    *(void **)(b + 0x20) = elem;
+    return (void *)b;
+}
+/* 装箱 int：对象头(klass 8 + monitor 8) 之后是值 */
+static void *mock_box_int(int v) {
+    unsigned char *b = (unsigned char *)calloc(1, 32);
+    *(int32_t *)(b + 16) = v;
+    return (void *)b;
+}
 void *il2cpp_runtime_invoke(void *m, void *o, void **p, void **e) {
     if (m == MOCK_SET_NAME && o && p && p[0]) {
         /* 模拟：把新字符串写进对象的 PlayerName 字段 */
         *(void **)((char *)o + OFF_PlayerName) = p[0];
         g_setname_calls++;
+        if (e) *e = NULL;
+        return NULL;
+    }
+    if (m == MOCK_ADD_DUMMY) {          /* 自由模式补齐：房间人数 +1 */
+        g_dummy_count++;
+        if (e) *e = NULL;
+        return NULL;
+    }
+    if (m == MOCK_PLAYER_CNT) {         /* 房间真实人数 = 真玩家 + 已补 dummy */
+        if (e) *e = NULL;
+        return mock_box_int(MAX_PLAYERS + g_dummy_count);
+    }
+    if (m == MOCK_FIND) {               /* 按类型返回实例数组（供 get_instances 用） */
+        if (e) *e = NULL;
+        void *want = p ? p[0] : NULL;   /* 传入的 System.Type 就是 klass 指针 */
+        if (want == (void *)&g_classes[6]) return mock_arr_of((void *)g_gd_mem);
+        if (want == (void *)&g_classes[0]) return mock_arr_of((void *)pc_obj(0));
+        return NULL;
     }
     (void)m; (void)o; (void)p; if (e) *e = NULL; return NULL;
 }
@@ -283,6 +331,18 @@ int main(void) {
         CHECK(strstr(nm0, "Player") != NULL, "自由模式：原名字仍在（未被冲掉）");
         /* 警长带刀 → 底层必须伪装成 Impostor，否则拿不到击杀按钮 */
         CHECK(rt_of(0) == RT_IMPOSTOR, "自由模式：带刀职业底层映射为 Impostor（能拿到刀）");
+    }
+
+    /* ③c 自由模式：房间人数自动补齐到目标，且【不会无限补】 */
+    {
+        for (int r = 0; r < 30; r++) nebula_il2cpp_apply_roles();
+        printf("      [info] 房间人数 = %d（真实玩家 %d + dummy %d，目标 10）\n",
+               MAX_PLAYERS + g_dummy_count, MAX_PLAYERS, g_dummy_count);
+        CHECK(g_dummy_count > 0, "自由模式：房间人数被自动补齐（调 GameData.AddDummy）");
+        CHECK(MAX_PLAYERS + g_dummy_count == 10, "补齐到目标 10 人后停止");
+        for (int r = 0; r < 60; r++) nebula_il2cpp_apply_roles();
+        CHECK(MAX_PLAYERS + g_dummy_count == 10,
+              "★ 再跑 60 轮人数仍为 10（不会无限补把房间撑爆）");
     }
 
     /* ④ 无关字段未被破坏 */
