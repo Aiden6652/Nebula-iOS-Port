@@ -51,6 +51,7 @@ static NSMutableArray *g_weight_labels = nil;   /* 每行的权重 Label，点 +
 
 - (void)refreshRow:(int)idx
 {
+    if (!g_weight_labels) return;
     if (idx < 0 || idx >= (int)g_weight_labels.count) return;
     UILabel *lb = g_weight_labels[idx];
     int w = nebula_ui_role_weight(idx);
@@ -61,39 +62,59 @@ static NSMutableArray *g_weight_labels = nil;   /* 每行的权重 Label，点 +
 - (void)onToggle:(id)sender
 {
     (void)sender;
-    if (!g_panel) return;
-    BOOL show = g_panel.hidden;
-    if (show) {
-        /* 每次打开按当前权重刷新（可能刚被其它逻辑改过） */
-        for (NSInteger i = 0; i < g_weight_labels.count; i++) [self refreshRow:(int)i];
+    @try {
+        if (!g_panel) return;
+        BOOL show = g_panel.hidden;
+        if (show && g_weight_labels) {
+            /* 每次打开按当前权重刷新（可能刚被其它逻辑改过） */
+            for (NSInteger i = 0; i < g_weight_labels.count; i++) [self refreshRow:(int)i];
+        }
+        g_panel.hidden = !show;
+    } @catch (NSException *e) {
+        nebula_log("面板：切换异常 %s", [[e reason] UTF8String]);
     }
-    g_panel.hidden = !show;
 }
 
 - (void)onNextRole:(id)sender
 {
     (void)sender;
-    g_nebula_switch = 1;
+    @try {
+        g_nebula_switch = 1;
+    } @catch (NSException *e) {
+        nebula_log("面板：换职业异常 %s", [[e reason] UTF8String]);
+    }
 }
 
 - (void)onFreeplay:(id)sender
 {
-    UISwitch *sw = (UISwitch *)sender;
-    nebula_ui_set_freeplay(sw.on ? 1 : 0);
+    @try {
+        UISwitch *sw = (UISwitch *)sender;
+        nebula_ui_set_freeplay(sw.on ? 1 : 0);
+    } @catch (NSException *e) {
+        nebula_log("面板：自由模式开关异常 %s", [[e reason] UTF8String]);
+    }
 }
 
 - (void)onMinus:(id)sender
 {
-    int idx = (int)((UIButton *)sender).tag;
-    nebula_ui_role_bump(idx, -1);
-    [self refreshRow:idx];
+    @try {
+        int idx = (int)((UIButton *)sender).tag;
+        nebula_ui_role_bump(idx, -1);
+        [self refreshRow:idx];
+    } @catch (NSException *e) {
+        nebula_log("面板：减权重异常 %s", [[e reason] UTF8String]);
+    }
 }
 
 - (void)onPlus:(id)sender
 {
-    int idx = (int)((UIButton *)sender).tag;
-    nebula_ui_role_bump(idx, +1);
-    [self refreshRow:idx];
+    @try {
+        int idx = (int)((UIButton *)sender).tag;
+        nebula_ui_role_bump(idx, +1);
+        [self refreshRow:idx];
+    } @catch (NSException *e) {
+        nebula_log("面板：加权重异常 %s", [[e reason] UTF8String]);
+    }
 }
 
 @end
@@ -237,7 +258,9 @@ static void build_panel(UIWindow *win)
     CGFloat rowH = 40.0;
     int n = nebula_ui_role_count();
     list.contentSize = CGSizeMake(pw, rowH * n);
-    g_weight_labels = [NSMutableArray arrayWithCapacity:n];
+    /* ★ 必须 alloc（自己持有）：用 [NSMutableArray arrayWithCapacity:] 得到的是
+       autorelease 对象，自动释放池一排空就变野指针 —— 点按钮时必崩。 */
+    g_weight_labels = [[NSMutableArray alloc] initWithCapacity:n];
 
     for (int i = 0; i < n; i++) {
         UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, rowH * i, pw, rowH)];

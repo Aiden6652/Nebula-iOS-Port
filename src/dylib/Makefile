@@ -4,7 +4,7 @@
 CC      ?= clang
 TARGET  := arm64-apple-ios14.0
 SYSROOT := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
-SRC     := loader.c ../net/protocol.c ../net/dispatch.c ../core/core.c ../core/roles.c ../core/rolecfg.c ../core/rolemapping.c ../core/roleweight.c ../core/freeplay.c ../ui/roles_ui.c ../ui/overlay.m ../il2cpp/bridge.c ../il2cpp/hook.c ../addon/addon.c
+SRC     := loader.c ../net/protocol.c ../net/dispatch.c ../core/core.c ../core/roles.c ../core/rolecfg.c ../core/rolemapping.c ../core/roleweight.c ../core/freeplay.c ../ui/roles_ui.c ../il2cpp/bridge.c ../il2cpp/hook.c ../addon/addon.c
 OUT     := nebula_ios_loader.dylib
 CFLAGS  := -target $(TARGET) -isysroot $(SYSROOT) -fPIC -O2 -Wall
 
@@ -14,10 +14,18 @@ endif
 
 all: $(OUT)
 
-$(OUT): $(SRC)
-	$(CC) $(CFLAGS) -shared -o $(OUT) $(SRC) -lz -framework UIKit -framework Foundation
+# ObjC 单独编译并开 ARC：MRC 下很容易踩"autorelease 对象赋给全局变量
+# → 池排空变野指针 → 一点就崩"的坑。ARC 能自动把强引用持有住。
+OBJC   := ../ui/overlay.m
+OBJO   := overlay_ui.o
+
+$(OUT): $(SRC) $(OBJO)
+	$(CC) $(CFLAGS) -shared -o $(OUT) $(SRC) $(OBJO) -lz -framework UIKit -framework Foundation
+
+$(OBJO): $(OBJC)
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $(OBJO) $(OBJC)
 
 clean:
-	rm -f $(OUT)
+	rm -f $(OUT) $(OBJO)
 
 .PHONY: all clean
