@@ -969,7 +969,10 @@ static void main_init_once(void)
     static const char *hints[] = {
         "PlayerControl", "GameManager", "ShipStatus", "GameData",
         "RoleBehaviour", "PlayerInfo",  "MeetingHud", "AmongUsClient",
-        "HudManager",    "PlayerPhysics", "ExileController"
+        "HudManager",    "PlayerPhysics", "ExileController",
+        /* ★ 官方内置模组 API（iOS 版也有！）—— 摸清它的结构就能：
+           显示模组标记(合规)、注册模组、甚至让官方服务器认这是模组房 */
+        "ModManager", "ModStamp"
     };
     nebula_il2cpp_dump_report(NULL, hints, (int)(sizeof(hints)/sizeof(hints[0])));
 
