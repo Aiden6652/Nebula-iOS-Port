@@ -174,6 +174,33 @@ void nebula_freeplay_next(int total)
     g_fp.last_switch = (long)time(NULL);   /* 重置：按钮切完不会紧接着自动又跳 */
 }
 
+/* 面板上的自由模式开关：立即改运行时状态，并把配置落盘
+   （关 = 写 off 行；开 = 不写 off），下次启动保持用户的选择。 */
+void nebula_freeplay_set_enabled(int on, const char *path)
+{
+    if (on) {
+        g_fp.enabled = 1;
+        if (g_fp.fill == 0) g_fp.fill = FP_FILL_DEFAULT;
+        /* 首次开启且没配过轮换 → 给个默认轮换间隔 */
+        if (g_fp.rotate == 0 && g_fp.role == FP_ROLE_NONE) g_fp.rotate = FP_ROTATE_DEFAULT;
+    } else {
+        g_fp.enabled = 0;
+    }
+    g_fp.last_switch = (long)time(NULL);
+
+    if (!path) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    if (!on) fputs("off\n\n", f);
+    fprintf(f, "fill %d\n", g_fp.fill);
+    if (g_fp.role != FP_ROLE_NONE) {
+        const char *k = nebula_role_key(g_fp.role);
+        if (k) fprintf(f, "role %s\n", k);
+    }
+    if (g_fp.rotate > 0) fprintf(f, "rotate %d\n", g_fp.rotate);
+    fclose(f);
+}
+
 int nebula_freeplay_progress(char *out, size_t osz)
 {
     if (!out || osz == 0) return 0;

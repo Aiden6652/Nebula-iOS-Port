@@ -11,6 +11,7 @@
 #include "bridge.h"
 #include "hook.h"
 #include "../core/freeplay.h"
+#include "../core/roleweight.h"
 
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>      /* GCD：把操作排到游戏主线程，无需 hook */
@@ -752,6 +753,10 @@ int nebula_il2cpp_apply_role_text(void)
        "必须在局内能看到、知道开了什么"。
        已做防护：主线程执行(GCD) + 每轮最多新建 8 个字符串 + 实例数上限 128。
        若要关闭，放 nebula_no_text.txt。 */
+    /* ★ 原版 11 个槽位【废弃】：它装不下 267 个职业，也加不进条目。
+       职业设置全交由我们自己的面板接管，所以默认不再往原版 UI 里写职业名。
+       真想恢复旧行为，放一个 nebula_role_slots.txt 即可。 */
+    if (!nebula_flag_file("nebula_role_slots.txt")) return 0;
     if (nebula_flag_file("nebula_no_text.txt")) return 0;
 
     void *insts[128];
@@ -928,14 +933,17 @@ int nebula_il2cpp_apply_roles(void)
         return 0;
     }
 
-    static int roster[ROLECFG_MAX]; static int roster_n = 0; static int cfg_done = 0;
+    /* ★ 上场职业来自【权重表】（267 个职业，由游戏内「职业」面板调整）。
+       每轮重新展开：面板里点了 +/- 之后 1 秒内就生效，不用重启游戏。 */
+    static int roster[512]; static int roster_n = 0; static int cfg_done = 0;
+    static char g_roles_path[1024] = {0};
     if (!cfg_done) {
         cfg_done = 1;
         const char *home = getenv("HOME");
-        char cfg[1024] = {0};
-        if (home) snprintf(cfg, sizeof(cfg), "%s/Documents/nebula_roles.txt", home);
-        nebula_rolecfg_emit_default(home ? cfg : NULL);
-        nebula_rolecfg_load(home ? cfg : NULL, roster, ROLECFG_MAX, &roster_n);
+        if (home) snprintf(g_roles_path, sizeof(g_roles_path),
+                           "%s/Documents/nebula_roles.txt", home);
+        nebula_rolecfg_emit_default(home ? g_roles_path : NULL);   /* 首次生成默认清单 */
+        nebula_weight_load(home ? g_roles_path : NULL);
         /* ★ 自由模式（星云舰 Solo Free Play）：存在 nebula_freeplay.txt 即开启 */
         if (home) {
             char fp[1024] = {0};
@@ -944,6 +952,7 @@ int nebula_il2cpp_apply_roles(void)
                 nebula_freeplay_emit_sample(fp);   /* 首次生成示例（默认关闭） */
         }
     }
+    roster_n = nebula_weight_expand(roster, 512);
     /* 自由模式：先把房间人数补齐（单人也能开局） */
     freeplay_fill_room(n);
     if (roster_n <= 0) nebula_rolecfg_default(roster, ROLECFG_MAX, &roster_n);

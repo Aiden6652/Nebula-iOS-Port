@@ -16,3 +16,14 @@ __pycache__/
 *.ipa
 tools/uploader/inbox/
 tools/uploader/__pycache__/
+core.*
+*.core
+src/core/testcore
+src/core/testrolecfg
+src/core/testfreeplay
+src/il2cpp/test_bridge
+src/il2cpp/test_mock_il2cpp
+src/addon/test_addon
+src/ui/test_roles_ui
+src/net/test_protocol
+src/net/test_dispatch

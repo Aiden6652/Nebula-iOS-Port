@@ -4,11 +4,11 @@ CC      ?= gcc
 CFLAGS  ?= -std=gnu11 -O2 -Wall -Wextra
 LDLIBS  ?= -ldl -lpthread
 TARGET  := test_bridge
-SRC     := test_bridge.c bridge.c hook.c ../core/roles.c ../core/rolecfg.c ../core/rolemapping.c ../core/freeplay.c ../core/core.c
+SRC     := test_bridge.c bridge.c hook.c ../core/roles.c ../core/rolecfg.c ../core/rolemapping.c ../core/roleweight.c ../core/freeplay.c ../core/core.c
 
 # 模拟 IL2CPP 环境：本地验证"不会把游戏改坏"（尤其速度不累乘），无需真机
 MOCK    := test_mock_il2cpp
-MSRC    := test_mock_il2cpp.c bridge.c ../core/roles.c ../core/rolecfg.c ../core/rolemapping.c ../core/freeplay.c ../core/core.c
+MSRC    := test_mock_il2cpp.c bridge.c ../core/roles.c ../core/rolecfg.c ../core/rolemapping.c ../core/roleweight.c ../core/freeplay.c ../core/core.c
 
 .PHONY: test clean
 

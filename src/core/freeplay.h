@@ -67,6 +67,9 @@ int nebula_freeplay_role(int idx, const int *roster, int n);
    now_sec<=0 时自己取当前时间。返回 1 表示本轮切换了。 */
 int nebula_freeplay_tick(int total, long now_sec);
 
+/* 运行时开关自由模式（面板按钮用），并落到配置文件 */
+void nebula_freeplay_set_enabled(int on, const char *path);
+
 /* 手动切换（悬浮按钮）：立即换下一个职业，并重置自动轮换计时 */
 void nebula_freeplay_next(int total);
 
