@@ -47,65 +47,11 @@ static UILabel *g_cur_label = nil;              /* 顶部：当前编辑的主�
 - (void)onFreeplay:(id)sender;   /* 自由模式开关 */
 - (void)onMinus:(id)sender;      /* 权重 -1 */
 /* 点职业名 = 选中它作为"当前编辑的主职业"，之后的「附」都挂在它下面 */
-- (void)onPickMain:(id)sender
-{
-    @try {
-        int idx = (int)((UIButton *)sender).tag;
-        nebula_ui_set_current_main(idx);
-        [self refreshAll];
-    } @catch (NSException *e) {
-        nebula_log("面板：选中主职业异常 %s", [[e reason] UTF8String]);
-    }
-}
-
-/* 整表刷新：职业名选中态 + 权重 + 「附」状态 + 顶部提示 */
-- (void)refreshAll
-{
-    NSInteger n = g_name_btns ? g_name_btns.count : 0;
-    for (NSInteger i = 0; i < n; i++) {
-        UIButton *nb = g_name_btns[i];
-        BOOL picked = (nebula_ui_current_main() == (int)i);
-        nb.backgroundColor = picked ? [UIColor systemGreenColor] : [UIColor clearColor];
-        [nb setTitleColor:(picked ? [UIColor blackColor] : [UIColor whiteColor])
-                 forState:UIControlStateNormal];
-
-        UILabel *wl = (i < g_weight_labels.count) ? g_weight_labels[i] : nil;
-        int w = nebula_ui_role_weight((int)i);
-        if (wl) {
-            wl.text = [NSString stringWithFormat:@"%d", w];
-            wl.textColor = (w > 0) ? [UIColor systemGreenColor] : [UIColor lightGrayColor];
-        }
-
-        UIButton *sb = (i < g_sub_btns.count) ? g_sub_btns[i] : nil;
-        if (sb) {
-            BOOL on = (nebula_ui_role_is_sub((int)i) != 0);
-            sb.backgroundColor = on ? [UIColor systemGreenColor] : [UIColor clearColor];
-            [sb setTitleColor:(on ? [UIColor blackColor] : [UIColor whiteColor])
-                     forState:UIControlStateNormal];
-        }
-    }
-    char nm[64] = {0};
-    if (g_cur_label) {
-        if (nebula_ui_current_main_name(nm, sizeof(nm)))
-            g_cur_label.text = [NSString stringWithFormat:@"附加给：%s", nm];
-        else
-            g_cur_label.text = @"先点职业名选中主职业，再点「附」";
-    }
-}
-
-- (void)onSub:(id)sender
-{
-    @try {
-        int idx = (int)((UIButton *)sender).tag;
-        nebula_ui_role_toggle_sub(idx);
-        [self refreshAll];
-    } @catch (NSException *e) {
-        nebula_log("面板：附加职业异常 %s", [[e reason] UTF8String]);
-    }
-}
-
 - (void)onPlus:(id)sender;       /* 权重 +1 */
 - (void)refreshRow:(int)idx;
+- (void)onSub:(id)sender;
+- (void)onPickMain:(id)sender;
+- (void)refreshAll;
 @end
 
 @implementation NebulaPanelCtl
@@ -172,6 +118,64 @@ static UILabel *g_cur_label = nil;              /* 顶部：当前编辑的主�
         [self refreshRow:idx];
     } @catch (NSException *e) {
         nebula_log("面板：加权重异常 %s", [[e reason] UTF8String]);
+    }
+}
+
+
+- (void)onPickMain:(id)sender
+{
+    @try {
+        int idx = (int)((UIButton *)sender).tag;
+        nebula_ui_set_current_main(idx);
+        [self refreshAll];
+    } @catch (NSException *e) {
+        nebula_log("面板：选中主职业异常 %s", [[e reason] UTF8String]);
+    }
+}
+
+/* 整表刷新：职业名选中态 + 权重 + 「附」状态 + 顶部提示 */
+- (void)refreshAll
+{
+    NSInteger n = g_name_btns ? g_name_btns.count : 0;
+    for (NSInteger i = 0; i < n; i++) {
+        UIButton *nb = g_name_btns[i];
+        BOOL picked = (nebula_ui_current_main() == (int)i);
+        nb.backgroundColor = picked ? [UIColor systemGreenColor] : [UIColor clearColor];
+        [nb setTitleColor:(picked ? [UIColor blackColor] : [UIColor whiteColor])
+                 forState:UIControlStateNormal];
+
+        UILabel *wl = (i < g_weight_labels.count) ? g_weight_labels[i] : nil;
+        int w = nebula_ui_role_weight((int)i);
+        if (wl) {
+            wl.text = [NSString stringWithFormat:@"%d", w];
+            wl.textColor = (w > 0) ? [UIColor systemGreenColor] : [UIColor lightGrayColor];
+        }
+
+        UIButton *sb = (i < g_sub_btns.count) ? g_sub_btns[i] : nil;
+        if (sb) {
+            BOOL on = (nebula_ui_role_is_sub((int)i) != 0);
+            sb.backgroundColor = on ? [UIColor systemGreenColor] : [UIColor clearColor];
+            [sb setTitleColor:(on ? [UIColor blackColor] : [UIColor whiteColor])
+                     forState:UIControlStateNormal];
+        }
+    }
+    char nm[64] = {0};
+    if (g_cur_label) {
+        if (nebula_ui_current_main_name(nm, sizeof(nm)))
+            g_cur_label.text = [NSString stringWithFormat:@"附加给：%s", nm];
+        else
+            g_cur_label.text = @"先点职业名选中主职业，再点「附」";
+    }
+}
+
+- (void)onSub:(id)sender
+{
+    @try {
+        int idx = (int)((UIButton *)sender).tag;
+        nebula_ui_role_toggle_sub(idx);
+        [self refreshAll];
+    } @catch (NSException *e) {
+        nebula_log("面板：附加职业异常 %s", [[e reason] UTF8String]);
     }
 }
 
