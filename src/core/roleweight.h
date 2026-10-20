@@ -36,6 +36,19 @@ void nebula_weight_bump(int idx, int delta);
 /* 按权重展开成"上场职业序列"（sheriff x2 → 出现两次），返回个数 */
 int  nebula_weight_expand(int *out_ids, int max);
 
+/* —— 附加职业（副职业）——
+   主职业只有一个，但可以同时挂多个附加职业，技能取并集。
+   例如「警长 + 附加赌怪」= 同时拥有警长和赌怪的能力。
+   存在 <Documents>/nebula_subroles.txt，一行一个 key。 */
+int  nebula_subrole_load(const char *path);
+int  nebula_subrole_save(const char *path);
+int  nebula_subrole_is_on(int idx);
+void nebula_subrole_set(int idx, int on);
+void nebula_subrole_toggle(int idx);
+int  nebula_subrole_count(void);
+/* 把当前开启的附加职业 id 填进 out，返回个数 */
+int  nebula_subrole_list(int *out_ids, int max);
+
 /* 全清（一个都不上场）与恢复默认 */
 void nebula_weight_clear(void);
 void nebula_weight_reset_default(void);

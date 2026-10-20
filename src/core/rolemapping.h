@@ -36,6 +36,12 @@
    参数 key 为官方英文 id（如 "sheriff"），可为 NULL（则只按阵营判断）。 */
 int nebula_role_underlying(int role_id, const char *key, int team_is_impostor);
 
+/* 主职业 + 附加职业的【能力并集】映射：
+   例：主=警长(带刀)，附加=赌怪 → 仍是 Impostor；
+       主=船员，附加=工程师(能跳管) → Engineer（拿得到跳管能力）。
+   附加职业的能力是【叠加】上去的，这也是"同时拥有两个职业技能"的底层依据。 */
+int nebula_role_underlying_multi(int main_id, const int *subs, int nsub);
+
 /* 该职业是否带刀（决定能否击杀） */
 int nebula_role_has_knife(int role_id, const char *key, int team_is_impostor);
 

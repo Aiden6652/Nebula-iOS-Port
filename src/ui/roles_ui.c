@@ -16,6 +16,7 @@
 static char g_docs[1024] = {0};
 static char g_roles_path[1024] = {0};
 static char g_fp_path[1024] = {0};
+static char g_sub_path[1024] = {0};
 
 void nebula_ui_init(const char *docs_dir)
 {
@@ -23,8 +24,10 @@ void nebula_ui_init(const char *docs_dir)
     else          g_docs[0] = '\0';
     snprintf(g_roles_path, sizeof(g_roles_path), "%s/nebula_roles.txt", g_docs);
     snprintf(g_fp_path,    sizeof(g_fp_path),    "%s/nebula_freeplay.txt", g_docs);
+    snprintf(g_sub_path,   sizeof(g_sub_path),   "%s/nebula_subroles.txt", g_docs);
 
     nebula_weight_load(g_roles_path);
+    nebula_subrole_load(g_sub_path);
     nebula_freeplay_load(g_fp_path);
 }
 
@@ -43,6 +46,16 @@ void nebula_ui_role_set(int idx, int w)
     nebula_weight_set(idx, w);
     if (g_roles_path[0]) nebula_weight_save(g_roles_path);
 }
+
+int nebula_ui_role_is_sub(int idx) { return nebula_subrole_is_on(idx); }
+
+void nebula_ui_role_toggle_sub(int idx)
+{
+    nebula_subrole_toggle(idx);
+    if (g_sub_path[0]) nebula_subrole_save(g_sub_path);
+}
+
+int nebula_ui_sub_count(void) { return nebula_subrole_count(); }
 
 int nebula_ui_freeplay_on(void) { return nebula_freeplay_enabled(); }
 

@@ -13,6 +13,8 @@
 #include <ctype.h>
 
 #define MAX_ROLES  512          /* 职业表上限（当前 267） */
+static int idx_to_id(int idx);   /* 前置声明：下面的函数会用到 */
+
 static int g_w[MAX_ROLES];
 static int g_count = 0;         /* 职业总数 */
 static int g_loaded = 0;
@@ -45,6 +47,92 @@ void nebula_weight_reset_default(void)
         if (id >= 0 && id < MAX_ROLES) g_w[id] = 1;
     }
     g_loaded = 1;
+}
+
+/* ---------------- 附加职业（副职业） ---------------- */
+static int g_sub[MAX_ROLES];
+
+static void sub_ensure(void) { ensure_count(); }
+
+int nebula_subrole_load(const char *path)
+{
+    sub_ensure();
+    memset(g_sub, 0, sizeof(g_sub));
+    FILE *f = path ? fopen(path, "r") : NULL;
+    if (!f) return 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        trim(line);
+        if (line[0] == '\0' || line[0] == '#') continue;
+        int id = nebula_role_id_by_key(line);
+        if (id >= 0 && id < MAX_ROLES) g_sub[id] = 1;
+    }
+    fclose(f);
+    int n = 0;
+    for (int i = 0; i < g_count; i++) {
+        int id = nebula_role_id_at(i);
+        if (id >= 0 && id < MAX_ROLES && g_sub[id]) n++;
+    }
+    nebula_log("subrole: 载入 %d 个附加职业", n);
+    return n;
+}
+
+int nebula_subrole_save(const char *path)
+{
+    if (!path) return -1;
+    sub_ensure();
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "# 附加职业：挂上去后【技能叠加在主职业之上】\n");
+    fprintf(f, "# 例：主职业写 sheriff，这里写 gambler → 你同时拥有警长和赌怪的能力\n\n");
+    for (int i = 0; i < g_count; i++) {
+        int id = nebula_role_id_at(i);
+        if (id < 0 || id >= MAX_ROLES || !g_sub[id]) continue;
+        const char *k = nebula_role_key(id);
+        if (k && k[0]) fprintf(f, "%s\n", k);
+    }
+    fclose(f);
+    return 0;
+}
+
+int nebula_subrole_count(void)
+{
+    sub_ensure();
+    int n = 0;
+    for (int i = 0; i < g_count; i++) {
+        int id = nebula_role_id_at(i);
+        if (id >= 0 && id < MAX_ROLES && g_sub[id]) n++;
+    }
+    return n;
+}
+
+int nebula_subrole_list(int *out_ids, int max)
+{
+    sub_ensure();
+    int n = 0;
+    for (int i = 0; i < g_count && n < max; i++) {
+        int id = nebula_role_id_at(i);
+        if (id >= 0 && id < MAX_ROLES && g_sub[id]) out_ids[n++] = id;
+    }
+    return n;
+}
+
+int nebula_subrole_is_on(int idx)
+{
+    int id = idx_to_id(idx);
+    return (id >= 0 && id < MAX_ROLES) ? g_sub[id] : 0;
+}
+
+void nebula_subrole_set(int idx, int on)
+{
+    int id = idx_to_id(idx);
+    if (id >= 0 && id < MAX_ROLES) g_sub[id] = on ? 1 : 0;
+}
+
+void nebula_subrole_toggle(int idx)
+{
+    int id = idx_to_id(idx);
+    if (id >= 0 && id < MAX_ROLES) g_sub[id] = g_sub[id] ? 0 : 1;
 }
 
 void nebula_weight_clear(void)

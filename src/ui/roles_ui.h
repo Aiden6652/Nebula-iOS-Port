@@ -23,6 +23,11 @@ int         nebula_ui_role_weight(int idx);
 void nebula_ui_role_bump(int idx, int delta);
 void nebula_ui_role_set(int idx, int w);
 
+/* —— 附加职业（副职业）：勾上后技能叠加到主职业之上 —— */
+int  nebula_ui_role_is_sub(int idx);
+void nebula_ui_role_toggle_sub(int idx);
+int  nebula_ui_sub_count(void);
+
 /* —— 自由模式开关（面板顶部的开关按钮） —— */
 int  nebula_ui_freeplay_on(void);
 void nebula_ui_set_freeplay(int on);

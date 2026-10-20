@@ -43,6 +43,22 @@ static NSMutableArray *g_weight_labels = nil;   /* 每行的权重 Label，点 +
 - (void)onNextRole:(id)sender;   /* 换职业 */
 - (void)onFreeplay:(id)sender;   /* 自由模式开关 */
 - (void)onMinus:(id)sender;      /* 权重 -1 */
+- (void)onSub:(id)sender
+{
+    @try {
+        int idx = (int)((UIButton *)sender).tag;
+        nebula_ui_role_toggle_sub(idx);
+        /* 自己刷新这一行的「附」按钮配色 */
+        BOOL on = (nebula_ui_role_is_sub(idx) != 0);
+        ((UIButton *)sender).backgroundColor =
+            on ? [UIColor systemGreenColor] : [UIColor clearColor];
+        [(UIButton *)sender setTitleColor:(on ? [UIColor blackColor] : [UIColor whiteColor])
+                                 forState:UIControlStateNormal];
+    } @catch (NSException *e) {
+        nebula_log("面板：附加职业异常 %s", [[e reason] UTF8String]);
+    }
+}
+
 - (void)onPlus:(id)sender;       /* 权重 +1 */
 - (void)refreshRow:(int)idx;
 @end
@@ -202,7 +218,7 @@ static NSString *docs_dir(void)
 static void build_panel(UIWindow *win)
 {
     CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
-    CGFloat pw = 340.0, px = W - pw - 8.0, py = 90.0, ph = H - py - 40.0;
+    CGFloat pw = 380.0, px = W - pw - 8.0, py = 90.0, ph = H - py - 40.0;
 
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(px, py, pw, ph)];
     panel.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.92];
@@ -220,7 +236,8 @@ static void build_panel(UIWindow *win)
     bar.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, 220, 22)];
-    title.text = [NSString stringWithFormat:@"职业设置（%d 个）", nebula_ui_role_count()];
+    title.text = [NSString stringWithFormat:@"职业设置（%d 个）  +/-上场 附=叠加",
+                  nebula_ui_role_count()];
     title.textColor = [UIColor whiteColor];
     title.font = [UIFont boldSystemFontOfSize:14];
     [bar addSubview:title];
@@ -266,13 +283,13 @@ static void build_panel(UIWindow *win)
         UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, rowH * i, pw, rowH)];
         const char *nm = nebula_ui_role_name(i);
 
-        UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(12, 4, 150, 32)];
+        UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(10, 4, 128, 32)];
         lb.text = [NSString stringWithUTF8String:(nm ? nm : "")];
         lb.textColor = [UIColor whiteColor];
         lb.font = [UIFont systemFontOfSize:14];
         [row addSubview:lb];
 
-        UILabel *wlb = [[UILabel alloc] initWithFrame:CGRectMake(168, 4, 34, 32)];
+        UILabel *wlb = [[UILabel alloc] initWithFrame:CGRectMake(140, 4, 30, 32)];
         int w = nebula_ui_role_weight(i);
         wlb.text = [NSString stringWithFormat:@"%d", w];
         wlb.textAlignment = NSTextAlignmentCenter;
@@ -282,7 +299,7 @@ static void build_panel(UIWindow *win)
         [g_weight_labels addObject:wlb];
 
         UIButton *minus = [UIButton buttonWithType:UIButtonTypeSystem];
-        minus.frame = CGRectMake(210, 4, 44, 32);
+        minus.frame = CGRectMake(174, 4, 38, 32);
         [minus setTitle:@"-" forState:UIControlStateNormal];
         minus.tag = i;
         minus.layer.borderWidth = 1;
@@ -291,13 +308,32 @@ static void build_panel(UIWindow *win)
         [row addSubview:minus];
 
         UIButton *plus = [UIButton buttonWithType:UIButtonTypeSystem];
-        plus.frame = CGRectMake(262, 4, 44, 32);
+        plus.frame = CGRectMake(216, 4, 38, 32);
         [plus setTitle:@"+" forState:UIControlStateNormal];
         plus.tag = i;
         plus.layer.borderWidth = 1;
         plus.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.3].CGColor;
         [plus addTarget:ctl action:@selector(onPlus:) forControlEvents:UIControlEventTouchUpInside];
         [row addSubview:plus];
+
+        /* 「附」：勾上 = 这个职业附加到主职业之上，技能叠加
+           （例：主职业警长 + 附加赌怪 → 同时有两种能力） */
+        UIButton *sub = [UIButton buttonWithType:UIButtonTypeSystem];
+        sub.frame = CGRectMake(262, 4, 46, 32);
+        [sub setTitle:@"附" forState:UIControlStateNormal];
+        sub.tag = i;
+        sub.layer.borderWidth = 1;
+        sub.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.3].CGColor;
+        sub.layer.cornerRadius = 5;
+        if (nebula_ui_role_is_sub(i)) {
+            sub.backgroundColor = [UIColor systemGreenColor];
+            [sub setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+        } else {
+            sub.backgroundColor = [UIColor clearColor];
+            [sub setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        }
+        [sub addTarget:ctl action:@selector(onSub:) forControlEvents:UIControlEventTouchUpInside];
+        [row addSubview:sub];
 
         [list addSubview:row];
     }

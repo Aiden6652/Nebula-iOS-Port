@@ -1016,8 +1016,8 @@ int nebula_il2cpp_apply_roles(void)
     /* ★ 上场职业来自【权重表】（267 个职业，由游戏内「职业」面板调整）。
        每轮重新展开：面板里点了 +/- 之后 1 秒内就生效，不用重启游戏。 */
     static int roster[512]; static int roster_n = 0; static int cfg_done = 0;
-    static char g_roles_path[1024] = {0}, g_fp_path[1024] = {0};
-    static time_t g_roles_mtime = 0, g_fp_mtime = 0;
+    static char g_roles_path[1024] = {0}, g_fp_path[1024] = {0}, g_sub_path[1024] = {0};
+    static time_t g_roles_mtime = 0, g_fp_mtime = 0, g_sub_mtime = 0;
     if (!cfg_done) {
         cfg_done = 1;
         const char *home = getenv("HOME");
@@ -1026,6 +1026,9 @@ int nebula_il2cpp_apply_roles(void)
         nebula_rolecfg_emit_default(home ? g_roles_path : NULL);   /* 首次生成默认清单 */
         nebula_weight_load(home ? g_roles_path : NULL);
         g_roles_mtime = nebula_file_mtime(g_roles_path);
+        snprintf(g_sub_path, sizeof(g_sub_path), "%s/Documents/nebula_subroles.txt", home);
+        nebula_subrole_load(g_sub_path);
+        g_sub_mtime = nebula_file_mtime(g_sub_path);
         /* ★ 自由模式（星云舰 Solo Free Play）：存在 nebula_freeplay.txt 即开启 */
         if (home) {
             char fp[1024] = {0};
@@ -1038,6 +1041,7 @@ int nebula_il2cpp_apply_roles(void)
     }
     reload_if_changed(g_roles_path, &g_roles_mtime, nebula_weight_load, "roleweight");
     reload_if_changed(g_fp_path,    &g_fp_mtime,    nebula_freeplay_load, "freeplay");
+    reload_if_changed(g_sub_path,   &g_sub_mtime,   nebula_subrole_load,  "subrole");
     roster_n = nebula_weight_expand(roster, 512);
     /* 自由模式：先把房间人数补齐（单人也能开局） */
     freeplay_fill_room(n);
@@ -1123,6 +1127,10 @@ int nebula_il2cpp_apply_roles(void)
         nebula_log("freeplay: 切换试用职业 -> %s", rn ? rn : "?");
     }
 
+    /* 本局挂着的附加职业（技能叠加用） */
+    static int subs[64];
+    int nsub = nebula_subrole_list(subs, 64);
+
     int applied = 0;
     for (int i = 0; i < n; i++) {
         /* 自由模式下：0 号（自己）拿固定/轮换的职业，其余按清单排 */
@@ -1154,8 +1162,8 @@ int nebula_il2cpp_apply_roles(void)
         if (info_off >= 0 && rt_off >= 0) {
             void *info = *(void **)((char *)insts[i] + info_off);
             if (info) {
-                int underlying = nebula_role_underlying(
-                        rid, nebula_role_key(rid), team == TEAM_IMPOSTOR);
+                /* 附加职业的能力【叠加】进来（警长+赌怪 = 同时有两者的能力） */
+                int underlying = nebula_role_underlying_multi(rid, subs, nsub);
                 int cur_rt = -1;
                 if (nebula_il2cpp_get_int_by(info, rt_off, &cur_rt) != 0 || cur_rt != underlying) {
                     if (nebula_il2cpp_set_int_by(info, rt_off, underlying) == 0) {
@@ -1191,11 +1199,23 @@ int nebula_il2cpp_apply_roles(void)
                既避免反复分配字符串（防 OOM），又保证自由模式轮换职业后名字会更新。 */
             {
                 /* 自由模式轮换时把进度写进名字：一眼看出试到第几个 */
-                char prog[32] = {0}, label[64];
-                if (i == 0 && nebula_freeplay_progress(prog, sizeof(prog)))
-                    snprintf(label, sizeof(label), "%s %s", prog, rname ? rname : "?");
-                else
+                char prog[32] = {0}, label[160];
+                /* 附加职业接在后面：警长+赌怪 —— 一眼看出这局有哪些能力 */
+                {
                     snprintf(label, sizeof(label), "%s", rname ? rname : "?");
+                    for (int k = 0; k < nsub && k < 3; k++) {
+                        const char *sn2 = nebula_role_name(subs[k]);
+                        if (sn2 && sn2[0]) {
+                            size_t used = strlen(label);
+                            snprintf(label + used, sizeof(label) - used, "+%s", sn2);
+                        }
+                    }
+                }
+                if (i == 0 && nebula_freeplay_progress(prog, sizeof(prog))) {
+                    char withprog[192];
+                    snprintf(withprog, sizeof(withprog), "%s %s", prog, label);
+                    snprintf(label, sizeof(label), "%s", withprog);
+                }
 
                 char want[192];
                 if (nebula_flag_file("nebula_plain_name.txt")) {

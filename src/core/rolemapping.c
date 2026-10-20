@@ -6,6 +6,7 @@
  */
 
 #include "rolemapping.h"
+#include "roles.h"
 #include <string.h>
 
 /* 带刀职业（船员/中立里能杀人的）—— 底层必须伪装成 Impostor
@@ -59,6 +60,33 @@ static int eq(const char *a, const char *b) {
         if (ca != cb) return 0;
     }
     return *a == 0 && *b == 0;
+}
+
+/* 主职业 + 附加职业 → 能力【并集】后的底层 RoleTypes */
+int nebula_role_underlying_multi(int main_id, const int *subs, int nsub)
+{
+    const char *mk = nebula_role_key(main_id);
+    int team_imp = (nebula_role_team(main_id) == TEAM_IMPOSTOR);
+    int base = nebula_role_underlying(main_id, mk, team_imp);
+
+    int knife = nebula_role_has_knife(main_id, mk, team_imp);
+    int best_special = -1;
+
+    for (int i = 0; i < nsub; i++) {
+        int id = subs[i];
+        const char *k = nebula_role_key(id);
+        int imp = (nebula_role_team(id) == TEAM_IMPOSTOR);
+        if (nebula_role_has_knife(id, k, imp)) knife = 1;
+        /* 附加职业对应的原版能力也能用上 */
+        for (int j = 0; SPECIAL[j].key; j++) {
+            if (k && eq(k, SPECIAL[j].key)) best_special = SPECIAL[j].rt;
+        }
+    }
+
+    /* 带刀优先（决定了有没有击杀按钮） */
+    if (knife) return RT_IMPOSTOR;
+    if (best_special >= 0) return best_special;
+    return base;
 }
 
 int nebula_role_has_knife(int role_id, const char *key, int team_is_impostor)

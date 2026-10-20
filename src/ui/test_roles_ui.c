@@ -98,6 +98,21 @@ int main(void) {
     CHECK(nebula_ui_freeplay_on() == 1, "再开 → 立即生效");
     CHECK(!file_has(FP, "off"), "开启时配置里没有 off 行");
 
+    /* ⑦b 附加职业（副职业）：勾上后技能叠加，且落盘 */
+    {
+        char SP[512]; snprintf(SP, sizeof(SP), "%s/nebula_subroles.txt", D);
+        wr(SP, "");
+        nebula_ui_init(D);
+        CHECK(nebula_ui_sub_count() == 0, "默认没有附加职业");
+        CHECK(nebula_ui_role_is_sub(jackal) == 0, "豺狼默认不是附加职业");
+        nebula_ui_role_toggle_sub(jackal);
+        CHECK(nebula_ui_role_is_sub(jackal) == 1, "点「附」勾上豺狼");
+        CHECK(file_has(SP, "jackal"), "附加职业立即写入配置");
+        nebula_ui_role_toggle_sub(jackal);
+        CHECK(nebula_ui_role_is_sub(jackal) == 0, "再点一次取消");
+        CHECK(!file_has(SP, "jackal"), "取消后配置里也没了");
+    }
+
     /* ⑧ 换职业按钮 */
     nebula_ui_next_role();
     CHECK(1, "换职业按钮调用不崩");
