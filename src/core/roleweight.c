@@ -49,47 +49,79 @@ void nebula_weight_reset_default(void)
     g_loaded = 1;
 }
 
-/* ---------------- 附加职业（副职业） ---------------- */
-static int g_sub[MAX_ROLES];
+/* ---------------- 附加职业（副职业） ----------------
+   附加职业【挂在主职业下面】：g_sub[主职业id][槽位] = 附加职业id（-1 = 空）。
+   这样"主=警长 + 附=赌怪"只有拿到警长的人才带赌怪的能力，不是全局附加。 */
+static int g_sub[MAX_ROLES][SUB_MAX_PER_ROLE];
 
-static void sub_ensure(void) { ensure_count(); }
+static void sub_clear_all(void)
+{
+    for (int i = 0; i < MAX_ROLES; i++)
+        for (int k = 0; k < SUB_MAX_PER_ROLE; k++) g_sub[i][k] = -1;
+}
 
 int nebula_subrole_load(const char *path)
 {
-    sub_ensure();
-    memset(g_sub, 0, sizeof(g_sub));
+    ensure_count();
+    sub_clear_all();
     FILE *f = path ? fopen(path, "r") : NULL;
     if (!f) return 0;
-    char line[256];
+
+    char line[512];
+    int groups = 0;
     while (fgets(line, sizeof(line), f)) {
         trim(line);
         if (line[0] == '\0' || line[0] == '#') continue;
-        int id = nebula_role_id_by_key(line);
-        if (id >= 0 && id < MAX_ROLES) g_sub[id] = 1;
+        char *colon = strchr(line, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        trim(line);
+        int mid = nebula_role_id_by_key(line);
+        if (mid < 0 || mid >= MAX_ROLES) continue;
+
+        char *p = colon + 1;
+        int slot = 0;
+        while (*p && slot < SUB_MAX_PER_ROLE) {
+            char *comma = strchr(p, ',');
+            if (comma) *comma = '\0';
+            trim(p);
+            if (*p) {
+                int sid = nebula_role_id_by_key(p);
+                if (sid >= 0 && sid < MAX_ROLES && sid != mid) g_sub[mid][slot++] = sid;
+            }
+            if (!comma) break;
+            p = comma + 1;
+        }
+        groups++;
     }
     fclose(f);
-    int n = 0;
-    for (int i = 0; i < g_count; i++) {
-        int id = nebula_role_id_at(i);
-        if (id >= 0 && id < MAX_ROLES && g_sub[id]) n++;
-    }
-    nebula_log("subrole: 载入 %d 个附加职业", n);
-    return n;
+    nebula_log("subrole: 载入 %d 组附加职业", groups);
+    return groups;
 }
 
 int nebula_subrole_save(const char *path)
 {
     if (!path) return -1;
-    sub_ensure();
+    ensure_count();
     FILE *f = fopen(path, "w");
     if (!f) return -1;
-    fprintf(f, "# 附加职业：挂上去后【技能叠加在主职业之上】\n");
-    fprintf(f, "# 例：主职业写 sheriff，这里写 gambler → 你同时拥有警长和赌怪的能力\n\n");
-    for (int i = 0; i < g_count; i++) {
-        int id = nebula_role_id_at(i);
-        if (id < 0 || id >= MAX_ROLES || !g_sub[id]) continue;
-        const char *k = nebula_role_key(id);
-        if (k && k[0]) fprintf(f, "%s\n", k);
+    fprintf(f, "# 附加职业：挂在主职业下面，技能叠加（例：主=警长 附=赌怪）\n");
+    fprintf(f, "# 格式：  主职业key: 附加key1, 附加key2\n");
+    fprintf(f, "# 每个主职业最多 %d 个附加\n\n", SUB_MAX_PER_ROLE);
+    for (int mid = 0; mid < MAX_ROLES; mid++) {
+        int any = 0;
+        for (int k = 0; k < SUB_MAX_PER_ROLE; k++) if (g_sub[mid][k] >= 0) { any = 1; break; }
+        if (!any) continue;
+        const char *mk = nebula_role_key(mid);
+        if (!mk || !mk[0]) continue;
+        fprintf(f, "%s:", mk);
+        for (int k = 0; k < SUB_MAX_PER_ROLE; k++) {
+            int sid = g_sub[mid][k];
+            if (sid < 0) continue;
+            const char *sk = nebula_role_key(sid);
+            if (sk && sk[0]) fprintf(f, "%s%s", (k ? "," : ""), sk);
+        }
+        fprintf(f, "\n");
     }
     fclose(f);
     return 0;
@@ -97,42 +129,49 @@ int nebula_subrole_save(const char *path)
 
 int nebula_subrole_count(void)
 {
-    sub_ensure();
+    ensure_count();
     int n = 0;
-    for (int i = 0; i < g_count; i++) {
-        int id = nebula_role_id_at(i);
-        if (id >= 0 && id < MAX_ROLES && g_sub[id]) n++;
+    for (int mid = 0; mid < MAX_ROLES; mid++)
+        for (int k = 0; k < SUB_MAX_PER_ROLE; k++) if (g_sub[mid][k] >= 0) { n++; break; }
+    return n;
+}
+
+int nebula_subrole_list_for(int main_role_id, int *out_ids, int max)
+{
+    if (!out_ids || max <= 0) return 0;
+    if (main_role_id < 0 || main_role_id >= MAX_ROLES) return 0;
+    int n = 0;
+    for (int k = 0; k < SUB_MAX_PER_ROLE && n < max; k++) {
+        int sid = g_sub[main_role_id][k];
+        if (sid >= 0) out_ids[n++] = sid;
     }
     return n;
 }
 
-int nebula_subrole_list(int *out_ids, int max)
+int nebula_subrole_is_on(int main_idx, int sub_idx)
 {
-    sub_ensure();
-    int n = 0;
-    for (int i = 0; i < g_count && n < max; i++) {
-        int id = nebula_role_id_at(i);
-        if (id >= 0 && id < MAX_ROLES && g_sub[id]) out_ids[n++] = id;
+    int mid = idx_to_id(main_idx), sid = idx_to_id(sub_idx);
+    if (mid < 0 || mid >= MAX_ROLES || sid < 0) return 0;
+    for (int k = 0; k < SUB_MAX_PER_ROLE; k++) if (g_sub[mid][k] == sid) return 1;
+    return 0;
+}
+
+void nebula_subrole_toggle(int main_idx, int sub_idx)
+{
+    int mid = idx_to_id(main_idx), sid = idx_to_id(sub_idx);
+    if (mid < 0 || mid >= MAX_ROLES || sid < 0 || sid >= MAX_ROLES || mid == sid) return;
+
+    for (int k = 0; k < SUB_MAX_PER_ROLE; k++) {
+        if (g_sub[mid][k] == sid) {          /* 已挂 → 移除（后面的前移） */
+            for (int j = k; j + 1 < SUB_MAX_PER_ROLE; j++) g_sub[mid][j] = g_sub[mid][j + 1];
+            g_sub[mid][SUB_MAX_PER_ROLE - 1] = -1;
+            return;
+        }
     }
-    return n;
-}
-
-int nebula_subrole_is_on(int idx)
-{
-    int id = idx_to_id(idx);
-    return (id >= 0 && id < MAX_ROLES) ? g_sub[id] : 0;
-}
-
-void nebula_subrole_set(int idx, int on)
-{
-    int id = idx_to_id(idx);
-    if (id >= 0 && id < MAX_ROLES) g_sub[id] = on ? 1 : 0;
-}
-
-void nebula_subrole_toggle(int idx)
-{
-    int id = idx_to_id(idx);
-    if (id >= 0 && id < MAX_ROLES) g_sub[id] = g_sub[id] ? 0 : 1;
+    for (int k = 0; k < SUB_MAX_PER_ROLE; k++) {   /* 未挂 → 加到空位 */
+        if (g_sub[mid][k] < 0) { g_sub[mid][k] = sid; return; }
+    }
+    /* 满了：不再加（防越界） */
 }
 
 void nebula_weight_clear(void)

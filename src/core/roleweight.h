@@ -37,17 +37,27 @@ void nebula_weight_bump(int idx, int delta);
 int  nebula_weight_expand(int *out_ids, int max);
 
 /* —— 附加职业（副职业）——
-   主职业只有一个，但可以同时挂多个附加职业，技能取并集。
-   例如「警长 + 附加赌怪」= 同时拥有警长和赌怪的能力。
-   存在 <Documents>/nebula_subroles.txt，一行一个 key。 */
+   附加职业【挂在主职业下面】：主职业=警长时勾选赌怪，
+   那么只有拿到警长的人才会附带赌怪的能力（不是全局附加）。
+   例：「主=警长 + 附=赌怪」→ 这局同时拥有警长和赌怪的能力。
+
+   存储 <Documents>/nebula_subroles.txt，格式：
+       sheriff: gambler, ninja      # 主职业: 附加列表
+   每个主职业最多挂 SUB_MAX_PER_ROLE 个。 */
+#define SUB_MAX_PER_ROLE 6
+
 int  nebula_subrole_load(const char *path);
 int  nebula_subrole_save(const char *path);
-int  nebula_subrole_is_on(int idx);
-void nebula_subrole_set(int idx, int on);
-void nebula_subrole_toggle(int idx);
+
+/* main_idx / sub_idx 都是【面板行号】；on=是否挂在 main 下面 */
+int  nebula_subrole_is_on(int main_idx, int sub_idx);
+void nebula_subrole_toggle(int main_idx, int sub_idx);
+
+/* 取某个【主职业 id】挂着的附加职业 id 列表，返回个数 */
+int  nebula_subrole_list_for(int main_role_id, int *out_ids, int max);
+
+/* 统计：一共配了多少组附加 */
 int  nebula_subrole_count(void);
-/* 把当前开启的附加职业 id 填进 out，返回个数 */
-int  nebula_subrole_list(int *out_ids, int max);
 
 /* 全清（一个都不上场）与恢复默认 */
 void nebula_weight_clear(void);

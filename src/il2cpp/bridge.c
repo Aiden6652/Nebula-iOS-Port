@@ -1154,10 +1154,6 @@ int nebula_il2cpp_apply_roles(void)
         nebula_log("freeplay: 切换试用职业 -> %s", rn ? rn : "?");
     }
 
-    /* 本局挂着的附加职业（技能叠加用） */
-    static int subs[64];
-    int nsub = nebula_subrole_list(subs, 64);
-
     int applied = 0;
     for (int i = 0; i < n; i++) {
         /* 自由模式下：0 号（自己）拿固定/轮换的职业，其余按清单排 */
@@ -1165,6 +1161,9 @@ int nebula_il2cpp_apply_roles(void)
         if (rid < 0) continue;
         const char *rname = nebula_role_name(rid);
         nebula_team_t team = nebula_role_team(rid);
+        /* 该玩家主职业下面挂着的附加职业（技能叠加） */
+        int subs[SUB_MAX_PER_ROLE + 2];
+        int nsub = nebula_subrole_list_for(rid, subs, SUB_MAX_PER_ROLE);
         nebula_core_register_player((uint32_t)(i + 1), team);
 
         /* 速度：用【基准值 × 系数】写入，绝不读当前值再乘（那会指数爆炸） */

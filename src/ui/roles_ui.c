@@ -47,11 +47,36 @@ void nebula_ui_role_set(int idx, int w)
     if (g_roles_path[0]) nebula_weight_save(g_roles_path);
 }
 
-int nebula_ui_role_is_sub(int idx) { return nebula_subrole_is_on(idx); }
+/* 面板里"当前正在编辑的主职业"：附加职业都挂在它下面 */
+static int g_cur_main = -1;
+
+int nebula_ui_current_main(void) { return g_cur_main; }
+
+void nebula_ui_set_current_main(int idx)
+{
+    if (idx < 0 || idx >= nebula_weight_count()) return;
+    g_cur_main = idx;
+}
+
+int nebula_ui_current_main_name(char *out, size_t osz)
+{
+    if (!out || osz == 0 || g_cur_main < 0) return 0;
+    const char *nm = nebula_weight_name(g_cur_main);
+    if (!nm) return 0;
+    snprintf(out, osz, "%s", nm);
+    return 1;
+}
+
+int nebula_ui_role_is_sub(int idx)
+{
+    if (g_cur_main < 0) return 0;
+    return nebula_subrole_is_on(g_cur_main, idx);
+}
 
 void nebula_ui_role_toggle_sub(int idx)
 {
-    nebula_subrole_toggle(idx);
+    if (g_cur_main < 0) return;            /* 还没选主职业就不动 */
+    nebula_subrole_toggle(g_cur_main, idx);
     if (g_sub_path[0]) nebula_subrole_save(g_sub_path);
 }
 

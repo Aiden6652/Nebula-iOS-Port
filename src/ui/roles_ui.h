@@ -23,7 +23,10 @@ int         nebula_ui_role_weight(int idx);
 void nebula_ui_role_bump(int idx, int delta);
 void nebula_ui_role_set(int idx, int w);
 
-/* —— 附加职业（副职业）：勾上后技能叠加到主职业之上 —— */
+/* —— 附加职业（副职业）：挂在【当前选中的主职业】之下，技能叠加 —— */
+int  nebula_ui_current_main(void);
+void nebula_ui_set_current_main(int idx);
+int  nebula_ui_current_main_name(char *out, size_t osz);
 int  nebula_ui_role_is_sub(int idx);
 void nebula_ui_role_toggle_sub(int idx);
 int  nebula_ui_sub_count(void);

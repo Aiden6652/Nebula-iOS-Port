@@ -36,24 +36,69 @@ int nebula_ui_switch_requested(void)
 
 static UIView         *g_panel = nil;
 static UIScrollView   *g_list  = nil;
-static NSMutableArray *g_weight_labels = nil;   /* 每行的权重 Label，点 +/- 后刷新 */
+static NSMutableArray *g_weight_labels = nil;   /* 每行的权重 Label */
+static NSMutableArray *g_name_btns = nil;       /* 每行的"职业名"按钮（点它选中主职业） */
+static NSMutableArray *g_sub_btns = nil;       /* 每行的"附"按钮 */
+static UILabel *g_cur_label = nil;              /* 顶部：当前编辑的主职业 */
 
 @interface NebulaPanelCtl : NSObject
 - (void)onToggle:(id)sender;     /* 悬浮按钮：打开/收起面板 */
 - (void)onNextRole:(id)sender;   /* 换职业 */
 - (void)onFreeplay:(id)sender;   /* 自由模式开关 */
 - (void)onMinus:(id)sender;      /* 权重 -1 */
+/* 点职业名 = 选中它作为"当前编辑的主职业"，之后的「附」都挂在它下面 */
+- (void)onPickMain:(id)sender
+{
+    @try {
+        int idx = (int)((UIButton *)sender).tag;
+        nebula_ui_set_current_main(idx);
+        [self refreshAll];
+    } @catch (NSException *e) {
+        nebula_log("面板：选中主职业异常 %s", [[e reason] UTF8String]);
+    }
+}
+
+/* 整表刷新：职业名选中态 + 权重 + 「附」状态 + 顶部提示 */
+- (void)refreshAll
+{
+    NSInteger n = g_name_btns ? g_name_btns.count : 0;
+    for (NSInteger i = 0; i < n; i++) {
+        UIButton *nb = g_name_btns[i];
+        BOOL picked = (nebula_ui_current_main() == (int)i);
+        nb.backgroundColor = picked ? [UIColor systemGreenColor] : [UIColor clearColor];
+        [nb setTitleColor:(picked ? [UIColor blackColor] : [UIColor whiteColor])
+                 forState:UIControlStateNormal];
+
+        UILabel *wl = (i < g_weight_labels.count) ? g_weight_labels[i] : nil;
+        int w = nebula_ui_role_weight((int)i);
+        if (wl) {
+            wl.text = [NSString stringWithFormat:@"%d", w];
+            wl.textColor = (w > 0) ? [UIColor systemGreenColor] : [UIColor lightGrayColor];
+        }
+
+        UIButton *sb = (i < g_sub_btns.count) ? g_sub_btns[i] : nil;
+        if (sb) {
+            BOOL on = (nebula_ui_role_is_sub((int)i) != 0);
+            sb.backgroundColor = on ? [UIColor systemGreenColor] : [UIColor clearColor];
+            [sb setTitleColor:(on ? [UIColor blackColor] : [UIColor whiteColor])
+                     forState:UIControlStateNormal];
+        }
+    }
+    char nm[64] = {0};
+    if (g_cur_label) {
+        if (nebula_ui_current_main_name(nm, sizeof(nm)))
+            g_cur_label.text = [NSString stringWithFormat:@"附加给：%s", nm];
+        else
+            g_cur_label.text = @"先点职业名选中主职业，再点「附」";
+    }
+}
+
 - (void)onSub:(id)sender
 {
     @try {
         int idx = (int)((UIButton *)sender).tag;
         nebula_ui_role_toggle_sub(idx);
-        /* 自己刷新这一行的「附」按钮配色 */
-        BOOL on = (nebula_ui_role_is_sub(idx) != 0);
-        ((UIButton *)sender).backgroundColor =
-            on ? [UIColor systemGreenColor] : [UIColor clearColor];
-        [(UIButton *)sender setTitleColor:(on ? [UIColor blackColor] : [UIColor whiteColor])
-                                 forState:UIControlStateNormal];
+        [self refreshAll];
     } @catch (NSException *e) {
         nebula_log("面板：附加职业异常 %s", [[e reason] UTF8String]);
     }
@@ -81,10 +126,7 @@ static NSMutableArray *g_weight_labels = nil;   /* 每行的权重 Label，点 +
     @try {
         if (!g_panel) return;
         BOOL show = g_panel.hidden;
-        if (show && g_weight_labels) {
-            /* 每次打开按当前权重刷新（可能刚被其它逻辑改过） */
-            for (NSInteger i = 0; i < g_weight_labels.count; i++) [self refreshRow:(int)i];
-        }
+        if (show) [self refreshAll];      /* 每次打开刷新（可能刚被改过） */
         g_panel.hidden = !show;
     } @catch (NSException *e) {
         nebula_log("面板：切换异常 %s", [[e reason] UTF8String]);
@@ -268,6 +310,12 @@ static void build_panel(UIWindow *win)
     [closeBtn addTarget:ctl action:@selector(onToggle:) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:closeBtn];
 
+    g_cur_label = [[UILabel alloc] initWithFrame:CGRectMake(12, 66, pw - 24, 24)];
+    g_cur_label.text = @"先点职业名选中主职业，再点「附」";
+    g_cur_label.textColor = [UIColor yellowColor];
+    g_cur_label.font = [UIFont systemFontOfSize:12];
+    [bar addSubview:g_cur_label];
+
     [panel addSubview:bar];
 
     /* ---- 267 行可滚动列表 ---- */
@@ -278,16 +326,25 @@ static void build_panel(UIWindow *win)
     /* ★ 必须 alloc（自己持有）：用 [NSMutableArray arrayWithCapacity:] 得到的是
        autorelease 对象，自动释放池一排空就变野指针 —— 点按钮时必崩。 */
     g_weight_labels = [[NSMutableArray alloc] initWithCapacity:n];
+    g_name_btns     = [[NSMutableArray alloc] initWithCapacity:n];
+    g_sub_btns      = [[NSMutableArray alloc] initWithCapacity:n];
 
     for (int i = 0; i < n; i++) {
         UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, rowH * i, pw, rowH)];
         const char *nm = nebula_ui_role_name(i);
 
-        UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(10, 4, 128, 32)];
-        lb.text = [NSString stringWithUTF8String:(nm ? nm : "")];
-        lb.textColor = [UIColor whiteColor];
-        lb.font = [UIFont systemFontOfSize:14];
+        /* 职业名做成按钮：点它 = 选中为"当前主职业" */
+        UIButton *lb = [UIButton buttonWithType:UIButtonTypeSystem];
+        lb.frame = CGRectMake(8, 4, 130, 32);
+        [lb setTitle:[NSString stringWithUTF8String:(nm ? nm : "")]
+            forState:UIControlStateNormal];
+        lb.titleLabel.font = [UIFont systemFontOfSize:14];
+        lb.tag = i;
+        lb.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        [lb setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [lb addTarget:ctl action:@selector(onPickMain:) forControlEvents:UIControlEventTouchUpInside];
         [row addSubview:lb];
+        [g_name_btns addObject:lb];
 
         UILabel *wlb = [[UILabel alloc] initWithFrame:CGRectMake(140, 4, 30, 32)];
         int w = nebula_ui_role_weight(i);
@@ -334,11 +391,13 @@ static void build_panel(UIWindow *win)
         }
         [sub addTarget:ctl action:@selector(onSub:) forControlEvents:UIControlEventTouchUpInside];
         [row addSubview:sub];
+        [g_sub_btns addObject:sub];
 
         [list addSubview:row];
     }
     [panel addSubview:list];
 
+    [ctl refreshAll];
     objc_setAssociatedObject(panel, &g_ctl_key, ctl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     g_list  = list;
     g_panel = panel;

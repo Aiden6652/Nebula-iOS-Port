@@ -98,19 +98,41 @@ int main(void) {
     CHECK(nebula_ui_freeplay_on() == 1, "再开 → 立即生效");
     CHECK(!file_has(FP, "off"), "开启时配置里没有 off 行");
 
-    /* ⑦b 附加职业（副职业）：勾上后技能叠加，且落盘 */
+    /* ⑦b 附加职业挂在【主职业】下面：只有拿到该主职业的人才带附加能力 */
     {
         char SP[512]; snprintf(SP, sizeof(SP), "%s/nebula_subroles.txt", D);
         wr(SP, "");
         nebula_ui_init(D);
         CHECK(nebula_ui_sub_count() == 0, "默认没有附加职业");
-        CHECK(nebula_ui_role_is_sub(jackal) == 0, "豺狼默认不是附加职业");
+
+        /* 先点职业名选中主职业 = 警长 */
+        nebula_ui_set_current_main(sheriff);
+        CHECK(nebula_ui_current_main() == sheriff, "点职业名 → 选中警长为主职业");
+        char mn[64] = {0};
+        CHECK(nebula_ui_current_main_name(mn, sizeof(mn)) &&
+              strcmp(mn, "警长") == 0, "顶部显示当前编辑的是警长");
+
+        CHECK(nebula_ui_role_is_sub(jackal) == 0, "豺狼默认没挂在警长下");
         nebula_ui_role_toggle_sub(jackal);
-        CHECK(nebula_ui_role_is_sub(jackal) == 1, "点「附」勾上豺狼");
-        CHECK(file_has(SP, "jackal"), "附加职业立即写入配置");
+        CHECK(nebula_ui_role_is_sub(jackal) == 1, "给警长挂上附加：豺狼");
+        CHECK(file_has(SP, "sheriff:") && file_has(SP, "jackal"), "配置写入 sheriff: jackal");
+
+        /* 换主职业后互不影响：这是"挂在主职业下"与"全局附加"的区别 */
+        nebula_ui_set_current_main(jackal);
+        CHECK(nebula_ui_role_is_sub(jackal) == 0, "换成豺狼当主职业 → 它自己不是自己的附加");
+        CHECK(nebula_ui_role_is_sub(sheriff) == 0, "豺狼下面没有挂警长");
+        nebula_ui_role_toggle_sub(sheriff);
+        CHECK(nebula_ui_role_is_sub(sheriff) == 1, "给豺狼挂上附加：警长");
+        CHECK(nebula_ui_sub_count() == 2, "两组附加都被记下");
+
+        /* 取消：两组都清掉，配置应该什么都不剩 */
+        nebula_ui_set_current_main(jackal);
+        nebula_ui_role_toggle_sub(sheriff);
+        nebula_ui_set_current_main(sheriff);
         nebula_ui_role_toggle_sub(jackal);
-        CHECK(nebula_ui_role_is_sub(jackal) == 0, "再点一次取消");
-        CHECK(!file_has(SP, "jackal"), "取消后配置里也没了");
+        CHECK(nebula_ui_role_is_sub(jackal) == 0, "再点一次 → 取消附加");
+        CHECK(nebula_ui_sub_count() == 0, "两组附加都清掉了");
+        CHECK(!file_has(SP, "jackal"), "取消后配置里没有 jackal 了");
     }
 
     /* ⑧ 换职业按钮 */
