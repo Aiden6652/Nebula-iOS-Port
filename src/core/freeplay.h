@@ -37,6 +37,7 @@ typedef struct {
     int  fill;          /* 补齐到几人（0=不补齐） */
     int  role;          /* 固定职业 id（-1=按清单轮换） */
     int  rotate;        /* 轮换间隔秒（0=不轮换） */
+    int  autostart;     /* 大厅里自动调用开始（最小人数压不住时的兜底） */
     int  cursor;        /* 当前试到清单第几个 */
     int  total;         /* 清单总数（仅用于显示进度） */
     long last_switch;   /* 上次切换时间（秒） */
@@ -53,6 +54,9 @@ const nebula_freeplay_t *nebula_freeplay_state(void);
 
 /* 是否开启 */
 int nebula_freeplay_enabled(void);
+
+/* 是否开启"自动开始"（大厅里直接调 BeginGame），默认关闭 */
+int nebula_freeplay_autostart(void);
 
 /* 目标人数（未开启返回 0） */
 int nebula_freeplay_fill(void);

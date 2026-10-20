@@ -622,20 +622,24 @@ int nebula_il2cpp_get_player_name(void *info_obj, char *out, size_t osz)
     return o > 0 ? 0 : -1;
 }
 
-/* ★ 自由模式：把【开局最小人数】从 4 改成 1。
+/* ★ 自由模式：把【开局最小人数】从 4 压到 1。
    原版 GameStartManager 要求房间里至少 4 个人才能按开始 ——
    这是"开了自由模式也启动不了"的直接原因（一个人永远凑不够 4）。
-   字段按名动态查找，不需要预先知道偏移。 */
+
+   ⚠ 关键：不能只改一次。游戏的 Update 每帧都可能把它写回 4，
+   所以必须【每轮都检查并压住】。上一版改成 1 后就置 done 不再管，
+   结果被游戏重设回 4 —— 表现就是"改了还是不行"。
+   字段名/类名都给多个候选（各版本命名不同）。 */
 static void freeplay_lower_min_players(void)
 {
     if (!nebula_freeplay_enabled()) return;
 
-    static int done = 0, miss = 0;
-    if (done) return;
+    static int miss = 0, logged = 0, fixed = 0;
 
     void *klass = nebula_il2cpp_find_class_by_hint("GameStartManager");
+    if (!klass) klass = nebula_il2cpp_find_class_by_hint("GameStart");
     if (!klass) {
-        if (++miss % 20 == 1)
+        if (++miss % 30 == 1)
             nebula_log("freeplay: 未找到 GameStartManager 类（第%d次）", miss);
         return;
     }
@@ -643,20 +647,43 @@ static void freeplay_lower_min_players(void)
     int n = nebula_il2cpp_get_instances(klass, inst, 4);
     if (n <= 0) return;                      /* 不在大厅就没有实例，正常 */
 
+    static const char *names[] = { "MinPlayers", "minPlayers",
+                                   "MinimumPlayers", "MinPlayerCount", NULL };
     ptrdiff_t off = -1;
-    if (nebula_il2cpp_find_field(klass, "MinPlayers", &off) != 0) {
-        if (++miss % 20 == 1)
-            nebula_log("freeplay: GameStartManager 里没有 MinPlayers 字段（第%d次）", miss);
+    for (int k = 0; names[k] && off < 0; k++)
+        nebula_il2cpp_find_field(klass, names[k], &off);
+    if (off < 0) {
+        if (++miss % 30 == 1)
+            nebula_log("freeplay: GameStartManager 里没有 MinPlayers 类字段（第%d次）", miss);
         return;
     }
-    int cur = -1;
-    if (nebula_il2cpp_get_int_by(inst[0], off, &cur) == 0 && cur != 1) {
-        if (nebula_il2cpp_set_int_by(inst[0], off, 1) == 0) {
-            done = 1;
-            nebula_log("freeplay: 开局最小人数 %d → 1（一个人也能开始）", cur);
+
+    /* 兜底：最小人数这条路万一压不住，就直接调开始（需 autostart 1 才启用，
+       默认关闭，免得在用户没准备好时自己开局）。 */
+    if (nebula_freeplay_autostart()) {
+        static int as_tried = 0;
+        if (!as_tried) {
+            as_tried = 1;
+            if (nebula_il2cpp_call_void(inst[0], "BeginGame") == 0)
+                nebula_log("freeplay: autostart → 已调用 BeginGame");
+            else if (nebula_il2cpp_call_void(inst[0], "StartGame") == 0)
+                nebula_log("freeplay: autostart → 已调用 StartGame");
+            else
+                nebula_log("freeplay: autostart 失败（没有 BeginGame/StartGame 方法）");
         }
-    } else if (cur == 1) {
-        done = 1;
+    }
+
+    int cur = -1;
+    if (nebula_il2cpp_get_int_by(inst[0], off, &cur) != 0) return;
+    if (cur != 1) {
+        if (nebula_il2cpp_set_int_by(inst[0], off, 1) == 0) {
+            fixed++;
+            if (!logged || fixed % 50 == 0) {
+                logged = 1;
+                nebula_log("freeplay: 开局最小人数 %d → 1（已压住 %d 次，游戏会反复重设）",
+                           cur, fixed);
+            }
+        }
     }
 }
 

@@ -52,6 +52,7 @@ int nebula_freeplay_load(const char *path)
     g_fp.fill    = FP_FILL_DEFAULT;
     g_fp.role    = FP_ROLE_NONE;
     g_fp.rotate  = FP_ROTATE_DEFAULT;
+    g_fp.autostart = 0;
     g_fp.cursor  = 0;
     g_fp.last_switch = (long)time(NULL);
 
@@ -85,6 +86,8 @@ int nebula_freeplay_load(const char *path)
             } else {
                 nebula_log("freeplay: 未知职业 key: %s（将按清单轮换）", v);
             }
+        } else if (strcmp(key, "autostart") == 0) {
+            g_fp.autostart = (atoi(v) != 0) ? 1 : 0;
         } else if (strcmp(key, "rotate") == 0) {
             int n = atoi(v);
             if (n < 0) n = 0;
@@ -120,7 +123,9 @@ int nebula_freeplay_emit_sample(const char *path)
     fputs("# 固定自己拿哪个职业（写了就不轮换），例如：role sheriff\n", f);
     fputs("# 职业 id 见 nebula_roles_all.txt\n\n", f);
     fputs("# 不写 role 时，每隔多少秒自动换清单里的下一个职业（逐个试用）\n", f);
-    fputs("rotate 20\n", f);
+    fputs("rotate 20\n\n", f);
+    fputs("# 兜底：上面都改不动时，在大厅直接调用开始（1=开，默认 0）\n", f);
+    fputs("autostart 0\n", f);
     fclose(f);
     return 0;
 }
@@ -130,6 +135,8 @@ const nebula_freeplay_t *nebula_freeplay_state(void) { return &g_fp; }
 int nebula_freeplay_enabled(void) { return g_fp.enabled; }
 
 int nebula_freeplay_fill(void) { return g_fp.enabled ? g_fp.fill : 0; }
+
+int nebula_freeplay_autostart(void) { return g_fp.enabled ? g_fp.autostart : 0; }
 
 int nebula_freeplay_role(int idx, const int *roster, int n)
 {
