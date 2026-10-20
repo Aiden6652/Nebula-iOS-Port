@@ -56,8 +56,8 @@ int main(int argc, char **argv) {
     CHECK(nebula_addon_name(999) == NULL, "越界取插件名返回 NULL");
 
     /* 5.5) 官方职业表：内置中文应直接用官方名 */
-    /* 77 汉化覆盖 + 32 汉化未覆盖内置 + 1 addons 扩展(审判长) = 110 */
-    CHECK(nebula_role_count() == 110, "职业共 110 个");
+    /* 77 汉化覆盖 + 32 汉化未覆盖内置 + 1 审判长 + 157 addons 职业 = 267 */
+    CHECK(nebula_role_count() == 267, "职业共 267 个");
     CHECK(strcmp(nebula_lang_get("ROLE_JACKAL"), "豺狼") == 0, "官方名：豺狼");
     CHECK(strcmp(nebula_lang_get("ROLE_SHERIFF"), "警长") == 0, "官方名：警长");
     CHECK(strcmp(nebula_lang_get("ROLE_ARSONIST"), "纵火犯") == 0, "官方名：纵火犯");

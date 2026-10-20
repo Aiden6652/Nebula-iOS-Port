@@ -24,7 +24,9 @@
 #include <stddef.h>
 
 #define NEBULA_ADDON_DIR   "addons"
-#define NEBULA_LANG_MAX    256
+/* 容量必须 > 职业总数（当前 267）+ UI 文案 + 插件词条，
+   否则职业铺满后 UI 文案会写不进去（曾因 256 < 267 导致溢出） */
+#define NEBULA_LANG_MAX    1024
 #define NEBULA_LANG_KEYSZ  64
 #define NEBULA_LANG_VALSZ  128
 

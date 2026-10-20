@@ -1,120 +1,277 @@
 /* roles.h — 由官方汉化包自动生成，请勿手改（改请用 tools/ 下的生成器）
  * 数据来源：Addons/【汉化-基础】SCBaseLangPack.zip → Language/SChinese.dat
- * 共 110 个官方职业，含官方中文名与阵营归属。 */
+ * 共 267 个官方职业，含官方中文名与阵营归属。 */
 #ifndef NEBULA_ROLES_H
 #define NEBULA_ROLES_H
 
 typedef enum {
     ROLE_AGENT,                      /* 代理人 */
     ROLE_ALIEN,                      /* 外星人 */
+    ROLE_ALMIGHTY,                   /* 全能大师 */
+    ROLE_ALONEMAN,                   /* 独行客 */
     ROLE_AMALGAM,                    /* 融合体 */
+    ROLE_AMON,                       /* 错误 */
     ROLE_ARSONIST,                   /* 纵火犯 */
+    ROLE_ASSISTANT,                  /* 副手 */
+    ROLE_ATTACKER,                   /* 奇袭者 */
+    ROLE_AURORA,                     /* 极光之女 */
+    ROLE_AUTHORFAIRYTALE,            /* 童话作家 */
     ROLE_AVENGER,                    /* 复仇者 */
+    ROLE_AWAKE,                      /* 清醒者 */
     ROLE_BAIT,                       /* 诱饵 */
+    ROLE_BAITM,                      /* 诱饵 */
     ROLE_BALLOONHOLDER,              /* 气球持有者 */
     ROLE_BERSERKER,                  /* 易怒者 */
+    ROLE_BIZARROSORCERER,            /* 诡法师 */
     ROLE_BLOODY,                     /* 血语者 */
+    ROLE_BOMBER,                     /* 炸弹王 */
+    ROLE_BOMBERTWINS,                /* 双子爆破者 */
     ROLE_BOUNTY_HUNTER,              /* 赏金猎人 */
+    ROLE_BOUNTYHUNTERMOD,            /* 赏金猎手 */
     ROLE_BUBBLEGUN,                  /* 泡泡枪手 */
     ROLE_BUSKER,                     /* 灵化使 */
+    ROLE_BUTTONBARRY,                /* 执钮人 */
     ROLE_CAMOUFLAGER,                /* 隐蔽者 */
     ROLE_CANNON,                     /* 空气炮手 */
+    ROLE_CELESTIALDOG,               /* 天狗 */
     ROLE_CHAIN_SHIFTER,              /* 交换师 */
+    ROLE_CHAINKILLER,                /* 连环杀手 */
     ROLE_CHAINSHIFTER,               /* 链移者 */
+    ROLE_CHAMELEON,                  /* 变色龙 */
+    ROLE_CHANNELADMIN,               /* 频道管理员 */
     ROLE_CLEANER,                    /* 清理者 */
     ROLE_CLIMBER,                    /* 攀登者 */
     ROLE_CLOG,                       /* 阻碍者 */
     ROLE_COLLATOR,                   /* 基因学家 */
     ROLE_COMET,                      /* 彗星之子 */
     ROLE_CONFUSED,                   /* 迷茫者 */
+    ROLE_CONNOISSEUR,                /* 鉴赏狂人 */
+    ROLE_CRAWLERENGINEER,            /* 爬虫工程师 */
     ROLE_CREEPING,                   /* 潜行者 */
     ROLE_CREWMATE,                   /* 船员 */
+    ROLE_CRIMINALISTWRITER,          /* 犯罪学作家 */
+    ROLE_CRITIC,                     /* 评论家 */
+    ROLE_CROW,                       /* 黑鸦 */
     ROLE_CUPID,                      /* 丘比特 */
     ROLE_DAMNED,                     /* 受诅咒者 */
     ROLE_DAMNED_IMPOSTOR,            /* 受诅咒者 */
     ROLE_DANCER,                     /* 舞蹈家 */
+    ROLE_DEDUCTIONIST,               /* 推演师 */
     ROLE_DESTROYER,                  /* 毁灭者 */
     ROLE_DISCLOSURE,                 /* 显眼包 */
+    ROLE_DISPERSER,                  /* 分散者 */
+    ROLE_DISPOSER,                   /* 肢解师 */
+    ROLE_DISSOCIATION,               /* 解离症 */
     ROLE_DISTURBER,                  /* 干扰者 */
     ROLE_DOCTOR,                     /* 医学家 */
+    ROLE_DOOMSAYER,                  /* 末日赌怪 */
+    ROLE_DOOMSAYER2,                 /* 末日预言家 */
     ROLE_DOPPELGANGER,               /* 二重身 */
+    ROLE_DOUBLEKILLER,               /* 双刀开挂王 */
+    ROLE_DREAMFALL,                  /* 坠梦者 */
+    ROLE_DREAMSTEALER,               /* 窃梦家 */
+    ROLE_DREAMWEAVER,                /* 织梦人 */
+    ROLE_DREAMWEAVERM,               /* 织梦人 */
+    ROLE_DUNNER,                     /* 讨债人 */
     ROLE_ECHO,                       /* 感知者 */
+    ROLE_ECLIPSEPRINCIPLE,           /* 日食主教 */
     ROLE_EFFACER,                    /* 擦除者 */
     ROLE_EMBER,                      /* 余烬 */
+    ROLE_ENGINEER,                   /* 工程师 */
+    ROLE_ESCAPIST,                   /* 逃逸者 */
     ROLE_EVIL_GUESSER,               /* 邪恶的赌怪 */
     ROLE_EVIL_TRACKER,               /* 邪恶的追踪者 */
     ROLE_EVIL_TRAPPER,               /* 邪恶的陷阱师 */
+    ROLE_EVILACE,                    /* 密命王牌 */
+    ROLE_EVILBUSKER,                 /* 亡灵爆破师 */
+    ROLE_EVILNECROMANCER,            /* 亡灵巫师 */
+    ROLE_EVILSPLICER,                /* 处决者 */
     ROLE_EVILTRACKER,                /* 邪恶追踪者 */
+    ROLE_EXILEADMIN,                 /* 放逐管理员 */
     ROLE_EXTRA_MISSION,              /* 额外任务 */
+    ROLE_FALSECHARGES,               /* 伪证师 */
+    ROLE_FANCY,                      /* 空想症 */
+    ROLE_FANTAST,                    /* 空想家 */
+    ROLE_FATALSCALE,                 /* 逆鳞 */
+    ROLE_FATEPEEPER,                 /* 窥命者 */
+    ROLE_FERRYMAN,                   /* 摆渡人 */
+    ROLE_FIRSTDEAD,                  /* 首刀保护 */
     ROLE_FIXER,                      /* 修理工 */
+    ROLE_FLOWERBURIAL,               /* 花葬师 */
+    ROLE_FLYHEAD,                    /* 超级面筋人 */
+    ROLE_FORENSICDOCTOR,             /* 法医 */
     ROLE_GAMBLER,                    /* 赌徒 */
+    ROLE_GAMEMASTER,                 /* 管理员 */
     ROLE_GIMLET,                     /* 钻头 */
     ROLE_GRAFFITI,                   /* 涂鸦者 */
+    ROLE_GRENADIER,                  /* 掷弹兵 */
     ROLE_GRUDGE,                     /* 怨灵 */
     ROLE_GUESSER,                    /* 赌怪 */
     ROLE_HADAR,                      /* 矿工 */
+    ROLE_HADMARK,                    /* 命定之人 */
     ROLE_HALLUCINATION,              /* 幻形 */
+    ROLE_HASLOVE,                    /* 被传递爱心 */
+    ROLE_HITMAN,                     /* 雇佣杀手 */
+    ROLE_HOLMES,                     /* 福尔摩斯 */
     ROLE_ILLUSIONER,                 /* 模仿大师 */
+    ROLE_IMMERSIONSPECTATOR,         /* 观战席 */
     ROLE_IMPOSTOR,                   /* 伪装者 */
+    ROLE_INDOMITABLE,                /* 不屈者 */
+    ROLE_INFECTED,                   /* 叛离者 */
+    ROLE_INSOMNIACS,                 /* 失眠症患者 */
+    ROLE_INSOMNIACSM,                /* 失眠症患者 */
+    ROLE_INTUITION,                  /* 第六感 */
     ROLE_INVESTIGATOR,               /* 调查员 */
     ROLE_JACKAL,                     /* 豺狼 */
     ROLE_JAILER,                     /* 狱卒 */
+    ROLE_JAILOR,                     /* 典狱长 */
     ROLE_JEKYLLANDHYDE,              /* 双重人格 */
     ROLE_JESTER,                     /* 小丑 */
     ROLE_JUSTICE,                    /* 大神官 */
     ROLE_JUSTICE_PLUS,               /* 审判长 */
+    ROLE_KNIGHT,                     /* 侠客 */
+    ROLE_KNIGHTED,                   /* 骑士 */
+    ROLE_KNIGHTEDTARGET,             /* 主公 */
+    ROLE_LASTIMPOSTOR,               /* 绝境者 */
+    ROLE_LAWYER,                     /* 律师 */
+    ROLE_LAWYERCLIENT,               /* 客户 */
+    ROLE_LIGHTING,                   /* 执灯人 */
+    ROLE_LOVEMESSEGER,               /* 爱心使 */
     ROLE_LOVER,                      /* 恋人 */
+    ROLE_LUCIDDREAMER,               /* 清醒梦 */
     ROLE_LUMINE,                     /* 引路魂 */
     ROLE_MADMATE,                    /* 叛徒 */
+    ROLE_MADMATEPLUS,                /* 背信者 */
     ROLE_MARIONETTE,                 /* 木偶师 */
+    ROLE_MARKSMAN,                   /* 快枪手 */
+    ROLE_MAYFLY,                     /* 蜉蝣 */
     ROLE_MAYOR,                      /* 市长 */
+    ROLE_MEETINGADMIN,               /* 会议管理员 */
     ROLE_META_ROLE,                  /* 自由模式附加能力 */
+    ROLE_MIMICASSISTANT,             /* 模仿者（助手） */
+    ROLE_MIMICKILLER,                /* 模仿者（杀手） */
+    ROLE_MINI,                       /* 迷你船员 */
+    ROLE_MIRACLEMERCHANT,            /* 奇迹商人 */
+    ROLE_MISPLACED,                  /* 错位者 */
+    ROLE_MORAN,                      /* 莫兰上校 */
+    ROLE_MORESETTING,                /* 更多设置 */
+    ROLE_MORIARTY,                   /* 莫里亚蒂 */
     ROLE_MORPHING,                   /* 化形者 */
+    ROLE_NARIEFOX,                   /* 那列狐 */
     ROLE_NAVVY,                      /* 杂役 */
     ROLE_NECROMANCER,                /* 死灵法师 */
+    ROLE_NEET,                       /* 躺平者 */
+    ROLE_NEWSANCHOR,                 /* 新闻主持人 */
     ROLE_NEXUS,                      /* 枢纽 */
     ROLE_NICE_GUESSER,               /* 正义的赌怪 */
     ROLE_NICE_TRAPPER,               /* 正义的陷阱师 */
+    ROLE_NICESPLICER,                /* 折跃者 */
     ROLE_NICETRACKER,                /* 正义追踪者 */
+    ROLE_NIGHTJAR,                   /* 夜鹰 */
     ROLE_NIGHTMARE,                  /* 梦魇 */
+    ROLE_NINJA,                      /* 忍者 */
+    ROLE_NOCTURNAL,                  /* 夜行 */
     ROLE_NOISEGHOST,                 /* 吵闹鬼 */
     ROLE_NOISEMAKER,                 /* 大嗓门 */
+    ROLE_NOTARIZED,                  /* 被公证 */
+    ROLE_NOTARY,                     /* 公证人 */
+    ROLE_OBLIVION,                   /* 遗忘 */
+    ROLE_OBLIVIONCREW,               /* 遗忘船员 */
+    ROLE_OBLIVIONWOLF,               /* 遗忘伪装者 */
+    ROLE_OBSESSION,                  /* 执念 */
     ROLE_OBSESSIONAL,                /* 暗恋者 */
     ROLE_OPPORTUNIST,                /* 机会主义者 */
     ROLE_ORACLE,                     /* 神谕者 */
+    ROLE_OUROBOROS,                  /* 衔尾蛇 */
+    ROLE_OUTLAWLEADER,               /* 教父 */
     ROLE_PAINTER,                    /* 画皮师 */
     ROLE_PAPARAZZO,                  /* 摄影师 */
+    ROLE_PASTERASER,                 /* 往抹师 */
+    ROLE_PASTGUESSER,                /* 往赌师 */
+    ROLE_PELICAN,                    /* 鹈鹕 */
+    ROLE_PESSIMIST,                  /* 残念先生 */
     ROLE_PHOSPHORUS,                 /* 提灯人 */
+    ROLE_PIGGY,                      /* 猪猪 */
     ROLE_PLAGUE,                     /* 瘟疫 */
+    ROLE_POLLYANNA,                  /* 幸福小姐 */
     ROLE_POLTERGEIST,                /* 捣蛋鬼 */
+    ROLE_PREDESTINED,                /* 命运少女 */
     ROLE_PROVOCATEUR,                /* 挑衅者 */
     ROLE_PSYCHIC,                    /* 灵媒 */
+    ROLE_PURSUER,                    /* 起诉人 */
+    ROLE_PYROMANIAC,                 /* 纵火狂 */
     ROLE_QUACK,                      /* 庸医 */
     ROLE_RAIDER,                     /* 强盗 */
+    ROLE_RANGER,                     /* 巡林者 */
+    ROLE_RAVEN,                      /* 渡鸦 */
     ROLE_REAPER,                     /* 送葬者 */
+    ROLE_RECALL,                     /* 回忆 */
+    ROLE_RECONNECTTESTER,            /* 断线测试 */
+    ROLE_REINDEER,                   /* 驯鹿 */
+    ROLE_REMIX,                      /* 混响 */
+    ROLE_REMIXANNOUNCER,             /* 混响播音员 */
+    ROLE_REMIXECHO,                  /* 混音回响 */
+    ROLE_REMIXHOST,                  /* 混响主持人 */
+    ROLE_REMIXPULLER,                /* 混响牵引者 */
     ROLE_ROKUROKUBI,                 /* 辘轳首 */
+    ROLE_SAFETYADMIN,                /* 安全操作管理员 */
+    ROLE_SAMEDREAM,                  /* 同魇 */
     ROLE_SCARLET,                    /* 魅魔 */
     ROLE_SCARLET_LOVER,              /* 魅魔的恋人 */
+    ROLE_SCHRODINGERCAT,             /* 薛定谔的猫 */
+    ROLE_SCRAMBLER,                  /* 扰频 */
     ROLE_SCULPTOR,                   /* 雕塑家 */
     ROLE_SECRET,                     /* 觉醒者 */
     ROLE_SECRET_IN_GAME,             /* 觉醒者 */
     ROLE_SEER,                       /* 先知 */
+    ROLE_SELUCH,                     /* 掘墓者 */
+    ROLE_SENDING,                    /* 揭示者 */
     ROLE_SHERIFF,                    /* 警长 */
+    ROLE_SHIFTER,                    /* 普通交换师 */
     ROLE_SIDEKICK,                   /* 跟班 */
+    ROLE_SKINNER,                    /* 斯金纳 */
+    ROLE_SKINNERDOG,                 /* 斯金纳的狗 */
     ROLE_SNATCHER,                   /* 掠夺者 */
     ROLE_SNIPER,                     /* 狙击手 */
+    ROLE_SOLARAPOSTLE,               /* 曦日使徒 */
+    ROLE_SOMMELIER,                  /* 鉴酒师 */
+    ROLE_SOULCHASER,                 /* 追魂师 */
+    ROLE_SOULREFINER,                /* 炼魂师 */
     ROLE_SPECTRE,                    /* 幽灵 */
+    ROLE_SPEECHEATER,                /* 噬言者 */
+    ROLE_SPEEDSTER,                  /* 闪电侠 */
+    ROLE_SPINED,                     /* 被缠绕 */
+    ROLE_SPINNER,                    /* 编织者 */
+    ROLE_STAR,                       /* 明星 */
+    ROLE_STILLHEART,                 /* 止心 */
     ROLE_STIRRER,                    /* 幻术师 */
-    ROLE_SWAPPER,                    /* 交换者 */
+    ROLE_SUMMONED,                   /* 恶灵 */
+    ROLE_SUNGLASS,                   /* 近视眼 */
+    ROLE_SWAPPER,                    /* 换票师 */
+    ROLE_TESTAMENT,                  /* 遗愿 */
     ROLE_THURIFER,                   /* 调香师 */
     ROLE_TIE_BREAKER,                /* 破平者 */
+    ROLE_TRAILECHO,                  /* 回声 */
     ROLE_TRAPPER,                    /* 陷阱师 */
+    ROLE_TRAVELER,                   /* 旅行家 */
+    ROLE_TUNNY,                      /* 金枪鱼 */
     ROLE_TYRANT,                     /* 暴君 */
     ROLE_UBIQUITOUS,                 /* 飞手 */
+    ROLE_UNITER,                     /* 统票者 */
     ROLE_VANITY,                     /* 虚荣者 */
+    ROLE_VETERAN,                    /* 老兵 */
+    ROLE_VIEWER,                     /* 群演观众 */
+    ROLE_VIGILANTE,                  /* 私刑官 */
+    ROLE_VIOLATOR,                   /* 违规员 */
     ROLE_VULTURE,                    /* 秃鹫 */
+    ROLE_WATCHING,                   /* 窥视者 */
     ROLE_WHAMMY,                     /* 厄运师 */
+    ROLE_WHISPERWEAVER,              /* 呓语者 */
+    ROLE_WHITEWOLFKING,              /* 白狼王 */
+    ROLE_YANDERE,                    /* 病娇 */
+    ROLE_YANDERELOVER,               /* 病娇的宝贝 */
     ROLE_ZEAL,                       /* 狂热者 */
+    ROLE_ZOMBIE,                     /* 僵尸 */
     ROLE_COUNT
 } nebula_role_id_t;
 
