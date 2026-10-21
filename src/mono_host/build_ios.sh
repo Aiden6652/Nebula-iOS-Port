@@ -20,7 +20,12 @@ CCBIN="$(xcrun --sdk iphoneos -f clang)"
 
 echo "SDK: $SDK"
 echo "CC : $CCBIN"
+
+# 强制清干净：先删掉整个产物目录再重建。
+# 目的：确保下面的 dylib 一定是这次真编译出来的，不可能是上一轮残留 / 缓存命中的东西。
+rm -rf "$OUT"
 mkdir -p "$OUT"
+echo "已清空并重建产物目录: $OUT"
 
 # 定位 Mono 头文件目录（找到 .../include/mono，再往上取 include）
 MONO_INC_DIR="$(find "$MONO_PREFIX" -type d -name mono -path "*include*" 2>/dev/null | head -1 || true)"
@@ -94,10 +99,27 @@ else
   echo "!! 没找到 lib/net8.0，BCL 未拷贝（dylib 会跑不起来）" >&2
 fi
 
+# Standard / Pro 是同一份二进制，区别只在 nebula_host.<profile>.cfg 里的
+# runtime.mode（interp / jit）。这里各出一份带名字的副本，方便直接分发、不用改配置。
+cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_standard.dylib"
+cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_pro.dylib"
+
 echo "=== 校验 ==="
 lipo -info "$OUT/libnebula_mono_host.dylib"
 file "$OUT/libnebula_mono_host.dylib" 2>/dev/null || true
-echo "--- 导出符号(前 20) ---"
-nm -gU "$OUT/libnebula_mono_host.dylib" 2>/dev/null | head -20 || true
 
-echo "OK -> $OUT/libnebula_mono_host.dylib"
+echo "--- 关键符号检查（证明 MonoVM 真的链进来了）---"
+SYMS="$(nm -gU "$OUT/libnebula_mono_host.dylib" 2>/dev/null || true)"
+for s in mono_jit_init mono_domain_assembly_open mono_runtime_invoke mono_gc_collect; do
+  if echo "$SYMS" | grep -q "$s"; then echo "    ✓ $s"; else echo "    ✗ $s 缺失！"; MISSING=1; fi
+done
+[ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号，链接有问题" >&2; exit 1; }
+
+echo "--- 产物 ---"
+for f in libnebula_mono_host.dylib libnebula_standard.dylib libnebula_pro.dylib; do
+  [ -f "$OUT/$f" ] && printf "    %-30s %8s  sha256=%s\n" "$f" \
+     "$(du -h "$OUT/$f" | cut -f1)" "$(shasum -a 256 "$OUT/$f" | cut -c1-16)"
+done
+echo "    构建时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+echo "OK -> $OUT"

@@ -79,6 +79,23 @@ cp "$ROOT/src/mono_host/nebula_host.pro.cfg" "$OUT/"
 cp "$OUT/nebula_host.$PROFILE.cfg" "$OUT/nebula_host.cfg"
 echo "    默认生效: nebula_host.cfg (= $PROFILE)"
 
+echo "=== [3.5/5] 关掉星云舰联网自动更新 ==="
+# 加载器默认会联网拉最新版，iOS 上要么没网要么被墙，会卡住/失败。
+CFG="$OUT/BepInEx/config/jp.dreamingpig.amongus.nebula.loader.cfg"
+if [ -f "$CFG" ]; then
+python3 - "$CFG" <<'PY'
+import sys, re
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+for k in ['AutoUpdate', 'AutoUpdateIfVersionMismatching', 'AllowHttpCommunication']:
+    s = re.sub(r'(?m)^%s\s*=\s*\S+' % k, '%s = false' % k, s)
+open(p, 'w', encoding='utf-8').write(s)
+print("    AutoUpdate / AutoUpdateIfVersionMismatching / AllowHttpCommunication = false")
+PY
+else
+  echo "    (未找到加载器配置，跳过)"
+fi
+
 echo "=== [4/5] entitlements ==="
 cp "$ROOT/tools/entitlements-jit.plist" "$OUT/entitlements.plist"
 echo "    已写入 entitlements.plist"
