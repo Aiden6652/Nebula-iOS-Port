@@ -54,7 +54,26 @@ PY
 echo "=== [4/5] 构建 iOS arm64 运行时 ==="
 export MONO_SOURCE_ROOT="$WORK/mono"
 cd "$WORK/gmb"
-python3 ./patch_mono.py
+
+# 4a. 打补丁。注意：godot-mono-builds 的 patch_mono.py 只要有一个补丁对不上就整体
+#     exit(1)，会把排在它后面的 iOS 关键补丁（mono_ios_asl_log_deprecated 等）
+#     一起吞掉。所以先容忍它的失败，再用兜底循环把没打上的补齐。
+python3 ./patch_mono.py || echo "!! patch_mono.py 有补丁未打上，交给兜底循环补齐"
+
+# 4b. 兜底：逐个补丁容忍失败再打一遍（-N 自动跳过已应用的，--batch 不再交互卡住）
+echo "--- 兜底补齐补丁 ---"
+for d in "$WORK/gmb/files/patches/"*.diff; do
+  echo "  [patch] $(basename "$d")"
+  ( cd "$WORK/mono" && patch -N -p1 --forward --batch < "$d" ) \
+    || echo "          跳过（不适用或已应用）"
+done
+
+# 4c. Mono 从 git 拉下来没有 configure，需要 autogen 生成
+if [ ! -x "$WORK/mono/configure" ]; then
+  echo "--- 生成 configure (autogen) ---"
+  ( cd "$WORK/mono" && NOCONFIGURE=1 ./autogen.sh )
+fi
+
 ./ios.py configure --target=arm64 --install-dir="$INSTALL"
 ./ios.py make --target=arm64 --install-dir="$INSTALL"
 
