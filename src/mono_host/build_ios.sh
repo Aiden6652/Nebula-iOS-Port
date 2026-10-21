@@ -71,15 +71,27 @@ echo "=== 编译 iOS arm64 dylib ==="
   -framework Security \
   -lobjc -lc++ -lpthread -lz -lm
 
-# 把 MonoVM 的 BCL 一并拷到产物目录，打包时能整包带走。
-# 运行时需要让 Mono 找得到它们：MONO_PATH 指向 bcl/ 与 bcl/ 的 CoreLib 所在处。
-if [ -d "$MONO_PREFIX/lib/net8.0" ]; then
+# 把 MonoVM 的 BCL 一并拷到产物目录 —— 没有 BCL 这个 dylib 跑不了任何 .NET 代码。
+# 注意路径：解包后真实位置是 <prefix>/ios-monovm/lib/net8.0，不是 <prefix>/lib/net8.0，
+# 所以要先定位含 lib/net8.0 的那一层。
+MONO_ROOT="$MONO_PREFIX"
+if [ ! -d "$MONO_ROOT/lib/net8.0" ]; then
+  found="$(find "$MONO_PREFIX" -maxdepth 4 -type d -name net8.0 -path "*/lib/*" 2>/dev/null | head -1)"
+  [ -n "$found" ] && MONO_ROOT="$(dirname "$(dirname "$found")")"
+fi
+echo "MONO_ROOT: $MONO_ROOT"
+
+if [ -d "$MONO_ROOT/lib/net8.0" ]; then
   echo "=== 拷贝 .NET 8 BCL ==="
   mkdir -p "$OUT/bcl"
-  cp -R "$MONO_PREFIX/lib/net8.0/." "$OUT/bcl/"
-  [ -f "$MONO_PREFIX/native/System.Private.CoreLib.dll" ] \
-    && cp "$MONO_PREFIX/native/System.Private.CoreLib.dll" "$OUT/bcl/"
+  cp -R "$MONO_ROOT/lib/net8.0/." "$OUT/bcl/"
+  [ -f "$MONO_ROOT/native/System.Private.CoreLib.dll" ] \
+    && cp "$MONO_ROOT/native/System.Private.CoreLib.dll" "$OUT/bcl/"
+  # ICU 数据（全球化/中文相关），有就带上
+  [ -f "$MONO_ROOT/native/icudt.dat" ] && cp "$MONO_ROOT/native/icudt.dat" "$OUT/bcl/"
   echo "    BCL 程序集 $(ls "$OUT/bcl" | wc -l) 个"
+else
+  echo "!! 没找到 lib/net8.0，BCL 未拷贝（dylib 会跑不起来）" >&2
 fi
 
 echo "=== 校验 ==="
