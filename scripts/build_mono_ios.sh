@@ -51,6 +51,34 @@ open(p, "w").write(s)
 print("已保留 JIT + interpreter（原本被 Godot 的 iOS 设备模板砍掉）")
 PY
 
+echo "=== [3b/5] iOS 特有问题：aot-compiler.c 用了 system() ==="
+# iOS SDK 把 system() 标成 unavailable，而 mono/mini/aot-compiler.c 会调它
+# （全 AOT 时用来起外部汇编器）。我们走 JIT/解释器，AOT 编译器完全用不到，
+# 所以在这个文件里把 system() 用宏桩掉 —— 只在 HOST_IOS 下生效，不影响别的平台。
+python3 - "$WORK/mono" <<'PY'
+import sys, os
+src = sys.argv[1]
+p = os.path.join(src, "mono/mini/aot-compiler.c")
+lines = open(p).read().split("\n")
+idx = None
+for i, l in enumerate(lines[:300]):
+    if l.lstrip().startswith("#include"):
+        idx = i
+if idx is None:
+    sys.exit("!! aot-compiler.c 里没找到 #include，无法定位插入点")
+guard = [
+    "",
+    "#if defined(HOST_IOS)",
+    "/* iOS 没有 system()（SDK 标为 unavailable）。我们走 JIT/解释器，",
+    "   AOT 编译器用不到，用桩顶掉，避免编译失败。 */",
+    "#define system(cmd) (-1)",
+    "#endif",
+]
+lines[idx + 1:idx + 1] = guard
+open(p, "w").write("\n".join(lines))
+print("已在 aot-compiler.c 注入 HOST_IOS 下的 system() 桩")
+PY
+
 echo "=== [4/5] 构建 iOS arm64 运行时 ==="
 export MONO_SOURCE_ROOT="$WORK/mono"
 cd "$WORK/gmb"
