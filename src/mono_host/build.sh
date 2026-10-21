@@ -14,11 +14,18 @@ cp "$ROOT/script.cs.txt" "$OUT/"
 echo "[build] 2/2 编译原生宿主 ..."
 if pkg-config --exists mono-2 2>/dev/null; then
     # 注意：-lstdc++ 必须加，libmono-2.0 含 C++ 代码（EXE 链接需要解析 __cxa_* 等符号）。
-    cc "$ROOT/nebula_mono_host.c" -o "$OUT/nebula_mono_host" \
-       $(pkg-config --cflags --libs mono-2) -lstdc++ -lpthread
-    cc -shared -fPIC "$ROOT/nebula_mono_host.c" -o "$OUT/libnebula_mono_host.so" \
-       $(pkg-config --cflags --libs mono-2) -lstdc++ -lpthread
-    echo "[build] OK (desktop Mono)"
+    CFLAGS="$(pkg-config --cflags --libs mono-2) -lstdc++ -lpthread"
+    # 1) 可执行（桌面验证用，走 main()）
+    cc "$ROOT/nebula_mono_host.c" -o "$OUT/nebula_mono_host" $CFLAGS
+    # 2) 动态库：按平台命名（macOS=.dylib / Linux=.so）；必须 -DBUILD_AS_LIB 才会挂
+    #    __attribute__((constructor)) 入口——被游戏进程 dlopen 时自动异步 boot Mono。
+    #    （之前漏了 -DBUILD_AS_LIB，产出的 .so 没有 constructor，dlopen 后不会启动。）
+    case "$(uname -s)" in
+      Darwin*) LIB="$OUT/libnebula_mono_host.dylib" ;;
+      *)       LIB="$OUT/libnebula_mono_host.so" ;;
+    esac
+    cc -shared -fPIC -DBUILD_AS_LIB "$ROOT/nebula_mono_host.c" -o "$LIB" $CFLAGS
+    echo "[build] OK (desktop Mono) -> 可执行=$OUT/nebula_mono_host 动态库=$LIB"
 else
     echo "[build] 未检测到桌面 Mono（pkg-config mono-2 不存在）。"
     echo "        仅生成了托管侧；宿主需在装有 Mono 的环境或 iOS 交叉工具链下编译。"
