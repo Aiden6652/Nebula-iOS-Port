@@ -98,6 +98,8 @@ void nebula_ui_role_toggle_sub(int idx)
                nebula_subrole_is_on(g_cur_main, idx) ? "已挂上" : "已取消");
 }
 
+int nebula_ui_role_is_allowed(int idx) { return nebula_subrole_is_allowed(idx); }
+
 int nebula_ui_sub_count(void) { return nebula_subrole_count(); }
 
 int nebula_ui_freeplay_on(void) { return nebula_freeplay_enabled(); }

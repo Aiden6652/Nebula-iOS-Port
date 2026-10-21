@@ -28,6 +28,7 @@ int  nebula_ui_current_main(void);
 void nebula_ui_set_current_main(int idx);
 int  nebula_ui_current_main_name(char *out, size_t osz);
 int  nebula_ui_role_is_sub(int idx);
+int  nebula_ui_role_is_allowed(int idx);   /* 是否在原版附加能力清单里 */
 void nebula_ui_role_toggle_sub(int idx);
 int  nebula_ui_sub_count(void);
 

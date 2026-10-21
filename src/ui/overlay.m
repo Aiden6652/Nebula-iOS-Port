@@ -378,24 +378,35 @@ static void build_panel(UIWindow *win)
         [row addSubview:plus];
 
         /* 「附」：勾上 = 这个职业附加到主职业之上，技能叠加
-           （例：主职业警长 + 附加赌怪 → 同时有两种能力） */
-        UIButton *sub = [UIButton buttonWithType:UIButtonTypeSystem];
-        sub.frame = CGRectMake(262, 4, 46, 32);
-        [sub setTitle:@"附" forState:UIControlStateNormal];
-        sub.tag = i;
-        sub.layer.borderWidth = 1;
-        sub.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.3].CGColor;
-        sub.layer.cornerRadius = 5;
-        if (nebula_ui_role_is_sub(i)) {
-            sub.backgroundColor = [UIColor systemGreenColor];
-            [sub setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+           （例：主职业警长 + 附加赌怪 → 同时有两种能力）
+           不在原版附加能力清单里的职业【不给这个按钮】，避免点了没反应。 */
+        if (nebula_ui_role_is_allowed(i)) {
+            UIButton *sub = [UIButton buttonWithType:UIButtonTypeSystem];
+            sub.frame = CGRectMake(262, 4, 46, 32);
+            [sub setTitle:@"附" forState:UIControlStateNormal];
+            sub.tag = i;
+            sub.layer.borderWidth = 1;
+            sub.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.3].CGColor;
+            sub.layer.cornerRadius = 5;
+            if (nebula_ui_role_is_sub(i)) {
+                sub.backgroundColor = [UIColor systemGreenColor];
+                [sub setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+            } else {
+                sub.backgroundColor = [UIColor clearColor];
+                [sub setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            }
+            [sub addTarget:ctl action:@selector(onSub:) forControlEvents:UIControlEventTouchUpInside];
+            [row addSubview:sub];
+            [g_sub_btns addObject:sub];
         } else {
-            sub.backgroundColor = [UIColor clearColor];
-            [sub setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            /* 不可附加：占位保持布局整齐 */
+            UILabel *ph = [[UILabel alloc] initWithFrame:CGRectMake(262, 4, 46, 32)];
+            ph.text = @"-";
+            ph.textAlignment = NSTextAlignmentCenter;
+            ph.textColor = [UIColor darkGrayColor];
+            [row addSubview:ph];
+            [g_sub_btns addObject:ph];
         }
-        [sub addTarget:ctl action:@selector(onSub:) forControlEvents:UIControlEventTouchUpInside];
-        [row addSubview:sub];
-        [g_sub_btns addObject:sub];
 
         [list addSubview:row];
     }
