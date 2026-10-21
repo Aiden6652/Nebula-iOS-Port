@@ -1,5 +1,9 @@
-name: Build Nebula-iOS dylib
+name: Build Nebula-iOS (Mono embed host)
 
+# 新路线：把原版星云舰 C# 跑进 iOS AU。
+# 本 workflow 在 macos-14 runner 上编译「Mono 嵌入宿主」（C 宿主 + Engine.dll），
+# 验证链路：嵌入 Mono(JIT) -> 加载 Engine.dll -> Roslyn 内存编译 C# -> Mono JIT 执行。
+# （这是 POC 在 CI 上的复刻；真机 iOS 还需 ios-arm64 的 libmono + JIT，见 src/mono_host/build.sh 末尾。）
 on:
   push:
     branches: [ main ]
@@ -11,27 +15,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # macOS：交叉编译 iOS arm64 dylib
-  #    固定用 macos-14：macos-latest 队列等待时间长；14 的镜像启动更快
-  #    注：原 Linux 测试 job 已移除（它只是跑 host 端测试，
-  #        本地每次提交前都会跑全量验证，放在 CI 里只会占队列、拖慢出包）
-  build-dylib:
+  build-mono-host:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode
-        # macos-14 上 Xcode 路径可能是 Xcode_15.x.app，逐个探测而不是写死
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install Mono (runtime + dev headers for embedding)
+        run: brew install mono
+
+      - name: Build Mono embed host (Engine.dll + native dylib)
+        env:
+          # brew 在 Apple Silicon 装到 /opt/homebrew，Intel 装到 /usr/local；两者都覆盖。
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig
+        run: cd src/mono_host && bash build.sh
+
+      - name: Verify embedded Mono + Roslyn JIT runs C#
         run: |
-          XC=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
-          echo "使用 Xcode: $XC"
-          sudo xcode-select -s "$XC/Contents/Developer"
-          xcrun --sdk iphoneos --show-sdk-path
-      - name: Build dylib (arm64-ios)
-        run: cd src/dylib && make
-      - name: Verify artifact
-        run: file src/dylib/nebula_ios_loader.dylib
-      - name: Upload dylib
+          cd src/mono_host/out
+          ./nebula_mono_host 2>&1 | tee /tmp/run.log
+          grep -q "C# is running" /tmp/run.log && echo "PASS: embedded Mono + Roslyn JIT executed C#"
+
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nebula-ios-dylib
-          path: src/dylib/*.dylib
+          name: nebula-mono-host
+          path: |
+            src/mono_host/out/nebula_mono_host
+            src/mono_host/out/libnebula_mono_host.so
+            src/mono_host/out/Engine.dll

@@ -27,3 +27,10 @@ src/addon/test_addon
 src/ui/test_roles_ui
 src/net/test_protocol
 src/net/test_dispatch
+
+# Mono 嵌入宿主构建产物（Engine.dll + Roslyn 依赖 + 编译好的宿主，由 CI 生成）
+src/mono_host/out/
+*.dll
+*.zip
+*.dat
+metadata/

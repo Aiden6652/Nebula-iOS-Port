@@ -1,0 +1,11 @@
+using System;
+using Il2Cpp.UnityEngine;
+
+public class Script
+{
+    public static void Main()
+    {
+        Debug.Log("C# is running!");
+        Debug.Log("Hello from embedded Mono + Roslyn JIT (Nebula iOS port POC)");
+    }
+}
