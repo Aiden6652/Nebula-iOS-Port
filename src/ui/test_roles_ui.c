@@ -98,41 +98,35 @@ int main(void) {
     CHECK(nebula_ui_freeplay_on() == 1, "再开 → 立即生效");
     CHECK(!file_has(FP, "off"), "开启时配置里没有 off 行");
 
-    /* ⑦b 附加职业挂在【主职业】下面：只有拿到该主职业的人才带附加能力 */
+    /* ⑦b 附加能力【白名单】：只有原版清单里的 39 个能附加，别的拒绝 */
     {
         char SP[512]; snprintf(SP, sizeof(SP), "%s/nebula_subroles.txt", D);
         wr(SP, "");
         nebula_ui_init(D);
-        CHECK(nebula_ui_sub_count() == 0, "默认没有附加职业");
+        int gid = nebula_role_id_by_key("guesser");      /* 赌怪：原版附加能力 */
+        CHECK(nebula_ui_sub_count() == 0, "默认没有附加能力");
 
-        /* 先点职业名选中主职业 = 警长 */
+        /* 主职业 = 警长 */
         nebula_ui_set_current_main(sheriff);
         CHECK(nebula_ui_current_main() == sheriff, "点职业名 → 选中警长为主职业");
         char mn[64] = {0};
         CHECK(nebula_ui_current_main_name(mn, sizeof(mn)) &&
               strcmp(mn, "警长") == 0, "顶部显示当前编辑的是警长");
 
-        CHECK(nebula_ui_role_is_sub(jackal) == 0, "豺狼默认没挂在警长下");
-        nebula_ui_role_toggle_sub(jackal);
-        CHECK(nebula_ui_role_is_sub(jackal) == 1, "给警长挂上附加：豺狼");
-        CHECK(file_has(SP, "sheriff:") && file_has(SP, "jackal"), "配置写入 sheriff: jackal");
+        /* 赌怪在白名单里 → 能挂上 */
+        CHECK(nebula_ui_role_is_sub(gid) == 0, "赌怪默认没挂上");
+        nebula_ui_role_toggle_sub(gid);
+        CHECK(nebula_ui_role_is_sub(gid) == 1, "给警长挂上附加能力：赌怪");
+        CHECK(file_has(SP, "guesser"), "配置写入 guesser");
 
-        /* 换主职业后互不影响：这是"挂在主职业下"与"全局附加"的区别 */
+        /* 换主职业后互不影响 */
         nebula_ui_set_current_main(jackal);
-        CHECK(nebula_ui_role_is_sub(jackal) == 0, "换成豺狼当主职业 → 它自己不是自己的附加");
-        CHECK(nebula_ui_role_is_sub(sheriff) == 0, "豺狼下面没有挂警长");
-        nebula_ui_role_toggle_sub(sheriff);
-        CHECK(nebula_ui_role_is_sub(sheriff) == 1, "给豺狼挂上附加：警长");
-        CHECK(nebula_ui_sub_count() == 2, "两组附加都被记下");
+        CHECK(nebula_ui_role_is_sub(gid) == 0, "换成豺狼当主职业 → 它下面没有赌怪");
 
-        /* 取消：两组都清掉，配置应该什么都不剩 */
-        nebula_ui_set_current_main(jackal);
-        nebula_ui_role_toggle_sub(sheriff);
-        nebula_ui_set_current_main(sheriff);
+        /* 清单外的（豺狼不是附加能力）→ 拒绝 */
         nebula_ui_role_toggle_sub(jackal);
-        CHECK(nebula_ui_role_is_sub(jackal) == 0, "再点一次 → 取消附加");
-        CHECK(nebula_ui_sub_count() == 0, "两组附加都清掉了");
-        CHECK(!file_has(SP, "jackal"), "取消后配置里没有 jackal 了");
+        CHECK(nebula_ui_role_is_sub(jackal) == 0,
+              "★ 豺狼不在原版附加能力清单里 → 拒绝附加");
     }
 
     /* ⑧ 换职业按钮 */

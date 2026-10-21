@@ -50,6 +50,9 @@ int  nebula_subrole_load(const char *path);
 int  nebula_subrole_save(const char *path);
 
 /* main_idx / sub_idx 都是【面板行号】；on=是否挂在 main 下面 */
+/* 该职业是否属于原版【附加能力】清单（清单外的不能附加） */
+int  nebula_subrole_is_allowed(int sub_idx);
+
 int  nebula_subrole_is_on(int main_idx, int sub_idx);
 void nebula_subrole_toggle(int main_idx, int sub_idx);
 

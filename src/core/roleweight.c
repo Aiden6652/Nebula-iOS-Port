@@ -156,8 +156,37 @@ int nebula_subrole_is_on(int main_idx, int sub_idx)
     return 0;
 }
 
+/* ★ 原版星云舰里"附加能力"是【独立的一套】，不是所有职业都能当附加。
+   用户给的权威清单（共 39 个）；不在清单里的一律不能附加。
+   注：诱饵同时有【独立职业版 bait】和【附加能力版 baitm】两个。 */
+static const char *ALLOWED_SUBROLES[] = {
+    "诱饵", "血语者", "执钮人", "变色龙", "幻视者", "受诅咒者",
+    "显眼包", "分散者", "临终遗言", "额外任务", "逆鳞",
+    "超级面筋人", "赌怪", "不屈者", "叛离者", "狱卒",
+    "绝境者", "执灯人", "恋人", "背信者", "迷你船员",
+    "躺平者", "夜至", "眠夜", "夜行", "暗恋者",
+    "猪猪", "RGB", "扰频", "觉醒者", "掘墓者",
+    "揭示者", "闪电侠", "明星", "止心", "破平者",
+    "三角仇", "VIP", "窥视者",
+    NULL
+};
+
+int nebula_subrole_is_allowed(int sub_idx)
+{
+    const char *nm = nebula_weight_name(sub_idx);
+    if (!nm || !nm[0]) return 0;
+    for (int i = 0; ALLOWED_SUBROLES[i]; i++)
+        if (strcmp(ALLOWED_SUBROLES[i], nm) == 0) return 1;
+    return 0;
+}
+
 void nebula_subrole_toggle(int main_idx, int sub_idx)
 {
+    if (!nebula_subrole_is_allowed(sub_idx)) {
+        nebula_log("subrole: [%s] 不是原版附加能力，不能附加",
+                   nebula_weight_name(sub_idx) ? nebula_weight_name(sub_idx) : "?");
+        return;                          /* ★ 清单外的一律拒绝 */
+    }
     int mid = idx_to_id(main_idx), sid = idx_to_id(sub_idx);
     if (mid < 0 || mid >= MAX_ROLES || sid < 0 || sid >= MAX_ROLES || mid == sid) {
         nebula_log("subrole: 无法附加（主id=%d 附id=%d：id 无效或自己附加自己）", mid, sid);
