@@ -22,6 +22,8 @@
 #include <limits.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <strings.h>    // strcasecmp
 
 #include <mono/jit/jit.h>
 #include <mono/metadata/assembly.h>
@@ -264,6 +266,64 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     return 1;
 }
 
+// 尝试调用某个静态无参方法，成功返回 1
+static int try_invoke(MonoImage *img, const char *ns, const char *cls, const char *method) {
+    MonoClass *k = mono_class_from_name(img, ns, cls);
+    if (!k) return 0;
+    MonoMethod *m = mono_class_get_method_from_name(k, method, 0);
+    if (!m) return 0;
+    MonoObject *exc = NULL;
+    printf("[host]   调用 %s%s%s.%s()\n", ns ? ns : "", ns && *ns ? "." : "", cls, method);
+    mono_runtime_invoke(m, NULL, NULL, &exc);
+    if (exc) { fprintf(stderr, "[host]   !! 抛异常\n"); return 0; }
+    return 1;
+}
+
+// 通用 C# 模组加载：扫 Mods/ 目录，逐个 Assembly.Load 并尝试常见入口。
+// 目的是不只支持星云舰/BepInEx —— 别的 C# AU 模组只要扔进去，入口能被认出来就能跑。
+static int boot_mods_dir(MonoDomain *domain, const char *root) {
+    char mdir[PATH_MAX];
+    const char *m = getenv("NEBULA_MODS_DIR");
+    if (m && *m) snprintf(mdir, sizeof(mdir), "%s", m);
+    else         snprintf(mdir, sizeof(mdir), "%s/Mods", root);
+
+    DIR *d = opendir(mdir);
+    if (!d) { printf("[host] 无 Mods 目录: %s\n", mdir); return 0; }
+    printf("[host] 扫描 Mods 目录: %s\n", mdir);
+
+    struct dirent *e;
+    int loaded = 0;
+    while ((e = readdir(d))) {
+        const char *n = e->d_name;
+        size_t len = strlen(n);
+        if (len < 5 || strcasecmp(n + len - 4, ".dll") != 0) continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", mdir, n);
+        printf("[host] 加载模组: %s\n", n);
+
+        MonoAssembly *as = mono_domain_assembly_open(domain, path);
+        if (!as) { fprintf(stderr, "[host]   打开失败\n"); continue; }
+        loaded++;
+
+        MonoImage *img = mono_assembly_get_image(as);
+        if (!img) continue;
+
+        // 常见入口，按顺序试：命中任意一个就算启动成功
+        char cls[256];
+        snprintf(cls, sizeof(cls), "%.*s", (int)(len - 4), n);   // 去掉 .dll 当类名
+        if (try_invoke(img, "Doorstop", "Entrypoint", "Start")) continue;
+        if (try_invoke(img, "", "Entrypoint", "Start"))          continue;
+        if (try_invoke(img, "", "Mod", "Start"))                 continue;
+        if (try_invoke(img, "", cls, "Start"))                    continue;
+        if (try_invoke(img, "", cls, "Main"))                    continue;
+        printf("[host]   （没找到已知入口，仅加载不启动）\n");
+    }
+    closedir(d);
+    printf("[host] Mods 加载完毕，共 %d 个程序集\n", loaded);
+    return loaded > 0;
+}
+
 // 兜底/桌面验证路径：跑 Engine.dll 这个 POC（Roslyn 编译脚本并执行）
 static int boot_engine_poc(MonoDomain *domain, const char *dir) {
     char engine[PATH_MAX];
@@ -310,12 +370,19 @@ static void *boot_thread(void *arg) {
     printf("[host] Mono 就绪，基线 RSS=%ldMB\n", rss_mb());
     start_watchdog();
 
-    // NEBULA_BOOT: bepinex | engine | auto（默认 auto：有 BepInEx 就走它）
+    // NEBULA_BOOT: bepinex | mods | engine | auto（默认）
+    // auto 的顺序：BepInEx → Mods 目录 → Engine POC
+    // 之所以先 BepInEx：BepInEx 起来后它自己会去加载 plugins/ 里的所有插件，
+    // 覆盖面最广；它不在场时才退到通用 Mods 扫描。
     const char *bm = getenv("NEBULA_BOOT");
+    int auto_mode = !bm || !*bm || !strcmp(bm, "auto");
     int ok = 0;
-    if (!bm || !*bm || !strcmp(bm, "auto") || !strcmp(bm, "bepinex"))
+
+    if (auto_mode || !strcmp(bm, "bepinex"))
         ok = boot_bepinex(domain, root);
-    if (!ok && (!bm || !*bm || !strcmp(bm, "auto") || !strcmp(bm, "engine")))
+    if (!ok && (auto_mode || !strcmp(bm, "mods")))
+        ok = boot_mods_dir(domain, root);
+    if (!ok && (auto_mode || !strcmp(bm, "engine")))
         ok = boot_engine_poc(domain, dir);
     if (!ok) fprintf(stderr, "[host] !! 没有任何启动路径成功\n");
 
