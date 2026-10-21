@@ -71,6 +71,7 @@ void nebula_il2cpp_tick_from_game(void);
 void nebula_il2cpp_apply_all(void);
 void nebula_il2cpp_apply_all_async(void);
 int  nebula_il2cpp_get_int_by(void *obj, ptrdiff_t off, int *out);
+int  nebula_il2cpp_set_bool_by(void *obj, ptrdiff_t off, int v);
 int  nebula_il2cpp_set_int_by(void *obj, ptrdiff_t off, int v);
 int  nebula_il2cpp_get_float_by(void *obj, ptrdiff_t off, float *out);
 int  nebula_il2cpp_set_float_by(void *obj, ptrdiff_t off, float v);

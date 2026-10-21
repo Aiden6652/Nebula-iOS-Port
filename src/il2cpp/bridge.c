@@ -493,6 +493,14 @@ int nebula_il2cpp_get_float_by(void *obj, ptrdiff_t off, float *out)
     return 0;
 }
 
+/* 写 bool 字段（IL2CPP 里 bool 占 1 字节） */
+int nebula_il2cpp_set_bool_by(void *obj, ptrdiff_t off, int v)
+{
+    if (!obj || off < 0) return -1;
+    *(uint8_t *)((char *)obj + off) = v ? 1 : 0;
+    return 0;
+}
+
 int nebula_il2cpp_set_int_by(void *obj, ptrdiff_t off, int v)
 {
     if (!obj || off < 0) return -1;
@@ -780,6 +788,45 @@ static int in_lobby(void)
     if (!lk) return 0;
     void *li[2];
     return nebula_il2cpp_get_instances(lk, li, 2) > 0;
+}
+
+/* ★ 技能按钮：真正的按钮开关不在 RoleTypes 枚举上，而在
+   NetworkedPlayerInfo.Role 指向的 RoleBehaviour 实例里：
+       CanUseKillButton → 击杀按钮
+       CanVent          → 跳管按钮
+   字段名按名动态查找，不硬编码偏移（各版本偏移可能不同）。 */
+static void apply_role_buttons(void *info, int rid, const char *key, int team_imp)
+{
+    if (!info) return;
+    void *ik = *(void **)info;
+    if (!ik) return;
+
+    ptrdiff_t role_off = -1;
+    static const char *rn[] = { "Role", "role", NULL };
+    if (nebula_il2cpp_find_field_exact(ik, rn, &role_off) != 0) return;
+
+    void *rb = *(void **)((char *)info + role_off);
+    void *rk = rb ? *(void **)rb : NULL;
+    if (!rk) return;
+
+    static ptrdiff_t kill_off = -2, vent_off = -2;
+    if (kill_off == -2) {
+        static const char *k1[] = { "CanUseKillButton", "canUseKillButton", NULL };
+        static const char *v1[] = { "CanVent", "canVent", NULL };
+        nebula_il2cpp_find_field_exact(rk, k1, &kill_off);
+        nebula_il2cpp_find_field_exact(rk, v1, &vent_off);
+    }
+    int knife = nebula_role_has_knife(rid, key, team_imp);
+    int vent  = team_imp || (nebula_role_underlying(rid, key, team_imp) == RT_ENGINEER);
+
+    if (kill_off >= 0) nebula_il2cpp_set_bool_by(rb, kill_off, knife);
+    if (vent_off  >= 0) nebula_il2cpp_set_bool_by(rb, vent_off, vent);
+
+    static int logged = 0;
+    if (!logged && (kill_off >= 0 || vent_off >= 0)) {
+        logged = 1;
+        nebula_log("apply_roles: 技能按钮开关已接入（击杀=%d 跳管=%d）", knife, vent);
+    }
 }
 
 /* ★ 调用无参方法并取 int 返回值（用于 GameData.get_PlayerCount）。
@@ -1289,6 +1336,8 @@ int nebula_il2cpp_apply_roles(void)
             }
         }
         void *info = (info_off >= 0) ? *(void **)((char *)insts[i] + info_off) : NULL;
+        /* 技能按钮（击杀/跳管）：按职业能力打开 RoleBehaviour 上的开关 */
+        apply_role_buttons(info, rid, nebula_role_key(rid), team == TEAM_IMPOSTOR);
 
         /* 名字：新版 AU 的 PlayerName 是【属性(方法)】不是字段
            （NetworkedPlayerInfo.set_PlayerName），真实数据在 Outfits 字典里，
