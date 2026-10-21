@@ -51,32 +51,56 @@ open(p, "w").write(s)
 print("已保留 JIT + interpreter（原本被 Godot 的 iOS 设备模板砍掉）")
 PY
 
-echo "=== [3b/5] iOS 特有问题：aot-compiler.c 用了 system() ==="
-# iOS SDK 把 system() 标成 unavailable，而 mono/mini/aot-compiler.c 会调它
-# （全 AOT 时用来起外部汇编器）。我们走 JIT/解释器，AOT 编译器完全用不到，
-# 所以在这个文件里把 system() 用宏桩掉 —— 只在 HOST_IOS 下生效，不影响别的平台。
+echo "=== [3b/5] iOS 特有问题：Mono 多处调用了 system() ==="
+# iOS SDK 把 system() 标成 unavailable。Mono 里调它的地方不止一处
+# （已实测：mono/mini/aot-compiler.c、mono/mini/graph.c，都是起外部工具用的），
+# 所以我们走 JIT/解释器根本不需要这些路径 —— 统一在 HOST_IOS 下把 system() 桩掉。
+#
+# 注意：不能用全局 -Dsystem(cmd)=(-1)。那样会连 stdlib.h 里的
+#   int system(const char *) __DARWIN_ALIAS_C(system);
+# 声明一起被宏改写，直接语法错误。必须在每个文件的 #include 之后插入才安全。
 python3 - "$WORK/mono" <<'PY'
-import sys, os
+import sys, os, re
+
 src = sys.argv[1]
-p = os.path.join(src, "mono/mini/aot-compiler.c")
-lines = open(p).read().split("\n")
-idx = None
-for i, l in enumerate(lines[:300]):
-    if l.lstrip().startswith("#include"):
-        idx = i
-if idx is None:
-    sys.exit("!! aot-compiler.c 里没找到 #include，无法定位插入点")
+call_re = re.compile(r'\bsystem\s*\(')
 guard = [
     "",
     "#if defined(HOST_IOS)",
-    "/* iOS 没有 system()（SDK 标为 unavailable）。我们走 JIT/解释器，",
-    "   AOT 编译器用不到，用桩顶掉，避免编译失败。 */",
+    "/* iOS 没有 system()（SDK 标为 unavailable）。",
+    "   我们走 JIT/解释器，这些起外部工具的路径用不到，用桩顶掉。 */",
     "#define system(cmd) (-1)",
     "#endif",
 ]
-lines[idx + 1:idx + 1] = guard
-open(p, "w").write("\n".join(lines))
-print("已在 aot-compiler.c 注入 HOST_IOS 下的 system() 桩")
+
+patched = []
+for root, dirs, files in os.walk(os.path.join(src, "mono")):
+    for fn in files:
+        if not fn.endswith(".c"):
+            continue
+        p = os.path.join(root, fn)
+        try:
+            text = open(p, encoding="utf-8", errors="ignore").read()
+        except Exception:
+            continue
+        if not call_re.search(text):
+            continue
+        if "HOST_IOS" in text and "#define system(cmd) (-1)" in text:
+            continue          # 已打过
+        lines = text.split("\n")
+        idx = None
+        for i, l in enumerate(lines[:400]):
+            if l.lstrip().startswith("#include"):
+                idx = i
+        if idx is None:
+            print("  跳过(找不到 #include):", p); continue
+        lines[idx + 1:idx + 1] = guard
+        open(p, "w", encoding="utf-8").write("\n".join(lines))
+        patched.append(os.path.relpath(p, src))
+
+print("已在 %d 个文件注入 HOST_IOS 下的 system() 桩:" % len(patched))
+for p in patched:
+    print("   ", p)
 PY
 
 echo "=== [4/5] 构建 iOS arm64 运行时 ==="
