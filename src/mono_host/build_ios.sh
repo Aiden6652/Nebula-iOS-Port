@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# 交叉编译宿主 dylib → iOS arm64
+#
+# 用法: bash src/mono_host/build_ios.sh <Mono-iOS-安装前缀>
+#
+# 产物: out-ios/libnebula_mono_host.dylib
+#   带 BUILD_AS_LIB → 挂 __attribute__((constructor))，被游戏 dlopen 后
+#   自动 pthread 异步 boot Mono（绝不能在 constructor 里同步初始化，会撞加载器锁死锁）。
+#
+# 注意: macOS 自带 /bin/bash 是 3.2，没有 mapfile/readarray，所以用 while-read 建数组。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MONO_PREFIX="${1:-$HOME/mono-installs}"
+OUT="${OUT:-$ROOT/out-ios}"
+MIN_IOS="${MIN_IOS:-13.0}"
+
+SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+CCBIN="$(xcrun --sdk iphoneos -f clang)"
+
+echo "SDK: $SDK"
+echo "CC : $CCBIN"
+mkdir -p "$OUT"
+
+# 定位 Mono 头文件目录（找到 .../include/mono，再往上取 include）
+MONO_INC_DIR="$(find "$MONO_PREFIX" -type d -name mono -path "*include*" 2>/dev/null | head -1 || true)"
+if [ -z "$MONO_INC_DIR" ]; then
+  echo "!! 没找到 Mono include 目录，检查 $MONO_PREFIX" >&2
+  find "$MONO_PREFIX" -maxdepth 3 2>/dev/null | head -30 >&2 || true
+  exit 1
+fi
+MONO_INC="$(dirname "$MONO_INC_DIR")"
+echo "MONO_INC: $MONO_INC"
+
+# 收集全部静态库。Mono 不会只出一个 .a，而是拆成好几个：
+#   libmonosgen-2.0 / libmono-native / libmono-ee-interp / libmono-ilgen / libmono-icall-table ...
+# 少链任何一个都会在链接期报缺符号，所以全链上。
+LIBS=()
+while IFS= read -r line; do
+  [ -n "$line" ] && LIBS+=("$line")
+done < <(find "$MONO_PREFIX" -name "*.a" 2>/dev/null)
+
+echo "静态库 ${#LIBS[@]} 个:"
+printf '  %s\n' "${LIBS[@]}"
+
+if [ "${#LIBS[@]}" -eq 0 ]; then
+  echo "!! 没找到 Mono 静态库，检查 $MONO_PREFIX" >&2
+  exit 1
+fi
+
+echo "=== 编译 iOS arm64 dylib ==="
+"$CCBIN" -arch arm64 \
+  -isysroot "$SDK" \
+  -miphoneos-version-min="$MIN_IOS" \
+  -dynamiclib -fPIC \
+  -DBUILD_AS_LIB \
+  -I"$MONO_INC" \
+  -o "$OUT/libnebula_mono_host.dylib" \
+  "$ROOT/nebula_mono_host.c" \
+  "${LIBS[@]}" \
+  -framework CoreFoundation \
+  -lobjc -lc++ -lpthread -lz -lm
+
+echo "=== 校验 ==="
+lipo -info "$OUT/libnebula_mono_host.dylib"
+file "$OUT/libnebula_mono_host.dylib" 2>/dev/null || true
+echo "--- 导出符号(前 20) ---"
+nm -gU "$OUT/libnebula_mono_host.dylib" 2>/dev/null | head -20 || true
+
+echo "OK -> $OUT/libnebula_mono_host.dylib"
