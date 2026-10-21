@@ -35,12 +35,15 @@ echo "MONO_INC: $MONO_INC"
 # 收集全部静态库。Mono 不会只出一个 .a，而是拆成好几个：
 #   libmonosgen-2.0 / libmono-native / libmono-ee-interp / libmono-ilgen / libmono-icall-table ...
 # 少链任何一个都会在链接期报缺符号，所以全链上。
-# 排除 libmono-component-*（diagnostics_tracing / debugger / hot_reload 等可选组件，
-# 全链进来容易互相撞符号，而且我们用不到）
+# 注意：不能把 libmono-component-* 全排除。libmonosgen 的 components.c 会引用
+#   mono_component_debugger_init / diagnostics_server_init / event_pipe_init /
+#   hot_reload_init / marshal_ilgen_init
+# 少一个就 Undefined symbol。
+# 唯一可以省的是 debugger：有 stub 版（0.06MB）顶替完整版（1.32MB），二选一。
 LIBS=()
 while IFS= read -r line; do
   case "$(basename "$line")" in
-    libmono-component-*) continue ;;
+    libmono-component-debugger-static.a) continue ;;  # 用 stub 版
   esac
   [ -n "$line" ] && LIBS+=("$line")
 done < <(find "$MONO_PREFIX" -name "*.a" 2>/dev/null)
@@ -63,7 +66,9 @@ echo "=== 编译 iOS arm64 dylib ==="
   -o "$OUT/libnebula_mono_host.dylib" \
   "$ROOT/nebula_mono_host.c" \
   "${LIBS[@]}" \
+  -framework Foundation \
   -framework CoreFoundation \
+  -framework Security \
   -lobjc -lc++ -lpthread -lz -lm
 
 # 把 MonoVM 的 BCL 一并拷到产物目录，打包时能整包带走。
