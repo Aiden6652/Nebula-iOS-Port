@@ -1,68 +1,108 @@
 # iOS 内存预算：全量 NOS 防 OOM
 
-> 目标：把**全量 NOS**（星云舰 + 28 个 Addons）塞进 iOS，且在**没有 `increased-memory-limit` 权限**的设备上不被 jetsam 杀掉。
+> **硬约束：28 个 Addons 必须全部加载** —— 职业定义就写在 addon 的脚本里，漏一个就玩不了。
+> 所以省内存不能靠"少加载 addon"，只能从别处省。
 > 本文所有体积数据来自对 PC 改装包 `星云3413.zip` 的实测清点。
 
-## 1. 实测：全量 NOS 到底多重
+## 1. 两个版本
 
-| 组成 | 体积 | 备注 |
+| | **Standard** | **Pro** |
 |---|---|---|
-| `BepInEx/interop/` | **50.2 MB** | Il2CppInterop 生成的 unhollowed 包装层 |
-| `BepInEx/nebula/Nebula.dll` | **32.4 MB** | 星云舰本体 |
-| `NebulaLibs/` | **17.1 MB** | 含 Roslyn（`Microsoft.CodeAnalysis.CSharp.dll` 6.6 MB）+ `Interstellar.dll` 6.4 MB |
-| `Addons/` | **110 MB / 28 个** | 全是 zip：语言包、皮肤、贴图、脚本 |
-| `BepInEx/core/` | 6.2 MB | BepInEx 框架 |
-| `BepInEx/plugins/` | 0.2 MB | |
-| 游戏本体（GameAssembly/UnityPlayer/资源）| ~1.2 GB | **不属于我们**，但和我们一起抢内存 |
+| 运行模式 | `interp` 纯解释器 | `jit` 强制 JIT |
+| 需要 `dynamic-codesigning` | 否 | **是**（没有会直接崩）|
+| 需要 `increased-memory-limit` | 否 | **是**（软顶放到 512 MB）|
+| GC nursery | 16 MB | 32 MB |
+| RSS 软顶 | 320 MB | 512 MB |
+| 贴图长边上限 | 512 px | 1024 px |
+| 贴图 LRU 缓存 | 64 MB | 128 MB |
+| **目标帧率** | **锁 60 fps** | **不限制（0）** |
+| 掉帧自适应降画质 | 开 | 开 |
+| Addons | **全部加载** | **全部加载** |
+| Roslyn | 关（打包期预编译）| 关 |
 
-最大的几个 dll：`GameAssembly.dll` 45.6 MB → `Nebula.dll` 32.4 MB → `UnityPlayer.dll` 21.9 MB →
-`Assembly-CSharp.dll`(interop) 7.1 MB → `Microsoft.CodeAnalysis.CSharp.dll` 6.6 MB → `Interstellar.dll` 6.4 MB。
+选择方式：`NEBULA_PROFILE=standard`（默认）或 `pro`；也可用 `NEBULA_HOST_CFG=<路径>` 直接指定配置文件。
 
-**关键换算**：程序集加载成托管元数据后，常驻内存通常是文件大小的 **3～5 倍**。
-所以 50 MB 的 interop 实际可能占 150～250 MB，32 MB 的 Nebula.dll 占 100～160 MB。
+**为什么 Standard 用解释器**：解释器不需要"可写又可执行"的内存，因此不依赖任何权限，发给谁都能跑。JIT 快，但没权限的设备上直接崩——不能作为默认。
 
-## 2. iOS 的红线
+**为什么 Standard 锁 60 帧**：解释器比 JIT 慢，同样的算力摊到每一秒里，更容易出现"某几帧做不完"，表现就是卡顿。**锁帧是把"每秒的算力"换成"每帧的预算"**——把上限压住，每帧就有确定的时间窗，宁可稳定 60，也不要忽高忽低。Pro 走 JIT 够快，不需要这个妥协，直接放开让设备跑满。
 
-- 没 `com.apple.developer.kernel.increased-memory-limit` 时，进程被 jetsam 杀掉的阈值随设备 RAM 变化，大致是**几百 MB 到 1GB 出头**的量级。
-- AU 本体（IL2CPP + Unity，几十 MB 的 `GameAssembly` 加上资源）本身就要吃掉相当一部分。
-- **结论：给模组层的预算应压在 250～350 MB**，并且必须能降级。
+两版都保留 `render.adaptive = 1`：真掉帧时先降贴图分辨率、再压 LRU 缓存，而不是硬扛着掉帧。（自适应逻辑在托管侧实现，宿主只负责把配置透传成 `NEBULA_TARGET_FPS` / `NEBULA_ADAPTIVE`。）
 
-分发场景尤其如此——你自己能开大内存权限，不代表别人能。所以**默认配置按"最差的设备"来定**。
+## 2. 实测：全量 NOS 多重
 
-## 3. 预算分配（目标值，待真机校准）
-
-| 项目 | 预算 | 说明 |
+| 组成 | 体积 | 说明 |
 |---|---|---|
-| Mono 运行时 + BCL | ~60 MB | Godot 的 minimal 配置已砍掉 remoting/COM/appdomains/security 等，够瘦 |
-| interop 包装层（按需加载）| ~120 MB | 最大头，靠"按需"而不是"全量预载"压下来 |
-| Nebula.dll + Interstellar | ~100 MB | |
-| Addons（默认只开必要项）| ~50 MB | 28 个全开是 110 MB，**不能全开** |
-| JIT/解释器代码 + GC 堆 | ~50 MB | |
-| **合计目标** | **~350 MB** | 软顶设 320 MB，超了强制 GC |
+| `BepInEx/interop/` | 50.2 MB | Il2CppInterop 生成的 unhollowed 包装层 |
+| `BepInEx/nebula/Nebula.dll` | 32.4 MB | 星云舰本体 |
+| `NebulaLibs/` | 17.1 MB | 含 Roslyn 6.6 MB + `Interstellar.dll` 6.4 MB |
+| `Addons/` | 110 MB（压缩）／**123 MB（解压）** | 28 个 |
+| `BepInEx/core/` | 6.2 MB | 框架 |
 
-## 4. 六条硬规则
+### Addons 内部构成（这是关键）
 
-1. **绝不预加载。** Mono 默认是按需加载程序集的——别写循环去 `mono_assembly_open` 全部 interop dll。让引用驱动加载。
-2. **Addons 默认只开必要项。** 语言包（SCLangPack / Plan17Language）必开，皮肤/贴图/剧本类按需开。28 个全开 = 110 MB 起步，必炸。
-3. **Roslyn 只在"真的要编译 addon 脚本"时加载。** 更好的做法是**打包期在 PC 上把 addon 脚本预编译成 dll**，运行时根本不碰 Roslyn——省掉 6.6 MB 的文件和上百 MB 的编译期工作集峰值。
-4. **GC 调小 + RSS 软顶。** nursery 调小（默认可能偏大），并起一个看门狗线程采样 RSS，超软顶就 `mono_gc_collect()`。见 `nebula_host.cfg`。
-5. **不分发 PC 专用的东西。** `dotnet/`（CoreCLR，~40 MB）、`GameAssembly.dll`、`UnityPlayer.dll`、`EOSSDK` 一律不带——iOS 上要么用不上，要么本来就是游戏自带的。
-6. **JIT 不是默认项。** 没有 `dynamic-codesigning` 的设备上 JIT 直接崩。默认 `runtime.mode = interp`（解释器，不需要可执行内存、不需要权限，处处能跑），能开 JIT 的人自己改配置切 `jit` 换性能。
+| 类型 | 体积 | 数量 | 性质 |
+|---|---|---|---|
+| `.png` | **97.82 MB** | 2423 | **纯外观**（皮肤/帽子/印章/服装）|
+| `.zip`（嵌套资源包）| 10.06 MB | 1 | 资源 |
+| `.mp3` | 9.51 MB | 3 | 音频 |
+| `.cs` | **3.55 MB** | 266 | **职业逻辑 — 必须加载** |
+| `.dat` | 0.67 MB | 51 | |
+| `.dll` | **0.64 MB** | 7 | **必须加载** |
+| `.json` | 0.53 MB | 14 | |
+| `.bundle` | 0.49 MB | 2 | |
 
-## 5. 降级阶梯（内存不够时依次砍）
+**结论：职业逻辑全加起来只有 4.2 MB（`.cs` + `.dll`），外观资源却占了 117 MB（95%+）。**
 
-1. 关 Addons（保留语言包）→ 省 ~60 MB
-2. `runtime.mode` 从 `jit` 退回 `interp` → 省 JIT 代码缓存
-3. 关 addon 脚本编译（不加载 Roslyn）→ 省峰值 ~100 MB
-4. 砍 interop：只保留 Nebula 真正用到的程序集 → 省 ~80 MB
-5. 还不行就只保留星云舰核心，Addons 全关
+也就是说 ——**"addons 全部加载"和"防 OOM"根本不冲突**。全加载是必须的，而且很便宜；真正会撑爆内存的只有贴图。
 
-## 6. 待真机校准
+## 3. 为什么贴图才是杀手
 
-上面的预算是**估算**，不是实测。等 iOS 版跑起来后要在真机上量三件事再回填本表：
+97.82 MB 是 **png 压缩后**的体积。解码成 RGBA 常驻内存会放大好几倍：一张 2048×2048 的 RGBA 就是 16 MB，2423 张全解码是灾难。
+
+所以贴图三条铁律：
+
+1. **按需解码** —— 只有真正要显示的才解码，不做启动预载
+2. **降分辨率** —— 长边压到 512 px（Standard）／1024 px（Pro）
+3. **LRU 上限** —— 缓存 64 MB（Standard）／128 MB（Pro），超了淘汰最久未用的
+
+## 4. 预算表（Standard，目标值）
+
+| 项目 | 预算 |
+|---|---|
+| Mono 运行时 + BCL | ~60 MB（Godot minimal 已砍掉 remoting/COM/appdomains/security）|
+| interop 包装层（引用驱动，不预载）| ~120 MB |
+| `Nebula.dll` + `Interstellar.dll` | ~100 MB |
+| Addons 职业逻辑（**全量**）| ~15 MB |
+| 贴图 LRU 常驻 | 64 MB（硬上限）|
+| 解释器 + GC 堆 | ~50 MB |
+| **合计** | **~350 MB**（软顶设 320 MB）|
+
+## 5. 硬规则
+
+1. **Addons 全加载**（职业）——不可协商，别为了省内存去砍。
+2. **贴图按需解码 + 降分辨率 + LRU 上限** —— 这是唯一的大头杠杆。
+3. **音频按需**：9.5 MB 的 `.mp3` 不预载。
+4. **嵌套 zip 按需解包**：`Plana's CustomAchievementsLoad` 里那个 10 MB 的嵌套包不要启动就展开。
+5. **Roslyn 关**：addon 脚本在打包期于 PC 上预编译成 dll，运行时不加载 Roslyn（省上百 MB 编译峰值）。
+6. **interop 不预载**：让程序集引用驱动加载，别循环 `mono_assembly_open` 全部包装层。
+7. **不带 PC 专用件**：`dotnet/`（CoreCLR ~40 MB）、`GameAssembly.dll`、`UnityPlayer.dll` 一律剔除。
+8. **RSS 看门狗**：采样 RSS，超软顶就 `mono_gc_collect()`。
+
+## 6. 降级阶梯（内存仍不够时，按顺序砍）
+
+1. 贴图：上限 512→256 px，LRU 64→32 MB → 省 ~35 MB
+2. 音频彻底不加载 → 省 ~10 MB
+3. interop 只保留实际被引用到的程序集 → 省 ~80 MB
+4. 以上都做了还不行 → 该设备确实跑不动全量 NOS，只能提示用户改用精简 addon 组合
+
+注意：**第 4 步是最后手段**。职业在 addon 里，砍 addon 等于砍玩法。
+
+## 7. 待真机校准
+
+上面全是**估算**，不是实测。iOS 版跑起来后要量三个数回填：
 
 - Mono 初始化完成后的基线 RSS
-- BepInEx + Nebula 加载完的 RSS
-- 逐个开启 Addon 的增量 RSS
+- BepInEx + Nebula + 全部 addon 职业逻辑加载完的 RSS
+- 贴图 LRU 打满时的峰值 RSS
 
-校准完把软顶 `gc.soft_limit_mb` 调到"实测峰值 + 20% 余量"。
+校准完把 `gc.soft_limit_mb` 设成"实测峰值 + 20% 余量"。

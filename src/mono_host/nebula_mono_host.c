@@ -38,14 +38,29 @@ typedef struct {
     int  gc_nursery_mb;
     int  gc_soft_limit_mb;
     int  gc_watchdog_interval_ms;
+    char addons_mode[16];       // all（默认，职业在 addon 里，必须全加载）
+    int  addons_texture_max_px; // 贴图降分辨率上限（长边像素）
+    int  addons_texture_cache_mb; // 贴图 LRU 缓存上限
+    int  addons_audio_lazy;     // 音频按需加载
+    int  roslyn_enabled;        // 运行时是否加载 Roslyn 编译 addon 脚本
+    int  render_target_fps;     // 目标帧率；0 = 不限制
+    int  render_adaptive;       // 掉帧时自动降画质（降贴图分辨率/LRU）
 } host_cfg;
 
-// 默认值就是"最差设备"档：解释器 + 小 nursery + 320MB 软顶
+// 内置默认值 = Standard 档（纯解释器 + 小 nursery + 320MB 软顶）。
+// 配置文件的 standard / pro 两套预设会覆盖它。
 static host_cfg CFG = {
     .runtime_mode = "interp",
     .gc_nursery_mb = 16,
     .gc_soft_limit_mb = 320,
     .gc_watchdog_interval_ms = 2000,
+    .addons_mode = "all",
+    .addons_texture_max_px = 512,
+    .addons_texture_cache_mb = 64,
+    .addons_audio_lazy = 1,
+    .roslyn_enabled = 0,
+    .render_target_fps = 60,
+    .render_adaptive = 1,
 };
 
 static char *trim(char *s) {
@@ -55,18 +70,33 @@ static char *trim(char *s) {
     return s;
 }
 
+// 两套预设：standard（纯解释器）/ pro（强制 JIT）。
+// 用 NEBULA_PROFILE 选；NEBULA_HOST_CFG 可直接指定文件路径，优先级最高。
 static void load_cfg(const char *dir) {
+    const char *profile = getenv("NEBULA_PROFILE");
+    if (!profile || !*profile) profile = "standard";
+
     char path[PATH_MAX];
     const char *envp = getenv("NEBULA_HOST_CFG");
-    if (envp && *envp) snprintf(path, sizeof(path), "%s", envp);
-    else               snprintf(path, sizeof(path), "%s/nebula_host.cfg", dir);
+    if (envp && *envp) {
+        snprintf(path, sizeof(path), "%s", envp);
+    } else {
+        snprintf(path, sizeof(path), "%s/nebula_host.%s.cfg", dir, profile);
+        FILE *probe = fopen(path, "r");
+        if (!probe) {
+            // 预设文件不在就退回通用名
+            snprintf(path, sizeof(path), "%s/nebula_host.cfg", dir);
+        } else {
+            fclose(probe);
+        }
+    }
 
     FILE *f = fopen(path, "r");
     if (!f) {
-        printf("[host] 未找到 cfg(%s)，用默认值\n", path);
+        printf("[host] 未找到 cfg(profile=%s, 试过 %s)，用内置默认值(standard)\n", profile, path);
         return;
     }
-    printf("[host] load cfg: %s\n", path);
+    printf("[host] profile=%s cfg=%s\n", profile, path);
 
     char line[512];
     while (fgets(line, sizeof(line), f)) {
@@ -83,10 +113,33 @@ static void load_cfg(const char *dir) {
         else if (!strcmp(k, "gc.nursery_mb"))            CFG.gc_nursery_mb = atoi(v);
         else if (!strcmp(k, "gc.soft_limit_mb"))         CFG.gc_soft_limit_mb = atoi(v);
         else if (!strcmp(k, "gc.watchdog_interval_ms"))  CFG.gc_watchdog_interval_ms = atoi(v);
+        else if (!strcmp(k, "addons.mode"))              snprintf(CFG.addons_mode, sizeof(CFG.addons_mode), "%s", v);
+        else if (!strcmp(k, "addons.texture_max_px"))    CFG.addons_texture_max_px = atoi(v);
+        else if (!strcmp(k, "addons.texture_cache_mb"))   CFG.addons_texture_cache_mb = atoi(v);
+        else if (!strcmp(k, "addons.audio_lazy"))        CFG.addons_audio_lazy = atoi(v);
+        else if (!strcmp(k, "roslyn.enabled"))           CFG.roslyn_enabled = atoi(v);
+        else if (!strcmp(k, "render.target_fps"))        CFG.render_target_fps = atoi(v);
+        else if (!strcmp(k, "render.adaptive"))          CFG.render_adaptive = atoi(v);
     }
     fclose(f);
-    printf("[host] cfg: mode=%s nursery=%dMB soft_limit=%dMB interval=%dms\n",
-           CFG.runtime_mode, CFG.gc_nursery_mb, CFG.gc_soft_limit_mb, CFG.gc_watchdog_interval_ms);
+
+    // 透传给托管侧（Engine/BepInEx 那边直接读环境变量，省得再解析一遍文件）
+    char buf[32];
+    setenv("NEBULA_ADDONS_MODE", CFG.addons_mode, 1);
+    snprintf(buf, sizeof(buf), "%d", CFG.addons_texture_max_px);   setenv("NEBULA_TEXTURE_MAX_PX", buf, 1);
+    snprintf(buf, sizeof(buf), "%d", CFG.addons_texture_cache_mb); setenv("NEBULA_TEXTURE_CACHE_MB", buf, 1);
+    snprintf(buf, sizeof(buf), "%d", CFG.roslyn_enabled);          setenv("NEBULA_ROSLYN", buf, 1);
+    snprintf(buf, sizeof(buf), "%d", CFG.render_target_fps);       setenv("NEBULA_TARGET_FPS", buf, 1);
+    snprintf(buf, sizeof(buf), "%d", CFG.render_adaptive);         setenv("NEBULA_ADAPTIVE", buf, 1);
+
+    printf("[host] cfg: mode=%s nursery=%dMB soft_limit=%dMB interval=%dms | addons=%s 贴图≤%dpx 贴图缓存%dMB audio_lazy=%d roslyn=%d\n",
+           CFG.runtime_mode, CFG.gc_nursery_mb, CFG.gc_soft_limit_mb, CFG.gc_watchdog_interval_ms,
+           CFG.addons_mode, CFG.addons_texture_max_px, CFG.addons_texture_cache_mb,
+           CFG.addons_audio_lazy, CFG.roslyn_enabled);
+    if (CFG.render_target_fps > 0)
+        printf("[host] cfg: 目标帧率=%d fps, adaptive=%d\n", CFG.render_target_fps, CFG.render_adaptive);
+    else
+        printf("[host] cfg: 目标帧率=不限制, adaptive=%d\n", CFG.render_adaptive);
 }
 
 // 必须在 mono_jit_init 之前调用才生效
