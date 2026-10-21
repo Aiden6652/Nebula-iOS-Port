@@ -35,8 +35,13 @@ echo "MONO_INC: $MONO_INC"
 # 收集全部静态库。Mono 不会只出一个 .a，而是拆成好几个：
 #   libmonosgen-2.0 / libmono-native / libmono-ee-interp / libmono-ilgen / libmono-icall-table ...
 # 少链任何一个都会在链接期报缺符号，所以全链上。
+# 排除 libmono-component-*（diagnostics_tracing / debugger / hot_reload 等可选组件，
+# 全链进来容易互相撞符号，而且我们用不到）
 LIBS=()
 while IFS= read -r line; do
+  case "$(basename "$line")" in
+    libmono-component-*) continue ;;
+  esac
   [ -n "$line" ] && LIBS+=("$line")
 done < <(find "$MONO_PREFIX" -name "*.a" 2>/dev/null)
 
@@ -60,6 +65,17 @@ echo "=== 编译 iOS arm64 dylib ==="
   "${LIBS[@]}" \
   -framework CoreFoundation \
   -lobjc -lc++ -lpthread -lz -lm
+
+# 把 MonoVM 的 BCL 一并拷到产物目录，打包时能整包带走。
+# 运行时需要让 Mono 找得到它们：MONO_PATH 指向 bcl/ 与 bcl/ 的 CoreLib 所在处。
+if [ -d "$MONO_PREFIX/lib/net8.0" ]; then
+  echo "=== 拷贝 .NET 8 BCL ==="
+  mkdir -p "$OUT/bcl"
+  cp -R "$MONO_PREFIX/lib/net8.0/." "$OUT/bcl/"
+  [ -f "$MONO_PREFIX/native/System.Private.CoreLib.dll" ] \
+    && cp "$MONO_PREFIX/native/System.Private.CoreLib.dll" "$OUT/bcl/"
+  echo "    BCL 程序集 $(ls "$OUT/bcl" | wc -l) 个"
+fi
 
 echo "=== 校验 ==="
 lipo -info "$OUT/libnebula_mono_host.dylib"
