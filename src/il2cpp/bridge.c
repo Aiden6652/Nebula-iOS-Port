@@ -622,6 +622,46 @@ int nebula_il2cpp_get_player_name(void *info_obj, char *out, size_t osz)
     return o > 0 ? 0 : -1;
 }
 
+/* 读房间人数：GameData.get_PlayerCount */
+int nebula_il2cpp_player_count(void)
+{
+    void *klass = nebula_il2cpp_find_class_by_hint("GameData");
+    if (!klass) return -1;
+    void *inst[4];
+    if (nebula_il2cpp_get_instances(klass, inst, 4) <= 0) return -1;
+    int n = -1;
+    if (nebula_il2cpp_call_int(inst[0], "get_PlayerCount", &n) != 0) return -1;
+    return n;
+}
+
+/* ★ 兜底：直接把房间人数压到 n。
+   只在 AddDummy 加进去却【不让人头增加】时才走这里 ——
+   那种情况下游戏仍认为房里只有你一个，靠补人是开不了局的。
+   做法：改 GameData.AllPlayers 这个 List 的 _size 字段（偏移 0x18），
+   改完立刻复查；不生效就回滚，绝不留下写坏的计数。 */
+int nebula_il2cpp_force_player_count(int n)
+{
+    if (n < 1) return -1;
+    void *klass = nebula_il2cpp_find_class_by_hint("GameData");
+    if (!klass) return -1;
+    void *inst[4];
+    if (nebula_il2cpp_get_instances(klass, inst, 4) <= 0) return -1;
+
+    ptrdiff_t all_off = -1;
+    if (nebula_il2cpp_find_field(klass, "AllPlayers", &all_off) != 0) return -1;
+    void *list = *(void **)((char *)inst[0] + all_off);
+    if (!list) return -1;
+
+    int32_t *psize = (int32_t *)((char *)list + 0x18);
+    int32_t old = *psize;
+    *psize = (int32_t)n;
+
+    int now = -1;
+    nebula_il2cpp_call_int(inst[0], "get_PlayerCount", &now);
+    if (now != n) { *psize = old; return -1; }     /* 不生效 → 回滚 */
+    return 0;
+}
+
 /* ★ 自由模式：把【开局最小人数】从 4 压到 1。
    原版 GameStartManager 要求房间里至少 4 个人才能按开始 ——
    这是"开了自由模式也启动不了"的直接原因（一个人永远凑不够 4）。
@@ -1173,10 +1213,37 @@ int nebula_il2cpp_apply_roles(void)
         nebula_log("freeplay: 切换试用职业 -> %s", rn ? rn : "?");
     }
 
+    /* ★ 本地玩家（自己）：只有自己的名字显示职业，
+       否则开会时所有人的职业全被暴露（真机反馈）。 */
+    static void *g_local = NULL; static int g_local_tried = 0;
+    if (!g_local_tried) {
+        g_local_tried = 1;
+        if (klass) static_field_ptr(klass, "LocalPlayer", &g_local);
+    }
+
+    /* ★ 职业分配锁定：给某个玩家分了职业就固定下来。
+       之前每轮都重算（受轮换 cursor 影响），于是名字还写着旧职业、
+       底层 RoleType 却已变成新的 —— 真机表现就是"显示的职业是错的"。 */
+    static void *g_pc[16]; static int g_rid[16]; static int g_n = 0;
+
     int applied = 0;
     for (int i = 0; i < n; i++) {
-        /* 自由模式下：0 号（自己）拿固定/轮换的职业，其余按清单排 */
-        int rid = nebula_freeplay_role(i, roster, roster_n);
+        /* 找到这个玩家的固定槽位（按对象指针，不受顺序变化影响） */
+        int slot = -1;
+        for (int k = 0; k < g_n; k++) if (g_pc[k] == insts[i]) { slot = k; break; }
+        if (slot < 0 && g_n < 16) { slot = g_n++; g_pc[slot] = insts[i]; g_rid[slot] = -1; }
+
+        int is_me = g_local ? (insts[i] == g_local) : (i == 0);
+        int rid;
+        if (is_me && nebula_freeplay_enabled()) {
+            rid = nebula_freeplay_role(0, roster, roster_n);   /* 自己：可固定/轮换 */
+            if (slot >= 0) g_rid[slot] = rid;                  /* 同步保存，保持名字与底层一致 */
+        } else if (slot >= 0 && g_rid[slot] >= 0) {
+            rid = g_rid[slot];                                 /* 已分配 → 不再变 */
+        } else {
+            rid = nebula_freeplay_role(i, roster, roster_n);
+            if (slot >= 0) g_rid[slot] = rid;
+        }
         if (rid < 0) continue;
         const char *rname = nebula_role_name(rid);
         nebula_team_t team = nebula_role_team(rid);
@@ -1226,10 +1293,20 @@ int nebula_il2cpp_apply_roles(void)
         /* 名字：新版 AU 的 PlayerName 是【属性(方法)】不是字段
            （NetworkedPlayerInfo.set_PlayerName），真实数据在 Outfits 字典里，
            所以必须用方法调用写入，不能靠字段偏移。 */
-        /* 自由模式下强制显示职业名（用户要靠它确认试的是哪个职业）；
-           但【大厅除外】—— 没开局就亮职业是剧透（真机已证实此 bug）。 */
-        int show_name = !in_lobby() &&
+        /* ★ 只给【自己】显示职业名：开会时别人的职业不能暴露给用户看。
+           自由模式下强制显示（要靠它确认试的是哪个职业），但大厅除外。 */
+        int show_name = is_me && !in_lobby() &&
                         (nebula_freeplay_enabled() || !nebula_flag_file("nebula_no_name.txt"));
+        if (!show_name && info) {
+            /* 别人：如果之前被写过前缀，还原成原名 */
+            char cur2[192]; cur2[0] = 0;
+            if (name_off >= 0) nebula_il2cpp_get_string_by(info, name_off, cur2, sizeof(cur2));
+            if (!cur2[0]) nebula_il2cpp_get_player_name(info, cur2, sizeof(cur2));
+            if (strchr(cur2, '\n')) {
+                const char *base2 = strrchr(cur2, '\n') + 1;
+                nebula_il2cpp_set_player_name(info, base2);
+            }
+        }
         if (info && show_name) {
             char cur[192]; cur[0] = 0;
             if (name_off >= 0) nebula_il2cpp_get_string_by(info, name_off, cur, sizeof(cur));

@@ -87,6 +87,12 @@ int  nebula_il2cpp_set_string_by(void *obj, ptrdiff_t off, const char *utf8);
    用于调原版自带的 GameData.AddDummy —— 自由模式靠它补齐房间人数。 */
 int  nebula_il2cpp_call_void(void *obj, const char *method);
 
+/* 手动加一个假人（自由模式凑人数），返回当前房间人数；-1=失败 */
+int  nebula_il2cpp_add_dummy(void);
+
+/* 读房间人数（GameData.get_PlayerCount）；-1=取不到 */
+int  nebula_il2cpp_player_count(void);
+
 /* 调用无参方法并取 int 返回值（如 GameData.get_PlayerCount） */
 int  nebula_il2cpp_call_int(void *obj, const char *method, int *out);
 

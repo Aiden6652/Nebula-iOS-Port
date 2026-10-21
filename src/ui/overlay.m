@@ -43,6 +43,19 @@ static UILabel *g_cur_label = nil;              /* 顶部：当前编辑的主�
 
 @interface NebulaPanelCtl : NSObject
 - (void)onToggle:(id)sender;     /* 悬浮按钮：打开/收起面板 */
+/* 「+假人」：点一次加一个；若 AddDummy 不涨人头，自动走强制人数兜底 */
+- (void)onAddDummy:(id)sender
+{
+    (void)sender;
+    @try {
+        int n = nebula_ui_add_dummy();
+        nebula_log("面板：+假人 → 房间人数=%d", n);
+        [self refreshAll];
+    } @catch (NSException *e) {
+        nebula_log("面板：加假人异常 %s", [[e reason] UTF8String]);
+    }
+}
+
 - (void)onNextRole:(id)sender;   /* 换职业 */
 - (void)onFreeplay:(id)sender;   /* 自由模式开关 */
 - (void)onMinus:(id)sender;      /* 权重 -1 */
@@ -51,6 +64,7 @@ static UILabel *g_cur_label = nil;              /* 顶部：当前编辑的主�
 - (void)refreshRow:(int)idx;
 - (void)onSub:(id)sender;
 - (void)onPickMain:(id)sender;
+- (void)onAddDummy:(id)sender;
 - (void)refreshAll;
 @end
 
@@ -319,6 +333,17 @@ static void build_panel(UIWindow *win)
     g_cur_label.textColor = [UIColor yellowColor];
     g_cur_label.font = [UIFont systemFontOfSize:12];
     [bar addSubview:g_cur_label];
+
+    /* 「+假人」：点一次进一个，凑到 4 人就能开局 */
+    UIButton *addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    addBtn.frame = CGRectMake(pw - 148, 36, 68, 31);
+    [addBtn setTitle:@"+假人" forState:UIControlStateNormal];
+    addBtn.layer.borderWidth = 1;
+    addBtn.layer.borderColor = [UIColor whiteColor].CGColor;
+    addBtn.layer.cornerRadius = 6;
+    [addBtn addTarget:ctl action:@selector(onAddDummy:)
+        forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:addBtn];
 
     [panel addSubview:bar];
 

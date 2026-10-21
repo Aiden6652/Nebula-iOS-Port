@@ -102,6 +102,9 @@ int nebula_ui_role_is_allowed(int idx) { return nebula_subrole_is_allowed(idx); 
 
 int nebula_ui_sub_count(void) { return nebula_subrole_count(); }
 
+int nebula_ui_add_dummy(void)    { return nebula_il2cpp_add_dummy(); }
+int nebula_ui_player_count(void) { return nebula_il2cpp_player_count(); }
+
 int nebula_ui_freeplay_on(void) { return nebula_freeplay_enabled(); }
 
 void nebula_ui_set_freeplay(int on)

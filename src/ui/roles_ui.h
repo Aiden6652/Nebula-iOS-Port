@@ -32,6 +32,11 @@ int  nebula_ui_role_is_allowed(int idx);   /* 是否在原版附加能力清单�
 void nebula_ui_role_toggle_sub(int idx);
 int  nebula_ui_sub_count(void);
 
+/* 手动加一个假人（点一次进一个，凑到 4 就能开局），返回当前人数 */
+int  nebula_ui_add_dummy(void);
+/* 当前房间人数；-1=取不到 */
+int  nebula_ui_player_count(void);
+
 /* —— 自由模式开关（面板顶部的开关按钮） —— */
 int  nebula_ui_freeplay_on(void);
 void nebula_ui_set_freeplay(int on);
