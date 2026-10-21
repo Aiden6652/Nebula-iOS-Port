@@ -43,19 +43,6 @@ static UILabel *g_cur_label = nil;              /* 顶部：当前编辑的主�
 
 @interface NebulaPanelCtl : NSObject
 - (void)onToggle:(id)sender;     /* 悬浮按钮：打开/收起面板 */
-/* 「+假人」：点一次加一个；若 AddDummy 不涨人头，自动走强制人数兜底 */
-- (void)onAddDummy:(id)sender
-{
-    (void)sender;
-    @try {
-        int n = nebula_ui_add_dummy();
-        nebula_log("面板：+假人 → 房间人数=%d", n);
-        [self refreshAll];
-    } @catch (NSException *e) {
-        nebula_log("面板：加假人异常 %s", [[e reason] UTF8String]);
-    }
-}
-
 - (void)onNextRole:(id)sender;   /* 换职业 */
 - (void)onFreeplay:(id)sender;   /* 自由模式开关 */
 - (void)onMinus:(id)sender;      /* 权重 -1 */
@@ -190,6 +177,20 @@ static UILabel *g_cur_label = nil;              /* 顶部：当前编辑的主�
         [self refreshAll];
     } @catch (NSException *e) {
         nebula_log("面板：附加职业异常 %s", [[e reason] UTF8String]);
+    }
+}
+
+
+/* 「+假人」：点一次加一个；若 AddDummy 不涨人头，自动走强制人数兜底 */
+- (void)onAddDummy:(id)sender
+{
+    (void)sender;
+    @try {
+        int n = nebula_ui_add_dummy();
+        nebula_log("面板：+假人 → 房间人数=%d", n);
+        [self refreshAll];
+    } @catch (NSException *e) {
+        nebula_log("面板：加假人异常 %s", [[e reason] UTF8String]);
     }
 }
 
