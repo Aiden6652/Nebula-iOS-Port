@@ -110,8 +110,13 @@ file "$OUT/libnebula_mono_host.dylib" 2>/dev/null || true
 
 echo "--- 关键符号检查（证明 MonoVM 真的链进来了）---"
 SYMS="$(nm -gU "$OUT/libnebula_mono_host.dylib" 2>/dev/null || true)"
+# 用 case 做纯字符串匹配，不用 echo|grep —— grep -q 会提前关管道，
+# 在 pipefail 下会让 echo 报 Broken pipe 而把脚本判失败（产物本身没问题）。
 for s in mono_jit_init mono_domain_assembly_open mono_runtime_invoke mono_gc_collect; do
-  if echo "$SYMS" | grep -q "$s"; then echo "    ✓ $s"; else echo "    ✗ $s 缺失！"; MISSING=1; fi
+  case "$SYMS" in
+    *"$s"*) echo "    ✓ $s" ;;
+    *)      echo "    ✗ $s 缺失！"; MISSING=1 ;;
+  esac
 done
 [ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号，链接有问题" >&2; exit 1; }
 
