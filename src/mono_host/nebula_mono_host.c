@@ -1,28 +1,33 @@
-// Nebula iOS Port — Mono 嵌入宿主
-// 职责：在 AU 进程里初始化 Mono 运行时，加载 Engine.dll 并执行。
+// Nebula iOS Port — Mono/MonoVM 嵌入宿主
 //
-// 关键：构造器里必须异步 boot（pthread），绝不在 constructor/DllMain 同步初始化
-//       Mono —— 会与加载器锁死锁（CoreCLR POC 已踩过）。
+// 职责：在 AU(iOS/IL2CPP) 进程里初始化 Mono 运行时，然后把控制权交给 BepInEx：
+//   加载 BepInEx/core/BepInEx.Unity.IL2CPP.dll → 调 Doorstop.Entrypoint.Start()
+//   剩下的事（Il2CppInterop 绑定、chainloader、加载 plugins 里的 NebulaLoader → Nebula.dll）
+//   全部由 BepInEx 自己接管。
+//   入口格式是 doorstop_config.ini 里写死的：
+//     target_assembly = BepInEx\core\BepInEx.Unity.IL2CPP.dll
+//     entrypoint = static void Doorstop.Entrypoint.Start()
 //
-// 内存：跑全量 NOS（星云舰 + 28 个 Addons）在 iOS 上很容易被 jetsam 杀掉，
-//       而分发包不能假定用户有 increased-memory-limit 权限。所以这里做了三件事：
-//       1) 宿主配置 nebula_host.cfg（nursery 大小 / RSS 软顶 / 运行模式）
-//       2) 默认走解释器而不是 JIT（解释器不需要可执行内存权限）
-//       3) RSS 看门狗线程，超软顶就强制 GC
-//       详见 docs/ios-memory-budget.md
+// 两个必须遵守的约束：
+//   1) 构造器里必须异步 boot（pthread），绝不在 constructor/DllMain 同步初始化
+//      Mono —— 会与加载器锁死锁。
+//   2) 内存：全量 NOS 在 iOS 上很容易被 jetsam 杀，且分发包不能假定用户有
+//      increased-memory-limit。所以有 RSS 软顶看门狗 + 默认走解释器。
+//      详见 docs/ios-memory-budget.md
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
-#include <ctype.h>
 #include <dlfcn.h>
 #include <pthread.h>
 
 #include <mono/jit/jit.h>
 #include <mono/metadata/assembly.h>
-#include <mono/metadata/object.h>
+#include <mono/metadata/appdomain.h>   // mono_domain_assembly_open
+#include <mono/metadata/class.h>       // mono_class_from_name / mono_class_get_method_from_name
+#include <mono/metadata/object.h>      // mono_runtime_invoke
 #include <mono/metadata/mono-config.h>
 #include <mono/metadata/mono-gc.h>
 
@@ -38,17 +43,16 @@ typedef struct {
     int  gc_nursery_mb;
     int  gc_soft_limit_mb;
     int  gc_watchdog_interval_ms;
-    char addons_mode[16];       // all（默认，职业在 addon 里，必须全加载）
-    int  addons_texture_max_px; // 贴图降分辨率上限（长边像素）
-    int  addons_texture_cache_mb; // 贴图 LRU 缓存上限
-    int  addons_audio_lazy;     // 音频按需加载
-    int  roslyn_enabled;        // 运行时是否加载 Roslyn 编译 addon 脚本
-    int  render_target_fps;     // 目标帧率；0 = 不限制
-    int  render_adaptive;       // 掉帧时自动降画质（降贴图分辨率/LRU）
+    char addons_mode[16];       // all（职业在 addon 里，必须全加载）
+    int  addons_texture_max_px;
+    int  addons_texture_cache_mb;
+    int  addons_audio_lazy;
+    int  roslyn_enabled;
+    int  render_target_fps;     // 0 = 不限制
+    int  render_adaptive;
 } host_cfg;
 
-// 内置默认值 = Standard 档（纯解释器 + 小 nursery + 320MB 软顶）。
-// 配置文件的 standard / pro 两套预设会覆盖它。
+// 内置默认 = Standard 档
 static host_cfg CFG = {
     .runtime_mode = "interp",
     .gc_nursery_mb = 16,
@@ -70,8 +74,7 @@ static char *trim(char *s) {
     return s;
 }
 
-// 两套预设：standard（纯解释器）/ pro（强制 JIT）。
-// 用 NEBULA_PROFILE 选；NEBULA_HOST_CFG 可直接指定文件路径，优先级最高。
+// 两套预设：standard（纯解释器）/ pro（强制 JIT）
 static void load_cfg(const char *dir) {
     const char *profile = getenv("NEBULA_PROFILE");
     if (!profile || !*profile) profile = "standard";
@@ -83,17 +86,13 @@ static void load_cfg(const char *dir) {
     } else {
         snprintf(path, sizeof(path), "%s/nebula_host.%s.cfg", dir, profile);
         FILE *probe = fopen(path, "r");
-        if (!probe) {
-            // 预设文件不在就退回通用名
-            snprintf(path, sizeof(path), "%s/nebula_host.cfg", dir);
-        } else {
-            fclose(probe);
-        }
+        if (!probe) snprintf(path, sizeof(path), "%s/nebula_host.cfg", dir);
+        else fclose(probe);
     }
 
     FILE *f = fopen(path, "r");
     if (!f) {
-        printf("[host] 未找到 cfg(profile=%s, 试过 %s)，用内置默认值(standard)\n", profile, path);
+        printf("[host] 未找到 cfg(profile=%s)，用内置默认值(standard)\n", profile);
         return;
     }
     printf("[host] profile=%s cfg=%s\n", profile, path);
@@ -112,10 +111,10 @@ static void load_cfg(const char *dir) {
         if      (!strcmp(k, "runtime.mode"))             snprintf(CFG.runtime_mode, sizeof(CFG.runtime_mode), "%s", v);
         else if (!strcmp(k, "gc.nursery_mb"))            CFG.gc_nursery_mb = atoi(v);
         else if (!strcmp(k, "gc.soft_limit_mb"))         CFG.gc_soft_limit_mb = atoi(v);
-        else if (!strcmp(k, "gc.watchdog_interval_ms"))  CFG.gc_watchdog_interval_ms = atoi(v);
+        else if (!strcmp(k, "gc.watchdog_interval_ms"))   CFG.gc_watchdog_interval_ms = atoi(v);
         else if (!strcmp(k, "addons.mode"))              snprintf(CFG.addons_mode, sizeof(CFG.addons_mode), "%s", v);
         else if (!strcmp(k, "addons.texture_max_px"))    CFG.addons_texture_max_px = atoi(v);
-        else if (!strcmp(k, "addons.texture_cache_mb"))   CFG.addons_texture_cache_mb = atoi(v);
+        else if (!strcmp(k, "addons.texture_cache_mb"))  CFG.addons_texture_cache_mb = atoi(v);
         else if (!strcmp(k, "addons.audio_lazy"))        CFG.addons_audio_lazy = atoi(v);
         else if (!strcmp(k, "roslyn.enabled"))           CFG.roslyn_enabled = atoi(v);
         else if (!strcmp(k, "render.target_fps"))        CFG.render_target_fps = atoi(v);
@@ -123,7 +122,7 @@ static void load_cfg(const char *dir) {
     }
     fclose(f);
 
-    // 透传给托管侧（Engine/BepInEx 那边直接读环境变量，省得再解析一遍文件）
+    // 透传给托管侧（BepInEx/Nebula 那边直接读环境变量，省得再解析一遍文件）
     char buf[32];
     setenv("NEBULA_ADDONS_MODE", CFG.addons_mode, 1);
     snprintf(buf, sizeof(buf), "%d", CFG.addons_texture_max_px);   setenv("NEBULA_TEXTURE_MAX_PX", buf, 1);
@@ -132,14 +131,13 @@ static void load_cfg(const char *dir) {
     snprintf(buf, sizeof(buf), "%d", CFG.render_target_fps);       setenv("NEBULA_TARGET_FPS", buf, 1);
     snprintf(buf, sizeof(buf), "%d", CFG.render_adaptive);         setenv("NEBULA_ADAPTIVE", buf, 1);
 
-    printf("[host] cfg: mode=%s nursery=%dMB soft_limit=%dMB interval=%dms | addons=%s 贴图≤%dpx 贴图缓存%dMB audio_lazy=%d roslyn=%d\n",
-           CFG.runtime_mode, CFG.gc_nursery_mb, CFG.gc_soft_limit_mb, CFG.gc_watchdog_interval_ms,
-           CFG.addons_mode, CFG.addons_texture_max_px, CFG.addons_texture_cache_mb,
-           CFG.addons_audio_lazy, CFG.roslyn_enabled);
+    printf("[host] cfg: mode=%s nursery=%dMB soft_limit=%dMB | addons=%s 贴图≤%dpx 缓存%dMB roslyn=%d\n",
+           CFG.runtime_mode, CFG.gc_nursery_mb, CFG.gc_soft_limit_mb,
+           CFG.addons_mode, CFG.addons_texture_max_px, CFG.addons_texture_cache_mb, CFG.roslyn_enabled);
     if (CFG.render_target_fps > 0)
-        printf("[host] cfg: 目标帧率=%d fps, adaptive=%d\n", CFG.render_target_fps, CFG.render_adaptive);
+        printf("[host] cfg: 目标帧率=%d fps adaptive=%d\n", CFG.render_target_fps, CFG.render_adaptive);
     else
-        printf("[host] cfg: 目标帧率=不限制, adaptive=%d\n", CFG.render_adaptive);
+        printf("[host] cfg: 目标帧率=不限制 adaptive=%d\n", CFG.render_adaptive);
 }
 
 // 必须在 mono_jit_init 之前调用才生效
@@ -154,7 +152,7 @@ static void apply_gc_env(void) {
         setenv("MONO_ENV_OPTIONS", "--interp", 1);
         printf("[host] 运行模式=解释器(interp)，不需要可执行内存权限\n");
     } else if (!strcmp(CFG.runtime_mode, "jit")) {
-        printf("[host] 运行模式=JIT（要求进程带 dynamic-codesigning，否则会崩）\n");
+        printf("[host] 运行模式=JIT（要求 dynamic-codesigning，否则会崩）\n");
     }
 }
 
@@ -173,8 +171,7 @@ static long rss_mb(void) {
     long size = 0, resident = 0;
     if (fscanf(f, "%ld %ld", &size, &resident) != 2) { fclose(f); return -1; }
     fclose(f);
-    long ps = sysconf(_SC_PAGESIZE);
-    return (long)(resident * ps / (1024 * 1024));
+    return (long)(resident * sysconf(_SC_PAGESIZE) / (1024 * 1024));
 #endif
 }
 
@@ -201,7 +198,6 @@ static void start_watchdog(void) {
 
 // ---------------------------------------------------------------- 路径与 boot
 
-// 取当前模块（.so / 可执行）自身所在目录，保证 dylib 注入游戏后也能定位自己的文件。
 static char *module_dir(void) {
     Dl_info info;
     if (dladdr((void *)&module_dir, &info) && info.dli_fname) {
@@ -214,17 +210,92 @@ static char *module_dir(void) {
     return strdup(".");
 }
 
+// 组装 MONO_PATH：BCL + BepInEx 各目录，Mono 靠它解析程序集依赖
+static void setup_mono_path(const char *dir, const char *root) {
+    char bcl[PATH_MAX], core[PATH_MAX], interop[PATH_MAX], plugins[PATH_MAX];
+    char nebula[PATH_MAX], patchers[PATH_MAX], libs[PATH_MAX];
+    snprintf(bcl,      sizeof(bcl),      "%s/bcl", dir);
+    snprintf(core,     sizeof(core),     "%s/BepInEx/core", root);
+    snprintf(interop,  sizeof(interop),  "%s/BepInEx/interop", root);
+    snprintf(plugins,  sizeof(plugins),  "%s/BepInEx/plugins", root);
+    snprintf(nebula,   sizeof(nebula),   "%s/BepInEx/nebula", root);
+    snprintf(patchers, sizeof(patchers), "%s/BepInEx/patchers", root);
+    snprintf(libs,     sizeof(libs),     "%s/NebulaLibs", root);
+
+    const char *all[] = { dir, bcl, core, interop, plugins, nebula, patchers, libs };
+    char mp[8192]; mp[0] = '\0';
+    for (int i = 0; i < 8; i++) {
+        if (strlen(mp) + strlen(all[i]) + 2 >= sizeof(mp)) break;
+        if (mp[0]) strcat(mp, ":");
+        strcat(mp, all[i]);
+    }
+    setenv("MONO_PATH", mp, 1);
+    printf("[host] MONO_PATH=%s\n", mp);
+}
+
+// 正式路径：把控制权交给 BepInEx
+static int boot_bepinex(MonoDomain *domain, const char *root) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/BepInEx/core/BepInEx.Unity.IL2CPP.dll", root);
+
+    FILE *probe = fopen(path, "rb");
+    if (!probe) {
+        printf("[host] 未找到 BepInEx 入口: %s\n", path);
+        return 0;
+    }
+    fclose(probe);
+    printf("[host] 加载 BepInEx 入口: %s\n", path);
+
+    MonoAssembly *as = mono_domain_assembly_open(domain, path);
+    if (!as) { fprintf(stderr, "[host] 打开 BepInEx.Unity.IL2CPP.dll 失败\n"); return 0; }
+
+    MonoImage *img = mono_assembly_get_image(as);
+    MonoClass *klass = mono_class_from_name(img, "Doorstop", "Entrypoint");
+    if (!klass) { fprintf(stderr, "[host] 找不到 Doorstop.Entrypoint\n"); return 0; }
+
+    MonoMethod *start = mono_class_get_method_from_name(klass, "Start", 0);
+    if (!start) { fprintf(stderr, "[host] 找不到 Doorstop.Entrypoint.Start()\n"); return 0; }
+
+    printf("[host] 调用 Doorstop.Entrypoint.Start() —— 之后交给 BepInEx chainloader\n");
+    MonoObject *exc = NULL;
+    mono_runtime_invoke(start, NULL, NULL, &exc);
+    if (exc) { fprintf(stderr, "[host] !! Start() 抛出异常\n"); return 0; }
+    printf("[host] Start() 已返回，RSS=%ldMB\n", rss_mb());
+    return 1;
+}
+
+// 兜底/桌面验证路径：跑 Engine.dll 这个 POC（Roslyn 编译脚本并执行）
+static int boot_engine_poc(MonoDomain *domain, const char *dir) {
+    char engine[PATH_MAX];
+    snprintf(engine, sizeof(engine), "%s/Engine.dll", dir);
+
+    MonoAssembly *as = mono_domain_assembly_open(domain, engine);
+    if (!as) { fprintf(stderr, "[host] open %s failed\n", engine); return 0; }
+
+    MonoImage *img = mono_assembly_get_image(as);
+    MonoClass *klass = mono_class_from_name(img, "Engine", "Engine");
+    if (!klass) { fprintf(stderr, "[host] class Engine.Engine not found\n"); return 0; }
+
+    MonoMethod *main = mono_class_get_method_from_name(klass, "Main", 0);
+    if (!main) { fprintf(stderr, "[host] Engine.Main not found\n"); return 0; }
+    mono_runtime_invoke(main, NULL, NULL, NULL);
+    return 1;
+}
+
 static void *boot_thread(void *arg) {
     (void)arg;
     char *dir = module_dir();
     printf("[host] module dir = %s\n", dir);
 
-    // 读配置 + 在 mono_jit_init 之前把 GC/运行模式环境变量设好
+    // 游戏根目录（BepInEx 所在处）。iOS 上由注入方指定，默认用 dylib 同目录。
+    const char *root = getenv("NEBULA_GAME_DIR");
+    if (!root || !*root) root = dir;
+    printf("[host] game root = %s\n", root);
+
     load_cfg(dir);
     apply_gc_env();
+    setup_mono_path(dir, root);
 
-    // 仅当显式设置了 MONO_PREFIX（iOS 自定义 Mono 根）时才覆盖目录；
-    // 桌面测试留空，让 Mono 用默认安装路径找 mscorlib 等框架程序集。
     const char *prefix = getenv("MONO_PREFIX");
     if (prefix) {
         char cfg[PATH_MAX];
@@ -236,41 +307,17 @@ static void *boot_thread(void *arg) {
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { fprintf(stderr, "[host] mono_jit_init failed\n"); free(dir); return NULL; }
 
-    long base_rss = rss_mb();
-    printf("[host] Mono 就绪，基线 RSS = %ldMB\n", base_rss);
-
+    printf("[host] Mono 就绪，基线 RSS=%ldMB\n", rss_mb());
     start_watchdog();
 
-    char engine[PATH_MAX];
-    snprintf(engine, sizeof(engine), "%s/Engine.dll", dir);
-
-    MonoAssembly *assembly = mono_domain_assembly_open(domain, engine);
-    if (!assembly) {
-        fprintf(stderr, "[host] open %s failed\n", engine);
-        watchdog_run = 0;
-        mono_jit_cleanup(domain);
-        free(dir);
-        return NULL;
-    }
-
-    MonoImage *image = mono_assembly_get_image(assembly);
-    MonoClass *klass = mono_class_from_name(image, "Engine", "Engine");
-    if (!klass) {
-        fprintf(stderr, "[host] class Engine.Engine not found\n");
-        watchdog_run = 0;
-        mono_jit_cleanup(domain);
-        free(dir);
-        return NULL;
-    }
-
-    // 走 Main()：它读 script.cs.txt，用 Roslyn 编译，再由 Mono 执行。
-    MonoMethod *main = mono_class_get_method_from_name(klass, "Main", 0);
-    if (main) {
-        mono_runtime_invoke(main, NULL, NULL, NULL);
-        printf("[host] Engine 结束，RSS = %ldMB\n", rss_mb());
-    } else {
-        fprintf(stderr, "[host] Engine.Main not found\n");
-    }
+    // NEBULA_BOOT: bepinex | engine | auto（默认 auto：有 BepInEx 就走它）
+    const char *bm = getenv("NEBULA_BOOT");
+    int ok = 0;
+    if (!bm || !*bm || !strcmp(bm, "auto") || !strcmp(bm, "bepinex"))
+        ok = boot_bepinex(domain, root);
+    if (!ok && (!bm || !*bm || !strcmp(bm, "auto") || !strcmp(bm, "engine")))
+        ok = boot_engine_poc(domain, dir);
+    if (!ok) fprintf(stderr, "[host] !! 没有任何启动路径成功\n");
 
     watchdog_run = 0;
     mono_jit_cleanup(domain);
@@ -278,7 +325,6 @@ static void *boot_thread(void *arg) {
     return NULL;
 }
 
-// 异步启动：构造器立即返回，后台线程初始化 Mono（避免加载器锁死锁）。
 static void boot(void) {
     pthread_t t;
     pthread_create(&t, NULL, boot_thread, NULL);
