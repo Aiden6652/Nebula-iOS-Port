@@ -464,6 +464,21 @@ const void *GlobalizationResolveDllImport(const char *name)
     return NULL;
 }
 
+/* ---- 文件日志：真机拿不到 .ips 时，靠它定位崩在哪一步 ----
+   每条都 fflush，进程硬崩(SIGSEGV/SIGABRT)也能留下最后一行。 */
+#include <stdarg.h>
+static FILE *g_logfp = NULL;
+static void hlog(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (g_logfp) { vfprintf(g_logfp, fmt, ap); fputc('\n', g_logfp); fflush(g_logfp); }
+    va_end(ap);
+    va_start(ap, fmt);
+    vprintf(fmt, ap); fputc('\n', stdout); fflush(stdout);
+    va_end(ap);
+}
+
 static void *boot_thread(void *arg) {
     (void)arg;
     // 全球化：默认 invariant 模式，避免 iOS 上缺 icudt.dat 崩溃（游戏模组走 UTF-8，不受影响）。
@@ -482,9 +497,22 @@ static void *boot_thread(void *arg) {
     if (!root || !*root) root = dir;
     printf("[host] game root = %s\n", root);
 
+    {   // 日志写在游戏根目录：崩溃时看最后一行就知道死在哪一步
+        char logp[PATH_MAX];
+        snprintf(logp, sizeof(logp), "%s/nebula_host.log", root);
+        g_logfp = fopen(logp, "w");
+        hlog("[host] === boot start === log=%s", logp);
+        hlog("[host] module dir = %s", dir);
+    }
+
+    hlog("[host] step: load_cfg");
     load_cfg(dir);
+    hlog("[host] step: apply_gc_env");
     apply_gc_env();
+    hlog("[host] step: blob_load");
     blob_load();
+    hlog("[host] step: blob ok, assemblies=%d", g_n);
+    hlog("[host] step: setup_mono_path");
     setup_mono_path(dir, root);
 
     const char *prefix = getenv("MONO_PREFIX");
@@ -493,15 +521,19 @@ static void *boot_thread(void *arg) {
         snprintf(cfg, sizeof(cfg), "%s/etc", prefix);
         mono_set_dirs(prefix, cfg);
     }
+    hlog("[host] step: mono_config_parse");
     mono_config_parse(NULL);
 
+    // 崩在这里 = mono 运行时自身初始化问题（sdb trampoline 那类）
+    hlog("[host] step: mono_jit_init ...");
     MonoDomain *domain = mono_jit_init("NebulaHost");
-    if (!domain) { fprintf(stderr, "[host] mono_jit_init failed\n"); free(dir); return NULL; }
+    if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
+    hlog("[host] step: mono_jit_init OK");
 
     // 注册预加载钩子：程序集依赖优先从 blob 内存加载（BCL/BepInEx.core 已内嵌）
     if (g_n > 0) mono_install_assembly_preload_hook(nebula_preload, NULL);
 
-    printf("[host] Mono 就绪，基线 RSS=%ldMB\n", rss_mb());
+    hlog("[host] step: Mono 就绪, RSS=%ldMB", rss_mb());
     start_watchdog();
 
     // NEBULA_BOOT: bepinex | mods | engine | auto（默认）
@@ -512,13 +544,22 @@ static void *boot_thread(void *arg) {
     int auto_mode = !bm || !*bm || !strcmp(bm, "auto");
     int ok = 0;
 
-    if (auto_mode || !strcmp(bm, "bepinex"))
+    if (auto_mode || !strcmp(bm, "bepinex")) {
+        hlog("[host] step: boot_bepinex enter");
         ok = boot_bepinex(domain, root);
-    if (!ok && (auto_mode || !strcmp(bm, "mods")))
+        hlog("[host] step: boot_bepinex -> %d", ok);
+    }
+    if (!ok && (auto_mode || !strcmp(bm, "mods"))) {
+        hlog("[host] step: boot_mods_dir enter");
         ok = boot_mods_dir(domain, root);
-    if (!ok && (auto_mode || !strcmp(bm, "engine")))
+        hlog("[host] step: boot_mods_dir -> %d", ok);
+    }
+    if (!ok && (auto_mode || !strcmp(bm, "engine"))) {
+        hlog("[host] step: boot_engine_poc enter");
         ok = boot_engine_poc(domain, dir);
-    if (!ok) fprintf(stderr, "[host] !! 没有任何启动路径成功\n");
+        hlog("[host] step: boot_engine_poc -> %d", ok);
+    }
+    if (!ok) hlog("[host] !! 没有任何启动路径成功");
 
     watchdog_run = 0;
     mono_jit_cleanup(domain);
