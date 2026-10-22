@@ -64,7 +64,17 @@ static int         g_n       = 0;
 static void blob_load(void) {
     if (g_entries) return;
 #ifdef __APPLE__
-    const struct mach_header *hdr = _dyld_get_image_header_containing_address((void *)blob_load);
+    // 取自身 dylib 的 mach_header：iOS 上没有 _dyld_get_image_header_containing_address，
+    // 改用 dladdr 拿路径 + 遍历 _dyld_image_count 匹配。
+    const struct mach_header *hdr = NULL;
+    Dl_info info;
+    if (dladdr((void *)blob_load, &info) && info.dli_fname) {
+        uint32_t cnt = _dyld_image_count();
+        for (uint32_t i = 0; i < cnt; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (nm && strcmp(nm, info.dli_fname) == 0) { hdr = _dyld_get_image_header(i); break; }
+        }
+    }
     if (!hdr) { printf("[host] 取自身 mach_header 失败，无嵌入式 blob\n"); return; }
     unsigned long sz = 0;
     char *p = getsectiondata((const struct mach_header_64 *)hdr, "__DATA", "__nebulabcl", &sz);
