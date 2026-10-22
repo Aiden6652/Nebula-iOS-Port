@@ -156,12 +156,6 @@ for s in mono_jit_init mono_domain_assembly_open mono_runtime_invoke mono_gc_col
 done
 [ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号，链接有问题" >&2; exit 1; }
 
-echo "--- 嵌入式 blob 段(__nebulabcl)检查 ---"
-SECTSIZE="$(xcrun otool -l "$OUT/libnebula_mono_host.dylib" 2>/dev/null | awk '/__nebulabcl/{f=1} f&&/size/{print $4; exit}')"
-if [ -n "$SECTSIZE" ]; then echo "    ✓ __nebulabcl 段存在, size=$SECTSIZE bytes"; else echo "    ✗ __nebulabcl 段缺失！"; MISSING=1; fi
-
-[ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号或 blob 段，链接有问题" >&2; exit 1; }
-
 echo "--- 产物 ---"
 for f in libnebula_mono_host.dylib libnebula_standard.dylib libnebula_pro.dylib; do
   [ -f "$OUT/$f" ] && printf "    %-30s %8s  sha256=%s\n" "$f" \

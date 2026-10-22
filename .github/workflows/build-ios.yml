@@ -11,18 +11,19 @@ on:
 
 jobs:
   mono-ios:
-    name: '1/2 取官方 iOS arm64 MonoVM（预编译，不编源码）'
+    name: '1/2 从源码编译 mono iOS arm64（修 sdb trampoline）'
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
       - name: 环境
         run: |
           echo "python3: $(python3 --version 2>&1)"
-          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo MISSING)"
+          echo "disk free:"; df -h ~ | tail -1
 
-      - name: 下载并解包 MonoVM(ios-arm64) + .NET 8 BCL
+      - name: 从源码编译 mono iOS（替换预编译包）
         run: bash scripts/build_mono_ios.sh
 
       - name: 上传 Mono iOS 产物

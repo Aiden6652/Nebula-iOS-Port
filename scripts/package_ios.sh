@@ -40,7 +40,7 @@ if names and names[0].count('/') >= 1:
         pref = cand
 print("    包内前缀:", repr(pref))
 
-KEEP_DIRS = ['BepInEx/', 'NebulaLibs/', 'Addons/']
+KEEP_DIRS = ['BepInEx/', 'NebulaLibs/', 'Addons/', 'MoreCosmic/', 'Cache/', 'LobbyRules/', 'Replace/']
 # PC 专用、iOS 用不到或本就属于游戏的，一律不带
 SKIP_NAMES = {'winhttp.dll', 'doorstop_config.ini', 'GameAssembly.dll',
               'UnityPlayer.dll', 'UnityCrashHandler32.exe', 'Among Us.exe',
