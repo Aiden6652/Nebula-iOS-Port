@@ -18,7 +18,7 @@
 #   $INSTALL/lib/net8.0/*.dll        .NET 8 BCL（来自 nuget）
 set -euo pipefail
 
-MONO_REF="${MONO_REF:-dotnet-8.0}"
+MONO_REF="${MONO_REF:-dotnet/main}"
 MONOVM_VERSION="${MONOVM_VERSION:-8.0.32}"
 WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
@@ -31,7 +31,14 @@ echo "clang: $(clang --version 2>/dev/null | head -1)"
 
 echo "=== [2/5] 克隆 mono 源码 ($MONO_REF) ==="
 rm -rf "$WORK"; mkdir -p "$(dirname "$WORK")"
-git clone --recursive --depth 1 --branch "$MONO_REF" https://github.com/mono/mono "$WORK/mono"
+# 分支回退：dotnet/main 是 mono 合入 .NET 后的开发分支；若上游不存在则退 main
+if ! git clone --recursive --depth 1 --branch "$MONO_REF" https://github.com/mono/mono "$WORK/mono"; then
+  for fb in main master; do
+    echo "    '$MONO_REF' 不存在，回退尝试 '$fb' ..."
+    git clone --recursive --depth 1 --branch "$fb" https://github.com/mono/mono "$WORK/mono" && MONO_REF="$fb" && break
+  done
+fi
+[ -d "$WORK/mono" ] || { echo "!! mono 源码克隆全部失败" >&2; exit 1; }
 echo "    mono 源码就位: $(du -sh "$WORK/mono" 2>/dev/null | cut -f1)"
 
 echo "=== [3/5] 编译 iOS arm64（官方 sdks 构建，信号 trampoline 路径）==="
