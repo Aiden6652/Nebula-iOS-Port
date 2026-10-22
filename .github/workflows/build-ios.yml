@@ -28,7 +28,8 @@ jobs:
         with:
           # key 绑定脚本内容 hash：脚本/补丁/构建命令一改就自动失效重编
           path: ~/mono-installs
-          key: mono-ios-${{ runner.os }}-arm64-${{ hashFiles('scripts/build_mono_ios.sh') }}
+          # v2：旧缓存条目里是残缺产物（缺 libSystem.*.a），bump 后强制重编
+          key: mono-ios-${{ runner.os }}-arm64-v2-${{ hashFiles('scripts/build_mono_ios.sh') }}
 
       - name: 从源码编译 mono iOS（替换预编译包）
         run: bash scripts/build_mono_ios.sh

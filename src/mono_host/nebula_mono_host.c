@@ -452,6 +452,18 @@ static int boot_engine_poc(MonoDomain *domain, const char *dir) {
 /* case_insensitive_fs.c：iOS 文件系统大小写不敏感回退 */
 void nebula_cifs_init(void);
 
+/* iOS mono 产物里未必带 libSystem.Globalization.Native.a，而 mono 的
+   native-library.c 会引用 _GlobalizationResolveDllImport（签名见 dotnet/runtime 的
+   src/native/libs/System.Globalization.Native/entrypoints.c）。
+   这里给 weak 定义兜底：宿主已设 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1，不需要 ICU，
+   返回 NULL 即可；若静态库里有真实实现，链接器会优先用真实的。 */
+__attribute__((weak))
+const void *GlobalizationResolveDllImport(const char *name)
+{
+    (void)name;
+    return NULL;
+}
+
 static void *boot_thread(void *arg) {
     (void)arg;
     // 全球化：默认 invariant 模式，避免 iOS 上缺 icudt.dat 崩溃（游戏模组走 UTF-8，不受影响）。

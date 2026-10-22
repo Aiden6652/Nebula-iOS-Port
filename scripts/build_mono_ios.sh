@@ -37,9 +37,11 @@ MONOVM_VERSION="${MONOVM_VERSION:-8.0.32}"
 WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
+# 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
+CACHE_VERSION="${CACHE_VERSION:-2}"
 
 # 缓存复用：CI 用 actions/cache 恢复 ~/mono-installs；产物完整就跳过全量编译
-if [ -f "$INSTALL/lib/libmonosgen-2.0.a" ] && [ -d "$INSTALL/include/mono-2.0" ] && [ -n "$(ls -A "$INSTALL/lib/net8.0" 2>/dev/null)" ]; then
+if [ -f "$INSTALL/lib/libmonosgen-2.0.a" ] && [ -d "$INSTALL/include/mono-2.0" ] && [ -n "$(ls -A "$INSTALL/lib/net8.0" 2>/dev/null)" ] && [ "$(cat "$INSTALL/.cache_version" 2>/dev/null)" = "$CACHE_VERSION" ]; then
   echo "=== [缓存命中] 复用已有 mono 产物，跳过全量编译 ==="
   echo "    prefix: $INSTALL"
   echo "    静态库: $(ls "$INSTALL/lib" | grep -c '\.a$') 个 / BCL: $(ls "$INSTALL/lib/net8.0" | wc -l) 个"
@@ -177,4 +179,5 @@ PY
   echo "HDR_JIT_H_MISSING=${HDR_WARN:-0}"
 } | tee "$MANIFEST"
 
+echo "$CACHE_VERSION" > "$INSTALL/.cache_version"
 echo "OK: 自编译 mono iOS 就位 -> $INSTALL"
