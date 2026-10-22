@@ -92,13 +92,27 @@ cd "$WORK/runtime"
 
 echo "=== [5/5] 整理产物（头文件 + 静态库）==="
 rm -rf "$INSTALL"; mkdir -p "$INSTALL/include" "$INSTALL/lib"
-INC="$WORK/runtime/src/mono/mono/include/mono-2.0"
-if [ -d "$INC" ]; then
-  cp -R "$INC" "$INSTALL/include/"
+# 公共嵌入 API 头：dotnet/runtime 放在 src/native/public/mono（布局 mono/jit/jit.h 等）
+INC="$WORK/runtime/src/native/public/mono"
+if [ ! -d "$INC" ]; then
+  # fallback：构建产物里找生成好的 mono-2.0 目录
+  INC="$(find "$WORK/runtime/artifacts" -type d -name 'mono-2.0' 2>/dev/null | head -1 || true)"
+fi
+if [ -n "$INC" ] && [ -d "$INC" ]; then
+  if [ -f "$INC/mono/jit/jit.h" ]; then
+    cp -R "$INC" "$INSTALL/include/mono-2.0"
+  elif [ -f "$INC/jit/jit.h" ]; then
+    mkdir -p "$INSTALL/include/mono-2.0"
+    cp -R "$INC" "$INSTALL/include/mono-2.0/mono"
+  else
+    echo "!! $INC 里没有 jit.h" >&2; exit 1
+  fi
   echo "    头文件: $INC"
 else
-  echo "!! 未找到 mono-2.0 头文件目录"
+  echo "!! 未找到 mono 头文件目录（public 与 artifacts 都没有）" >&2
+  exit 1
 fi
+[ -f "$INSTALL/include/mono-2.0/mono/jit/jit.h" ] || { echo "!! 最终头文件布局缺 mono/jit/jit.h" >&2; exit 1; }
 find "$WORK/runtime/artifacts/bin/mono" -name 'libmonosgen-2.0.a' 2>/dev/null | head -1 | while read -r f; do
   cp "$f" "$INSTALL/lib/"; echo "    $(basename "$f")"
 done
@@ -131,7 +145,7 @@ PY
   echo "MONO_REF=$MONO_REF"
   echo "MONOVM_VERSION=$MONOVM_VERSION"
   echo "INSTALL=$INSTALL"
-  echo "--- 头文件 ---"; ls "$INSTALL/include/mono-2.0" 2>/dev/null | head -3
+  echo "--- 头文件 ---"; ls "$INSTALL/include/mono-2.0" 2>/dev/null | head -3 || true
   echo "--- 静态库 ---"; ls "$INSTALL/lib" 2>/dev/null | head
   echo "--- BCL 数量 ---"; ls "$INSTALL/lib/net8.0" 2>/dev/null | wc -l
 } | tee "$MANIFEST"
