@@ -61,7 +61,59 @@ if [ "${#LIBS[@]}" -eq 0 ]; then
   exit 1
 fi
 
-echo "=== 编译 iOS arm64 dylib ==="
+# 定位 .NET 8 BCL 目录（解包后真实位置是 <prefix>/ios-monovm/lib/net8.0）
+MONO_ROOT="$MONO_PREFIX"
+if [ ! -d "$MONO_ROOT/lib/net8.0" ]; then
+  found="$(find "$MONO_PREFIX" -maxdepth 4 -type d -name net8.0 -path "*/lib/*" 2>/dev/null | head -1)"
+  [ -n "$found" ] && MONO_ROOT="$(dirname "$(dirname "$found")")"
+fi
+echo "MONO_ROOT: $MONO_ROOT"
+
+echo "=== 生成嵌入式 blob（BCL + 可选 BepInEx/core，全部内存加载，无散文件）==="
+BLOB="$OUT/.nebula_bcl.blob"
+# BepInEx/core 默认取 vendored 目录（与星云包锁版本）；可用 BEPINEX_CORE_DIR 覆盖
+if [ -z "${BEPINEX_CORE_DIR:-}" ] && [ -d "$ROOT/bepinex-core" ]; then
+  BEPINEX_CORE_DIR="$ROOT/bepinex-core"
+fi
+echo "   BepInEx/core 来源: ${BEPINEX_CORE_DIR:-无（仅嵌 BCL）}"
+python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" <<'PY'
+import sys, os, struct
+mono_root = sys.argv[1]
+bepinex_core = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else ""
+blob_path = sys.argv[3]
+
+entries = []; seen = set()
+def add(name, data):
+    if name in seen: return
+    seen.add(name); entries.append((name, data))
+
+# 1) .NET 8 BCL（托管程序集，含 System.Private.CoreLib）
+bcl_dir = os.path.join(mono_root, "lib", "net8.0")
+if os.path.isdir(bcl_dir):
+    for f in sorted(os.listdir(bcl_dir)):
+        if f.endswith(".dll"):
+            add(f, open(os.path.join(bcl_dir, f), "rb").read())
+else:
+    print("!! 没找到 lib/net8.0，BCL 未嵌入", file=sys.stderr)
+
+# 2) BepInEx/core（托管 dll，排除原生 dobby.dll）
+if os.path.isdir(bepinex_core):
+    for f in sorted(os.listdir(bepinex_core)):
+        if not f.endswith(".dll"): continue
+        if f.lower() == "dobby.dll": continue   # 原生库，不是托管，不能当 assembly 加载
+        add("BepInEx/core/" + f, open(os.path.join(bepinex_core, f), "rb").read())
+
+buf = struct.pack("<I", 0x4E424C31)  # 'NBL1'
+buf += struct.pack("<I", len(entries))
+for name, data in entries:
+    nb = name.encode("utf-8")
+    buf += struct.pack("<H", len(nb)) + nb
+    buf += struct.pack("<I", len(data)) + data
+open(blob_path, "wb").write(buf)
+print("blob: %d 个程序集, %d bytes" % (len(entries), len(buf)))
+PY
+
+echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 "$CCBIN" -arch arm64 \
   -isysroot "$SDK" \
   -miphoneos-version-min="$MIN_IOS" \
@@ -71,33 +123,17 @@ echo "=== 编译 iOS arm64 dylib ==="
   -o "$OUT/libnebula_mono_host.dylib" \
   "$ROOT/nebula_mono_host.c" \
   "${LIBS[@]}" \
+  -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
   -framework Foundation \
   -framework CoreFoundation \
   -framework Security \
   -lobjc -lc++ -lpthread -lz -lm
 
-# 把 MonoVM 的 BCL 一并拷到产物目录 —— 没有 BCL 这个 dylib 跑不了任何 .NET 代码。
-# 注意路径：解包后真实位置是 <prefix>/ios-monovm/lib/net8.0，不是 <prefix>/lib/net8.0，
-# 所以要先定位含 lib/net8.0 的那一层。
-MONO_ROOT="$MONO_PREFIX"
-if [ ! -d "$MONO_ROOT/lib/net8.0" ]; then
-  found="$(find "$MONO_PREFIX" -maxdepth 4 -type d -name net8.0 -path "*/lib/*" 2>/dev/null | head -1)"
-  [ -n "$found" ] && MONO_ROOT="$(dirname "$(dirname "$found")")"
-fi
-echo "MONO_ROOT: $MONO_ROOT"
-
-if [ -d "$MONO_ROOT/lib/net8.0" ]; then
-  echo "=== 拷贝 .NET 8 BCL ==="
-  mkdir -p "$OUT/bcl"
-  cp -R "$MONO_ROOT/lib/net8.0/." "$OUT/bcl/"
-  [ -f "$MONO_ROOT/native/System.Private.CoreLib.dll" ] \
-    && cp "$MONO_ROOT/native/System.Private.CoreLib.dll" "$OUT/bcl/"
-  # ICU 数据（全球化/中文相关），有就带上
-  [ -f "$MONO_ROOT/native/icudt.dat" ] && cp "$MONO_ROOT/native/icudt.dat" "$OUT/bcl/"
-  echo "    BCL 程序集 $(ls "$OUT/bcl" | wc -l) 个"
-else
-  echo "!! 没找到 lib/net8.0，BCL 未拷贝（dylib 会跑不起来）" >&2
-fi
+# 注：BCL 已嵌入 dylib 的 __nebulabcl 段（见上方 blob 生成），不再散落 bcl/ 目录。
+# 运行时由 nebula_mono_host.c 的 Mono 预加载钩子从内存加载。
+BLOBSZ="$(wc -c < "$BLOB" 2>/dev/null || echo 0)"
+echo "BCL 状态: 已内嵌（${BLOBSZ} bytes 烧进 dylib 的 __nebulabcl 段）"
+rm -f "$BLOB"   # 临时 blob 已烧进段，删掉避免被打进 artifact
 
 # Standard / Pro 是同一份二进制，区别只在 nebula_host.<profile>.cfg 里的
 # runtime.mode（interp / jit）。这里各出一份带名字的副本，方便直接分发、不用改配置。
@@ -119,6 +155,12 @@ for s in mono_jit_init mono_domain_assembly_open mono_runtime_invoke mono_gc_col
   esac
 done
 [ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号，链接有问题" >&2; exit 1; }
+
+echo "--- 嵌入式 blob 段(__nebulabcl)检查 ---"
+SECTSIZE="$(xcrun otool -l "$OUT/libnebula_mono_host.dylib" 2>/dev/null | awk '/__nebulabcl/{f=1} f&&/size/{print $4; exit}')"
+if [ -n "$SECTSIZE" ]; then echo "    ✓ __nebulabcl 段存在, size=$SECTSIZE bytes"; else echo "    ✗ __nebulabcl 段缺失！"; MISSING=1; fi
+
+[ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号或 blob 段，链接有问题" >&2; exit 1; }
 
 echo "--- 产物 ---"
 for f in libnebula_mono_host.dylib libnebula_standard.dylib libnebula_pro.dylib; do

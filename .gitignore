@@ -31,6 +31,9 @@ src/net/test_dispatch
 # Mono 嵌入宿主构建产物（Engine.dll + Roslyn 依赖 + 编译好的宿主，由 CI 生成）
 src/mono_host/out/
 *.dll
+# 例外：BepInEx/core 托管 dll 是 vendored 进来的（与星云包锁版本，构建期嵌进 dylib，非构建产物）
+!src/mono_host/bepinex-core/
+!src/mono_host/bepinex-core/*.dll
 *.zip
 *.dat
 metadata/

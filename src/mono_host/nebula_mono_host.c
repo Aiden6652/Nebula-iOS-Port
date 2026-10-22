@@ -16,6 +16,7 @@
 //      详见 docs/ios-memory-budget.md
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -31,12 +32,102 @@
 #include <mono/metadata/class.h>       // mono_class_from_name / mono_class_get_method_from_name
 #include <mono/metadata/object.h>      // mono_runtime_invoke
 #include <mono/metadata/mono-config.h>
+#include <mono/metadata/image.h>      // mono_image_open_from_data_with_name
 #include <mono/metadata/mono-gc.h>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/task_info.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #endif
+
+// ---------------------------------------------------------------- 嵌入式 BCL/BepInEx blob
+//
+// 构建期把 BCL(.NET 8 基础类库, 171 个程序集) + BepInEx/core 托管 dll 打成一个 NBL1 blob，
+// 用 ld -sectcreate 嵌进 dylib 的 __DATA,__nebulabcl 段。运行时从这里【内存加载】程序集，
+// 不再依赖任何散落的 .dll 文件 —— 成品就一个 .dylib。
+//
+// blob 格式(NBL1, 小端):
+//   uint32 magic = 'NBL1'
+//   uint32 count
+//   count × {
+//     uint16 namelen
+//     char   name[namelen]      UTF-8（可带 BepInEx/core/ 子路径，查找只看 basename）
+//     uint32 datalen
+//     byte   data[datalen]
+//   }
+typedef struct { const char *name; const uint8_t *data; uint32_t size; } blob_entry;
+static blob_entry *g_entries = NULL;
+static int         g_n       = 0;
+
+static void blob_load(void) {
+    if (g_entries) return;
+#ifdef __APPLE__
+    const struct mach_header *hdr = _dyld_get_image_header_containing_address((void *)blob_load);
+    if (!hdr) { printf("[host] 取自身 mach_header 失败，无嵌入式 blob\n"); return; }
+    unsigned long sz = 0;
+    char *p = getsectiondata((const struct mach_header_64 *)hdr, "__DATA", "__nebulabcl", &sz);
+    if (!p || sz < 8) { printf("[host] 未找到 __nebulabcl 段（构建未嵌入 blob，走文件兜底）\n"); return; }
+    const uint8_t *q = (const uint8_t *)p;
+    uint32_t magic; memcpy(&magic, q, 4); q += 4;
+    if (magic != 0x4E424C31u) { printf("[host] blob magic 错误(0x%08X)，跳过\n", magic); return; }
+    uint32_t count; memcpy(&count, q, 4); q += 4;
+    g_entries = (blob_entry *)calloc(count ? count : 1, sizeof(blob_entry));
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t nl; memcpy(&nl, q, 2); q += 2;
+        char *nm = (char *)malloc(nl + 1); memcpy(nm, q, nl); nm[nl] = 0; q += nl;
+        uint32_t dl; memcpy(&dl, q, 4); q += 4;
+        g_entries[i].name = nm; g_entries[i].data = q; g_entries[i].size = dl; q += dl;
+    }
+    g_n = (int)count;
+    printf("[host] 嵌入式 blob: %d 个程序集已就位（全部内存加载，无散文件）\n", g_n);
+#else
+    printf("[host] 非 Apple 平台，无嵌入式 blob（桌面测试走文件）\n");
+#endif
+}
+
+// 按程序集简单名查找（去掉路径与 .dll），命中返回 entry
+static const blob_entry *blob_find(const char *aname) {
+    if (!g_n || !aname) return NULL;
+    const char *slash = strrchr(aname, '/');
+    const char *s = slash ? slash + 1 : aname;
+    char base[512];
+    strncpy(base, s, sizeof(base) - 1); base[sizeof(base) - 1] = 0;
+    size_t L = strlen(base);
+    if (L > 4 && !strcasecmp(base + L - 4, ".dll")) base[L - 4] = 0;
+    for (int i = 0; i < g_n; i++) {
+        const char *bn = strrchr(g_entries[i].name, '/');
+        const char *en = bn ? bn + 1 : g_entries[i].name;
+        size_t EL = strlen(en); char ebase[512];
+        strncpy(ebase, en, sizeof(ebase) - 1); ebase[sizeof(ebase) - 1] = 0;
+        if (EL > 4 && !strcasecmp(ebase + EL - 4, ".dll")) ebase[EL - 4] = 0;
+        if (!strcasecmp(ebase, base)) return &g_entries[i];
+    }
+    return NULL;
+}
+
+// 从 blob 内存加载一个程序集（open image from data + load from full）
+static MonoAssembly *blob_load_assembly(const blob_entry *e) {
+    MonoImageOpenStatus status;
+    MonoImage *img = mono_image_open_from_data_with_name((char *)e->data, e->size, 1, &status, 0, e->name);
+    if (!img || status != MONO_IMAGE_OK) { if (img) mono_image_close(img); return NULL; }
+    MonoAssembly *as = mono_assembly_load_from_full(img, e->name, &status, 0);
+    if (!as) { mono_image_close(img); return NULL; }
+    printf("[host]   内存加载 %s (%u bytes)\n", e->name, e->size);
+    return as;
+}
+
+// Mono 预加载钩子：解析程序集依赖时先查嵌入式 blob，命中就内存加载，否则交给文件系统
+static MonoAssembly *nebula_preload(MonoAssemblyName *aname, char **assemblies_path, void *user_data) {
+    (void)assemblies_path; (void)user_data;
+    if (!g_n) return NULL;
+    const char *name = mono_assembly_name_get_name(aname);
+    if (!name) return NULL;
+    const blob_entry *e = blob_find(name);
+    if (!e) return NULL;
+    return blob_load_assembly(e);
+}
 
 // ---------------------------------------------------------------- 配置
 
@@ -212,11 +303,11 @@ static char *module_dir(void) {
     return strdup(".");
 }
 
-// 组装 MONO_PATH：BCL + BepInEx 各目录，Mono 靠它解析程序集依赖
+// 组装 MONO_PATH：仅保留用户内容目录作为【文件兜底】（BCL/BepInEx.core 已在 blob 里内存加载）
 static void setup_mono_path(const char *dir, const char *root) {
-    char bcl[PATH_MAX], core[PATH_MAX], interop[PATH_MAX], plugins[PATH_MAX];
+    (void)dir;  // dir(=dylib 目录) 不再含 bcl，仅作占位
+    char core[PATH_MAX], interop[PATH_MAX], plugins[PATH_MAX];
     char nebula[PATH_MAX], patchers[PATH_MAX], libs[PATH_MAX];
-    snprintf(bcl,      sizeof(bcl),      "%s/bcl", dir);
     snprintf(core,     sizeof(core),     "%s/BepInEx/core", root);
     snprintf(interop,  sizeof(interop),  "%s/BepInEx/interop", root);
     snprintf(plugins,  sizeof(plugins),  "%s/BepInEx/plugins", root);
@@ -224,32 +315,38 @@ static void setup_mono_path(const char *dir, const char *root) {
     snprintf(patchers, sizeof(patchers), "%s/BepInEx/patchers", root);
     snprintf(libs,     sizeof(libs),     "%s/NebulaLibs", root);
 
-    const char *all[] = { dir, bcl, core, interop, plugins, nebula, patchers, libs };
+    const char *all[] = { core, interop, plugins, nebula, patchers, libs };
     char mp[8192]; mp[0] = '\0';
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 6; i++) {
         if (strlen(mp) + strlen(all[i]) + 2 >= sizeof(mp)) break;
         if (mp[0]) strcat(mp, ":");
         strcat(mp, all[i]);
     }
     setenv("MONO_PATH", mp, 1);
-    printf("[host] MONO_PATH=%s\n", mp);
+    printf("[host] MONO_PATH(文件兜底)=%s\n", mp);
 }
 
-// 正式路径：把控制权交给 BepInEx
+// 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
 static int boot_bepinex(MonoDomain *domain, const char *root) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/BepInEx/core/BepInEx.Unity.IL2CPP.dll", root);
-
-    FILE *probe = fopen(path, "rb");
-    if (!probe) {
-        printf("[host] 未找到 BepInEx 入口: %s\n", path);
-        return 0;
+    MonoAssembly *as = NULL;
+    const blob_entry *e = blob_find("BepInEx.Unity.IL2CPP");
+    if (e) {
+        as = blob_load_assembly(e);
+        if (as) printf("[host] 从 blob 内存加载 BepInEx 入口\n");
     }
-    fclose(probe);
-    printf("[host] 加载 BepInEx 入口: %s\n", path);
-
-    MonoAssembly *as = mono_domain_assembly_open(domain, path);
-    if (!as) { fprintf(stderr, "[host] 打开 BepInEx.Unity.IL2CPP.dll 失败\n"); return 0; }
+    if (!as) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/BepInEx/core/BepInEx.Unity.IL2CPP.dll", root);
+        FILE *probe = fopen(path, "rb");
+        if (!probe) {
+            printf("[host] 未找到 BInEx 入口（内存与文件均无）\n");
+            return 0;
+        }
+        fclose(probe);
+        printf("[host] 从文件加载 BepInEx 入口: %s\n", path);
+        as = mono_domain_assembly_open(domain, path);
+    }
+    if (!as) { fprintf(stderr, "[host] 打开 BepInEx.Unity.IL2CPP 失败\n"); return 0; }
 
     MonoImage *img = mono_assembly_get_image(as);
     MonoClass *klass = mono_class_from_name(img, "Doorstop", "Entrypoint");
@@ -344,6 +441,10 @@ static int boot_engine_poc(MonoDomain *domain, const char *dir) {
 
 static void *boot_thread(void *arg) {
     (void)arg;
+    // 全球化：默认 invariant 模式，避免 iOS 上缺 icudt.dat 崩溃（游戏模组走 UTF-8，不受影响）。
+    // 若要完整文化格式化，放 icudt.dat 到 dylib 同目录并删此行。
+    setenv("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1", 1);
+
     char *dir = module_dir();
     printf("[host] module dir = %s\n", dir);
 
@@ -354,6 +455,7 @@ static void *boot_thread(void *arg) {
 
     load_cfg(dir);
     apply_gc_env();
+    blob_load();
     setup_mono_path(dir, root);
 
     const char *prefix = getenv("MONO_PREFIX");
@@ -366,6 +468,9 @@ static void *boot_thread(void *arg) {
 
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { fprintf(stderr, "[host] mono_jit_init failed\n"); free(dir); return NULL; }
+
+    // 注册预加载钩子：程序集依赖优先从 blob 内存加载（BCL/BepInEx.core 已内嵌）
+    if (g_n > 0) mono_install_assembly_preload_hook(nebula_preload, NULL);
 
     printf("[host] Mono 就绪，基线 RSS=%ldMB\n", rss_mb());
     start_watchdog();

@@ -23,10 +23,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "=== 打包 profile=$profile -> $OUT ===" 2>/dev/null
 rm -rf "$OUT"; mkdir -p "$OUT"
 
-echo "=== [1/5] 宿主 dylib + BCL ==="
+echo "=== [1/5] 宿主 dylib（BCL + BepInEx/core 已内嵌，无散文件）==="
 cp "$ART/libnebula_mono_host.dylib" "$OUT/"
-[ -d "$ART/bcl" ] && cp -R "$ART/bcl" "$OUT/bcl"
-echo "    dylib $(du -h "$OUT/libnebula_mono_host.dylib" | cut -f1), BCL $(ls "$OUT/bcl" 2>/dev/null | wc -l) 个程序集"
+echo "    dylib $(du -h "$OUT/libnebula_mono_host.dylib" | cut -f1)（BCL + BepInEx.core 已烧进 __nebulabcl 段）"
 
 echo "=== [2/5] 从改装包提取模组文件 ==="
 python3 - "$NOS" "$OUT" <<'PY'
@@ -47,7 +46,7 @@ SKIP_NAMES = {'winhttp.dll', 'doorstop_config.ini', 'GameAssembly.dll',
               'UnityPlayer.dll', 'UnityCrashHandler32.exe', 'Among Us.exe',
               'baselib.dll', 'opus.dll', 'msvcp140.dll', 'vcruntime140.dll',
               'dobby.dll'}
-SKIP_DIRS = ['dotnet/', 'MonoBleedingEdge/', 'UnityPlayer_Data/']
+SKIP_DIRS = ['dotnet/', 'MonoBleedingEdge/', 'UnityPlayer_Data/', 'BepInEx/core/', 'BepInEx/interop/']
 
 kept = collections.Counter()
 for n in names:
@@ -114,13 +113,12 @@ cat > "$OUT/INSTALL.md" <<EOF
    切换：设置环境变量 \`NEBULA_PROFILE=pro\`，或直接改 \`nebula_host.cfg\`。
 
 ## 目录
-| 目录 | 作用 |
+| 目录/文件 | 作用 |
 |---|---|
-| \`bcl/\` | .NET 8 基础类库，Mono 需要 |
-| \`BepInEx/core/\` | 框架本体 |
+| \`libnebula_mono_host.dylib\` | 宿主（内含 MonoVM + BCL + BepInEx.core，自包含，无散 dll） |
 | \`BepInEx/plugins/\` | BepInEx 插件（星云舰加载器等）—— **新模组扔这里** |
+| \`BepInEx/interop/\` | Il2CppInterop 包装层（**首次启动自动生成 iOS 版**；不要带 PC 版） |
 | \`BepInEx/config/\` | 配置 |
-| \`BepInEx/interop/\` | Il2CppInterop 包装层（**必须用 iOS 版重新生成**） |
 | \`NebulaLibs/\` | 星云舰依赖 |
 | \`Addons/\` | 附加组件（职业定义在里面，默认全加载） |
 | \`Mods/\` | 非 BepInEx 的普通 C# 模组扔这里（可选） |
