@@ -23,6 +23,13 @@ jobs:
           echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo MISSING)"
           echo "disk free:"; df -h ~ | tail -1
 
+      - name: 恢复 mono 编译缓存（避免每轮全量重编）
+        uses: actions/cache@v4
+        with:
+          # key 绑定脚本内容 hash：脚本/补丁/构建命令一改就自动失效重编
+          path: ~/mono-installs
+          key: mono-ios-${{ runner.os }}-arm64-${{ hashFiles('scripts/build_mono_ios.sh') }}
+
       - name: 从源码编译 mono iOS（替换预编译包）
         run: bash scripts/build_mono_ios.sh
 

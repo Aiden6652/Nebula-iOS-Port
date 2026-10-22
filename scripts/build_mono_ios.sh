@@ -1,16 +1,30 @@
 #!/usr/bin/env bash
 # 从源码编译 mono for iOS arm64 —— 替换原「下载预编译包」方案。
 #
-# 为什么换（根因见真机 .ips 崩溃栈）：
-#   原 Microsoft.NETCore.App.Runtime.Mono.ios-arm64 包里的 libmonosgen 在
-#     mono_jit_init -> mono_arch_init -> mini_get_breakpoint_trampoline
-#       -> mono_arch_create_sdb_trampoline -> mono_assertion_message_unreachable
-#   触发断言崩溃。iOS 不允许运行时 mmap 可执行 trampoline，该官方包把 sdb/breakpoint
-#   trampoline 编成了 unreachable stub。自编译走 mono 官方 iOS 构建（信号 trampoline
-#   路径），mono_arch_init 不会走到 unreachable，mono_jit_init 能正常初始化。
+# 崩溃根因（真机 .ips 栈 + mono 源码核对）：
+#   mono_jit_init -> mono_arch_init -> mini_get_breakpoint_trampoline
+#     -> mono_arch_create_sdb_trampoline -> mono_assertion_message_unreachable
 #
-# 注意：BCL(.NET 8 托管程序集) 仍然从官方 nuget 取，不自己编（版本匹配即可）；
-#       本脚本只从源码编译「原生运行时」(libmonosgen + 头文件)。
+#   mono/mini/mini-arm64.c 的 mono_arch_init 里是：
+#       if (!mono_aot_only)
+#           bp_trampoline = mini_get_breakpoint_trampoline ();
+#   而 mini-trampolines.c 里：
+#       #ifdef MONO_ARCH_HAVE_SDB_TRAMPOLINES
+#           tramp = mono_arch_create_sdb_trampoline (...);
+#       #else
+#           g_assert_not_reached ();      ← iOS 官方包走这里，必崩
+#       #endif
+#   iOS 不允许运行时造可执行 trampoline，官方预编译包没定义
+#   MONO_ARCH_HAVE_SDB_TRAMPOLINES，且条件是 !mono_aot_only（不是 debugger 开关），
+#   所以任何 JIT/interp 模式都必崩，关 debug agent 也救不了。
+#
+# 修法：自编译 mono，并在 mono_arch_init 里让 iOS 跳过 bp_trampoline 创建。
+#   代价：仅 soft-debug 断点失效，不影响 JIT/interpreter 正常执行 IL。
+#
+# 构建源：mono 现在在 dotnet/runtime 仓库（mono/mono 的 sdks 已不适用于 iOS 构建）。
+#   ./build.sh -s mono -os ios -arch arm64 -c Release
+#   产物：artifacts/bin/mono/iOS.arm64.Release/
+#   BCL(.NET 8 托管程序集) 仍从官方 nuget 取，不自己编。
 #
 # 产出（映射到 build_ios.sh 期望的 prefix 结构）：
 #   $INSTALL/include/mono-2.0/...    头文件
@@ -18,65 +32,81 @@
 #   $INSTALL/lib/net8.0/*.dll        .NET 8 BCL（来自 nuget）
 set -euo pipefail
 
-MONO_REF="${MONO_REF:-dotnet/main}"
+MONO_REF="${MONO_REF:-v8.0.32}"          # dotnet/runtime tag，与 MONOVM_VERSION 对齐
 MONOVM_VERSION="${MONOVM_VERSION:-8.0.32}"
 WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
-NPROC="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+
+# 缓存复用：CI 用 actions/cache 恢复 ~/mono-installs；产物完整就跳过全量编译
+if [ -f "$INSTALL/lib/libmonosgen-2.0.a" ] && [ -d "$INSTALL/include/mono-2.0" ] && [ -n "$(ls -A "$INSTALL/lib/net8.0" 2>/dev/null)" ]; then
+  echo "=== [缓存命中] 复用已有 mono 产物，跳过全量编译 ==="
+  echo "    prefix: $INSTALL"
+  echo "    静态库: $(ls "$INSTALL/lib" | grep -c '\.a$') 个 / BCL: $(ls "$INSTALL/lib/net8.0" | wc -l) 个"
+  {
+    echo "REUSED_CACHE=yes"
+    echo "INSTALL=$INSTALL"
+    echo "--- 静态库 ---"; ls "$INSTALL/lib" | head
+    echo "--- BCL 数量 ---"; ls "$INSTALL/lib/net8.0" | wc -l
+  } | tee "$MANIFEST"
+  exit 0
+fi
 
 echo "=== [1/5] 环境 ==="
 echo "Xcode: $(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo 'NO iOS SDK')"
 echo "clang: $(clang --version 2>/dev/null | head -1)"
+echo "dotnet: $(dotnet --version 2>/dev/null || echo 'NO dotnet')"
 
-echo "=== [2/5] 克隆 mono 源码 ($MONO_REF) ==="
-rm -rf "$WORK"; mkdir -p "$(dirname "$WORK")"
-# 分支回退：dotnet/main 是 mono 合入 .NET 后的开发分支；若上游不存在则退 main
-if ! git clone --recursive --depth 1 --branch "$MONO_REF" https://github.com/mono/mono "$WORK/mono"; then
-  for fb in main master; do
-    echo "    '$MONO_REF' 不存在，回退尝试 '$fb' ..."
-    git clone --recursive --depth 1 --branch "$fb" https://github.com/mono/mono "$WORK/mono" && MONO_REF="$fb" && break
-  done
-fi
-[ -d "$WORK/mono" ] || { echo "!! mono 源码克隆全部失败" >&2; exit 1; }
-echo "    mono 源码就位: $(du -sh "$WORK/mono" 2>/dev/null | cut -f1)"
+echo "=== [2/5] 克隆 dotnet/runtime ($MONO_REF) ==="
+rm -rf "$WORK"; mkdir -p "$WORK"
+git clone --depth 1 --branch "$MONO_REF" https://github.com/dotnet/runtime "$WORK/runtime"
+echo "    源码就位: $(du -sh "$WORK/runtime" 2>/dev/null | cut -f1)"
 
-echo "=== [3/5] 编译 iOS arm64（官方 sdks 构建，信号 trampoline 路径）==="
-cd "$WORK/mono"
-# sdks 系统是 mono 官方对 iOS 的构建入口，已处理 iOS 的 unavailable API 打桩与
-# trampoline/信号路径。只构建 ios-arm64 device runtime，避免 simulator/多 config 拖时长。
-export MONO_BUILD_DIR="$WORK/build"
-set +e
-make -C sdks build-ios 2>&1 | tail -40
-RC=${PIPESTATUS[0]}
-set -e
-if [ "$RC" -ne 0 ]; then
-  echo "!! sdks build-ios 失败，尝试根 Makefile 的 ios target ..."
-  make build-ios 2>&1 | tail -40
-fi
+echo "=== [3/5] 打补丁：iOS 跳过 sdb breakpoint trampoline ==="
+F="$WORK/runtime/src/mono/mono/mini/mini-arm64.c"
+[ -f "$F" ] || { echo "!! 找不到 $F" >&2; exit 1; }
+python3 - "$F" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='replace').read()
+new = ("\t/* [Nebula iOS patch] iOS 无可执行内存可造 sdb trampoline（官方预编译包在此\n"
+       "\t   assert_not_reached）。跳过 breakpoint trampoline 创建：仅 soft-debug 断点失效，\n"
+       "\t   不影响 JIT / interpreter 执行 IL。 */\n"
+       "\tbp_trampoline = NULL;\n")
+m = re.search(r"[ \t]*if[ \t]*\(!mono_aot_only\)[ \t]*\n[ \t]*bp_trampoline[ \t]*=[ \t]*mini_get_breakpoint_trampoline[ \t]*\([ \t]*\)[ \t]*;", s)
+if not m:
+    # 可能已被上游改写成单行
+    m2 = re.search(r"[ \t]*if[ \t]*\(!mono_aot_only\)[ \t]*\{?[ \t]*bp_trampoline[ \t]*=[ \t]*mini_get_breakpoint_trampoline[ \t]*\([ \t]*\)[ \t]*;", s)
+    if not m2:
+        print("!! 补丁点未匹配（mono 源码可能已改结构）", file=sys.stderr)
+        sys.exit(1)
+    m = m2
+s = s[:m.start()] + new + s[m.end():]
+open(p, 'w', encoding='utf-8').write(s)
+print("    补丁已应用到 mini-arm64.c")
+PY
 
-echo "=== [4/5] 定位并拷贝 头文件 + 静态库 到 $INSTALL ==="
+echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="
+cd "$WORK/runtime"
+./build.sh -s mono -os ios -arch arm64 -c Release 2>&1 | tail -60
+
+echo "=== [5/5] 整理产物（头文件 + 静态库）==="
 rm -rf "$INSTALL"; mkdir -p "$INSTALL/include" "$INSTALL/lib"
-
-# 头文件：include/mono-2.0（可能嵌套在 sdks 产出里）
-INC="$(find "$WORK/build" -type d -name 'mono-2.0' -path '*include*' 2>/dev/null | head -1)"
-if [ -z "$INC" ]; then
-  # fallback：mono 源码自带头文件
-  INC="$(find "$WORK/mono" -type d -name 'mono-2.0' -path '*include*' 2>/dev/null | head -1)"
-fi
-if [ -n "$INC" ]; then
+INC="$WORK/runtime/src/mono/mono/include/mono-2.0"
+if [ -d "$INC" ]; then
   cp -R "$INC" "$INSTALL/include/"
-  echo "    头文件: $INC -> $INSTALL/include/mono-2.0"
+  echo "    头文件: $INC"
 else
   echo "!! 未找到 mono-2.0 头文件目录"
 fi
-
-# 静态库：libmonosgen-2.0.a 等
-find "$WORK/build" -name 'libmonosgen-2.0.a' 2>/dev/null | head -1 | xargs -I{} cp {} "$INSTALL/lib/" 2>/dev/null || true
-find "$WORK/build" -name 'libmono-*.a' 2>/dev/null | while read -r f; do cp "$f" "$INSTALL/lib/"; done
+find "$WORK/runtime/artifacts/bin/mono" -name 'libmonosgen-2.0.a' 2>/dev/null | head -1 | while read -r f; do
+  cp "$f" "$INSTALL/lib/"; echo "    $(basename "$f")"
+done
+find "$WORK/runtime/artifacts/bin/mono" -name 'libmono*.a' 2>/dev/null | while read -r f; do cp -n "$f" "$INSTALL/lib/" 2>/dev/null || true; done
 echo "    静态库: $(ls "$INSTALL/lib" 2>/dev/null | wc -l) 个"
+[ -n "$(ls -A "$INSTALL/lib" 2>/dev/null)" ] || { echo "!! 未产出任何静态库" >&2; exit 1; }
 
-echo "=== [5/5] 取 .NET 8 BCL + CoreLib（托管程序集，不自己编）==="
+echo "=== [6/6] 取 .NET 8 BCL（托管程序集，不自己编）==="
 mkdir -p "$INSTALL/lib/net8.0"
 PKG="microsoft.netcore.app.runtime.mono.ios-arm64"
 URL="https://api.nuget.org/v3-flatcontainer/$PKG/$MONOVM_VERSION/$PKG.$MONOVM_VERSION.nupkg"
@@ -101,7 +131,7 @@ PY
   echo "MONO_REF=$MONO_REF"
   echo "MONOVM_VERSION=$MONOVM_VERSION"
   echo "INSTALL=$INSTALL"
-  echo "--- include/mono ---"; find "$INSTALL/include" -maxdepth 2 -name 'jit.h' 2>/dev/null | head -1
+  echo "--- 头文件 ---"; ls "$INSTALL/include/mono-2.0" 2>/dev/null | head -3
   echo "--- 静态库 ---"; ls "$INSTALL/lib" 2>/dev/null | head
   echo "--- BCL 数量 ---"; ls "$INSTALL/lib/net8.0" 2>/dev/null | wc -l
 } | tee "$MANIFEST"
