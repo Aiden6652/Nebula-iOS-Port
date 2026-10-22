@@ -122,6 +122,8 @@ echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
   -I"$MONO_INC" \
   -o "$OUT/libnebula_mono_host.dylib" \
   "$ROOT/nebula_mono_host.c" \
+  "$ROOT/case_insensitive_fs.c" \
+  "$ROOT/fishhook.c" \
   "${LIBS[@]}" \
   -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
   -framework Foundation \

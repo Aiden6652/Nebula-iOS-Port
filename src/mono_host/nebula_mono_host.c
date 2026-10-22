@@ -449,11 +449,18 @@ static int boot_engine_poc(MonoDomain *domain, const char *dir) {
     return 1;
 }
 
+/* case_insensitive_fs.c：iOS 文件系统大小写不敏感回退 */
+void nebula_cifs_init(void);
+
 static void *boot_thread(void *arg) {
     (void)arg;
     // 全球化：默认 invariant 模式，避免 iOS 上缺 icudt.dat 崩溃（游戏模组走 UTF-8，不受影响）。
     // 若要完整文化格式化，放 icudt.dat 到 dylib 同目录并删此行。
     setenv("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1", 1);
+
+    // iOS 文件系统大小写敏感，模组路径大小写对不上会 FileNotFound 直接崩。
+    // 必须在任何文件访问（含 load_cfg / mono_jit_init）之前装上回退。
+    nebula_cifs_init();
 
     char *dir = module_dir();
     printf("[host] module dir = %s\n", dir);
