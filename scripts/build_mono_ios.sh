@@ -116,9 +116,25 @@ fi
 find "$WORK/runtime/artifacts/bin/mono" -name 'libmonosgen-2.0.a' 2>/dev/null | head -1 | while read -r f; do
   cp "$f" "$INSTALL/lib/"; echo "    $(basename "$f")"
 done
-find "$WORK/runtime/artifacts/bin/mono" -name 'libmono*.a' 2>/dev/null | while read -r f; do cp -n "$f" "$INSTALL/lib/" 2>/dev/null || true; done
+# 全部 iOS 目标静态库（排除 cross/ 里的 host 工具）。
+# 必须带上 libSystem.Globalization.Native.a：mono 的 native-library.c 里
+# lookup_pinvoke_call_impl 会调 GlobalizationResolveDllImport（定义在
+# src/native/libs/System.Globalization.Native/entrypoints.c），漏了链接期必缺符号。
+find "$WORK/runtime/artifacts/bin/mono" -name '*.a' -not -path '*/cross/*' 2>/dev/null | while read -r f; do
+  cp -n "$f" "$INSTALL/lib/" 2>/dev/null || true
+done
 echo "    静态库: $(ls "$INSTALL/lib" 2>/dev/null | wc -l) 个"
 [ -n "$(ls -A "$INSTALL/lib" 2>/dev/null)" ] || { echo "!! 未产出任何静态库" >&2; exit 1; }
+
+# 校验：GlobalizationResolveDllImport 必须能在收集到的库里找到，否则宿主链接必挂
+OK=0
+for f in "$INSTALL"/lib/*.a; do
+  if nm "$f" 2>/dev/null | grep -q 'GlobalizationResolveDllImport'; then
+    echo "    ✓ GlobalizationResolveDllImport 来自 $(basename "$f")"
+    OK=1; break
+  fi
+done
+[ "$OK" = "1" ] || { echo "!! 收集到的静态库里没有 GlobalizationResolveDllImport" >&2; exit 1; }
 
 echo "=== [6/6] 取 .NET 8 BCL（托管程序集，不自己编）==="
 mkdir -p "$INSTALL/lib/net8.0"
