@@ -35,6 +35,12 @@
 #include <mono/metadata/image.h>      // mono_image_open_from_data_with_name
 #include <mono/metadata/mono-gc.h>
 
+// mono 公开 API：在 mono_jit_init 之前调用可强制 AOT-only 模式。
+// iOS 不能运行时生成 trampoline 代码（generic / breakpoint trampoline 都会
+// g_assert_not_reached），AOT-only 让 mono_trampolines_init 直接 return，
+// 彻底避开整组雷。这正是 .NET MAUI iOS 的运行方式。
+extern void mono_jit_set_aot_only (gboolean aot_only);
+
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/task_info.h>
@@ -574,6 +580,13 @@ static void *boot_thread(void *arg) {
     mono_config_parse(NULL);
 
     // 崩在这里 = mono 运行时自身初始化问题（sdb trampoline 那类）
+    // iOS 不能运行时生成 trampoline 代码：强制 AOT-only（.NET MAUI iOS 的运行方式）。
+    // 仅 pro/JIT 模式跳过（那需要 MAP_JIT + dynamic-codesigning entitlement）。
+    if (strcmp(CFG.runtime_mode, "jit") != 0) {
+        mono_jit_set_aot_only(TRUE);
+        hlog("[host] 强制 mono AOT-only（iOS 禁止运行时生成 trampoline）");
+    }
+
     hlog("[host] step: mono_jit_init ...");
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
