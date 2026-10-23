@@ -118,6 +118,22 @@ for fn in ('mini/mini-arm64.c', 'mini/tramp-arm64.c'):
     open(p, 'w', encoding='utf-8').write(s)
     print("    #undef DISABLE_JIT 已插入:", fn)
 
+# (a1) 根治：直接中和 config.h.in 的 #cmakedefine DISABLE_JIT，使生成的 config.h 不再
+#      #define DISABLE_JIT。这是 DISABLE_JIT 的真正源头：编译期由 cmake 把 config.h.in
+#      生成 config.h 并 #define DISABLE_JIT，所有 #include config.h 的文件都受影响
+#      （含 arch/arm64/arm64-codegen.c 的 emit helper，之前只给 mini/tramp 注入 #undef 会漏）。
+#      去掉后整个 iOS mono 放出完整 JIT 实现，不必逐文件 #undef。逐文件 #undef 仅作冗余安全网。
+cfg = os.path.join(mono, 'cmake', 'config.h.in')
+if os.path.exists(cfg):
+    s = open(cfg, encoding='utf-8', errors='replace').read()
+    if '#cmakedefine DISABLE_JIT' in s:
+        s2 = s.replace('#cmakedefine DISABLE_JIT 1',
+                       '/* [Nebula iOS JIT] 不在 iOS 定义 DISABLE_JIT，放出完整 JIT 实现 */')
+        open(cfg, 'w', encoding='utf-8').write(s2)
+        print("    config.h.in: 已移除 DISABLE_JIT 的 cmakedefine（iOS 放出完整 JIT）")
+    else:
+        print("    !! config.h.in 未匹配到 #cmakedefine DISABLE_JIT", file=sys.stderr)
+
 # (a2) 兜底：中和构建系统里可能存在的 -DDISABLE_JIT / add_compile_definitions(DISABLE_JIT) / add_definitions(...DISABLE_JIT...)
 for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
     for f in files:
