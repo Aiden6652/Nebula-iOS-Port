@@ -449,8 +449,8 @@ static int boot_engine_poc(MonoDomain *domain, const char *dir) {
     return 1;
 }
 
-/* case_insensitive_fs.c：iOS 文件系统大小写不敏感回退 */
-void nebula_cifs_init(void);
+/* case_insensitive_fs.c：iOS 文件系统大小写不敏感回退（需传入游戏根目录） */
+void nebula_cifs_init(const char *root);
 
 /* iOS mono 产物里未必带 libSystem.Globalization.Native.a，而 mono 的
    native-library.c 会引用 _GlobalizationResolveDllImport（签名见 dotnet/runtime 的
@@ -479,31 +479,51 @@ static void hlog(const char *fmt, ...)
     va_end(ap);
 }
 
+/* 依次尝试若干可写位置建日志；游戏目录未必可写，不能只试一个 */
+static int log_try(const char *p)
+{
+    if (!p || !*p || g_logfp) return 0;
+    FILE *f = fopen(p, "w");
+    if (!f) return 0;
+    g_logfp = f;
+    hlog("[host] log -> %s", p);
+    return 1;
+}
+
 static void *boot_thread(void *arg) {
     (void)arg;
     // 全球化：默认 invariant 模式，避免 iOS 上缺 icudt.dat 崩溃（游戏模组走 UTF-8，不受影响）。
     // 若要完整文化格式化，放 icudt.dat 到 dylib 同目录并删此行。
     setenv("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1", 1);
 
-    // iOS 文件系统大小写敏感，模组路径大小写对不上会 FileNotFound 直接崩。
-    // 必须在任何文件访问（含 load_cfg / mono_jit_init）之前装上回退。
-    nebula_cifs_init();
+    {   // 尽早开日志（早到能覆盖后面每一步），并依次试多个可写位置
+        char p[PATH_MAX];
+        const char *home = getenv("HOME");
+        if (home) { snprintf(p, sizeof(p), "%s/Documents/nebula_host.log", home); log_try(p); }
+        const char *gd = getenv("NEBULA_GAME_DIR");
+        if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.log", gd);             log_try(p); }
+        log_try("/var/mobile/nebula_host.log");
+        hlog("[host] === boot start ===");
+    }
 
     char *dir = module_dir();
-    printf("[host] module dir = %s\n", dir);
+    hlog("[host] module dir = %s", dir);
 
     // 游戏根目录（BepInEx 所在处）。iOS 上由注入方指定，默认用 dylib 同目录。
     const char *root = getenv("NEBULA_GAME_DIR");
     if (!root || !*root) root = dir;
-    printf("[host] game root = %s\n", root);
+    hlog("[host] game root = %s", root);
 
-    {   // 日志写在游戏根目录：崩溃时看最后一行就知道死在哪一步
-        char logp[PATH_MAX];
-        snprintf(logp, sizeof(logp), "%s/nebula_host.log", root);
-        g_logfp = fopen(logp, "w");
-        hlog("[host] === boot start === log=%s", logp);
-        hlog("[host] module dir = %s", dir);
+    if (!g_logfp) {   // 前面候选都没成功，再试游戏根目录 / dylib 同目录
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/nebula_host.log", root); log_try(p);
+        snprintf(p, sizeof(p), "%s/nebula_host.log", dir);  log_try(p);
     }
+    if (!g_logfp) hlog("[host] !! 日志无法创建：所有候选路径都不可写");
+
+    // 大小写回退必须在知道游戏根目录后装（只对它生效），且默认关闭
+    hlog("[host] step: cifs init");
+    nebula_cifs_init(root);
 
     hlog("[host] step: load_cfg");
     load_cfg(dir);
@@ -528,13 +548,19 @@ static void *boot_thread(void *arg) {
     hlog("[host] step: mono_jit_init ...");
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
-    hlog("[host] step: mono_jit_init OK");
+    hlog("[host] step: mono_jit_init OK, RSS=%ldMB", rss_mb());
 
     // 注册预加载钩子：程序集依赖优先从 blob 内存加载（BCL/BepInEx.core 已内嵌）
     if (g_n > 0) mono_install_assembly_preload_hook(nebula_preload, NULL);
 
     hlog("[host] step: Mono 就绪, RSS=%ldMB", rss_mb());
     start_watchdog();
+
+    // 分阶段：先把虚拟机本身跑稳并回收一次，再进入模组加载，
+    // 不让 VM 初始化和全部模组/资源在同一时刻一起压进来。
+    hlog("[host] phase1: VM 就绪，先 GC 回收一次, RSS=%ldMB", rss_mb());
+    mono_gc_collect(mono_gc_max_generation());
+    hlog("[host] phase1: GC 完成, RSS=%ldMB", rss_mb());
 
     // NEBULA_BOOT: bepinex | mods | engine | auto（默认）
     // auto 的顺序：BepInEx → Mods 目录 → Engine POC
@@ -545,6 +571,7 @@ static void *boot_thread(void *arg) {
     int ok = 0;
 
     if (auto_mode || !strcmp(bm, "bepinex")) {
+        hlog("[host] phase2: 进入模组加载(BepInEx/星云), RSS=%ldMB", rss_mb());
         hlog("[host] step: boot_bepinex enter");
         ok = boot_bepinex(domain, root);
         hlog("[host] step: boot_bepinex -> %d", ok);

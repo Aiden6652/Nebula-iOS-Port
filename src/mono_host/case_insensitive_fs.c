@@ -15,8 +15,13 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #include "fishhook.h"
+
+// 只对「游戏根目录」下的路径做回退：mono 启动时会探测大量系统路径，
+// 不限定的话会对 /dev、/System、甚至上千文件的 Addons 目录反复遍历，慢到被系统杀。
+static char g_root[PATH_MAX];
 
 static int   (*orig_open)(const char *, int, ...);
 static int   (*orig_openat)(int, const char *, int, ...);
@@ -38,6 +43,12 @@ static char *resolve_ci(const char *path)
         snprintf(abs + n, sizeof(abs) - n, "/%s", path);
     } else {
         snprintf(abs, sizeof(abs), "%s", path);
+    }
+
+    if (g_root[0]) {
+        size_t rn = strlen(g_root);
+        // 必须正好是根目录本身或其子路径，否则 /GameFoo 会被误判成 /Game 内部
+        if (strncmp(abs, g_root, rn) != 0 || (abs[rn] != '/' && abs[rn] != '\0')) return NULL;
     }
 
     struct stat st;
@@ -146,13 +157,16 @@ DIR *my_opendir(const char *path)
     return d;
 }
 
-void nebula_cifs_init(void)
+void nebula_cifs_init(const char *root)
 {
     static int done = 0;
     if (done) return;
     done = 1;
-    if (getenv("NEBULA_CIFS_OFF")) {
-        fprintf(stderr, "[cifs] 已按 NEBULA_CIFS_OFF 关闭\n");
+    if (root && *root) snprintf(g_root, sizeof(g_root), "%s", root);
+    // 默认关闭：hook 全局 open/stat 影响面太大，先保证不启用时一切正常；
+    // 需要时设 NEBULA_CIFS=1 开启。
+    if (!getenv("NEBULA_CIFS")) {
+        fprintf(stderr, "[cifs] 未启用（设 NEBULA_CIFS=1 开启）root=%s\n", g_root);
         return;
     }
     struct rebinding rb[] = {
@@ -164,5 +178,16 @@ void nebula_cifs_init(void)
         {"opendir", (void *)my_opendir, (void **)&orig_opendir},
     };
     rebind_symbols(rb, sizeof(rb) / sizeof(rb[0]));
-    fprintf(stderr, "[cifs] 大小写不敏感回退已安装\n");
+    // 兜底：万一某个符号没替换成功(orig 仍为 NULL)，必须取到真实实现，
+    // 否则 my_* 会一律返回失败，把整个文件访问搞坏。
+    if (!orig_open)    orig_open    = (int (*)(const char *, int, ...))dlsym(RTLD_DEFAULT, "open");
+    if (!orig_openat)  orig_openat  = (int (*)(int, const char *, int, ...))dlsym(RTLD_DEFAULT, "openat");
+    if (!orig_fopen)   orig_fopen   = (FILE *(*)(const char *, const char *))dlsym(RTLD_DEFAULT, "fopen");
+    if (!orig_stat)    orig_stat    = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
+    if (!orig_access)  orig_access  = (int (*)(const char *, int))dlsym(RTLD_DEFAULT, "access");
+    if (!orig_opendir) orig_opendir = (DIR *(*)(const char *))dlsym(RTLD_DEFAULT, "opendir");
+    fprintf(stderr, "[cifs] 大小写不敏感回退已安装 root=%s\n", g_root);
 }
+
+/* 注：这里原本残留了一份 nebula_cifs_init_legacy() 死代码（编辑切分函数时的残留，
+   无人调用且没有 done 保护），已删除。 */
