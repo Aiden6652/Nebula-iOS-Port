@@ -40,6 +40,13 @@
 #include <mach/task_info.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <os/log.h>
+#include <signal.h>
+#else
+#include <signal.h>
+typedef void *os_log_t;
+#define os_log(...)
+#define os_log_create(...) NULL
 #endif
 
 // ---------------------------------------------------------------- 嵌入式 BCL/BepInEx blob
@@ -464,19 +471,40 @@ const void *GlobalizationResolveDllImport(const char *name)
     return NULL;
 }
 
-/* ---- 文件日志：真机拿不到 .ips 时，靠它定位崩在哪一步 ----
-   每条都 fflush，进程硬崩(SIGSEGV/SIGABRT)也能留下最后一行。 */
+/* ---- 日志：双通道 ----
+   (1) 系统日志 os_log（subsystem=com.nebula.host）：真机不依赖沙盒文件路径，
+       用 idevicesyslog 直接抓，最可靠——文件日志在沙盒里用户不易取。
+   (2) 文件：兜底，依次试多个可写位置（见 log_try）。
+   每条都 fflush，进程硬崩(SIGSEGV/SIGABRT)也能留下最后一行；
+   同时把原文存进 g_last_buf，崩点信号处理器能读出“最后执行到哪一步”。 */
 #include <stdarg.h>
-static FILE *g_logfp = NULL;
+static os_log_t g_neb_log = NULL;
+static FILE     *g_logfp   = NULL;
+static char      g_last_buf[1024];
+static const char *g_last_step = "(尚未执行任何步骤)";
+
 static void hlog(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    if (g_logfp) { vfprintf(g_logfp, fmt, ap); fputc('\n', g_logfp); fflush(g_logfp); }
+    vsnprintf(g_last_buf, sizeof(g_last_buf), fmt, ap);
     va_end(ap);
-    va_start(ap, fmt);
-    vprintf(fmt, ap); fputc('\n', stdout); fflush(stdout);
-    va_end(ap);
+    g_last_step = g_last_buf;
+    if (g_neb_log) os_log(g_neb_log, "%{public}s", g_last_buf);
+    if (g_logfp)   { fprintf(g_logfp, "%s\n", g_last_buf); fflush(g_logfp); }
+    printf("%s\n", g_last_buf); fflush(stdout);
+}
+
+/* 崩溃信号处理器：崩时把“最后执行到的步骤”打进系统日志 + 文件，再交还默认行为
+   生成崩溃报告。async-signal-safe：只读全局 buffer + 调 os_log（Apple 宣称安全）。 */
+static void neb_crash(int sig)
+{
+    if (g_neb_log)
+        os_log(g_neb_log, "!! 崩溃信号 %d，最后执行到: %{public}s",
+               sig, g_last_step ? g_last_step : "(null)");
+    if (g_logfp) { fprintf(g_logfp, "!! signal %d @ %s\n", sig, g_last_step); fflush(g_logfp); }
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 /* 依次尝试若干可写位置建日志；游戏目录未必可写，不能只试一个 */
@@ -492,6 +520,7 @@ static int log_try(const char *p)
 
 static void *boot_thread(void *arg) {
     (void)arg;
+    hlog("[host] boot thread started");
     // 全球化：默认 invariant 模式，避免 iOS 上缺 icudt.dat 崩溃（游戏模组走 UTF-8，不受影响）。
     // 若要完整文化格式化，放 icudt.dat 到 dylib 同目录并删此行。
     setenv("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1", 1);
@@ -602,7 +631,19 @@ static void boot(void) {
 
 #ifdef BUILD_AS_LIB
 __attribute__((constructor))
-static void on_load(void) { boot(); }
+static void on_load(void) {
+    // 最早能拿到的日志：系统日志 os_log，不依赖沙盒/文件，且先于 boot 建立，
+    // 这样即使 boot 之前崩，也能在 idevicesyslog 里看到“ctor entered”。
+    g_neb_log = os_log_create("com.nebula.host", "host");
+    os_log(g_neb_log, "ctor entered (dylib 已加载, before boot)");
+    // 崩时至少能知道崩在哪一步（覆盖 SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGTRAP）
+    signal(SIGSEGV, neb_crash);
+    signal(SIGABRT, neb_crash);
+    signal(SIGBUS,  neb_crash);
+    signal(SIGILL,  neb_crash);
+    signal(SIGTRAP, neb_crash);
+    boot();
+}
 #endif
 
 int main(int argc, char **argv) {
