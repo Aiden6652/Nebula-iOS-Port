@@ -37,6 +37,11 @@ jobs:
       - name: Verify embedded Mono + Roslyn JIT runs C#
         run: |
           cd src/mono_host/out
+          # runner 的 homebrew mono 是 Apple Silicon 构建：强制 aot-only 会因
+          # mscorlib 未 AOT 编译而 fatal。桌面冒烟测试本就验证 JIT 链路，
+          # 显式用 runtime.mode=jit（macOS 上 JIT 可用，靠 MAP_JIT）。
+          # 注意：iOS 真机产物由 build-ios.yml 产出，默认仍走 aot-only/interp。
+          printf 'runtime.mode=jit\n' > nebula_host.cfg
           ./nebula_mono_host 2>&1 | tee /tmp/run.log
           grep -q "C# is running" /tmp/run.log && echo "PASS: embedded Mono + Roslyn JIT executed C#"
 
