@@ -39,7 +39,7 @@
 // iOS 不能运行时生成 trampoline 代码（generic / breakpoint trampoline 都会
 // g_assert_not_reached），AOT-only 让 mono_trampolines_init 直接 return，
 // 彻底避开整组雷。这正是 .NET MAUI iOS 的运行方式。
-extern void mono_jit_set_aot_only (gboolean aot_only);
+extern void mono_jit_set_aot_only (int aot_only);
 // mono 公开 API：强制让 JIT 内存走 MAP_JIT 分配。iOS 严格 W^X 下，非 MAP_JIT 的
 // 可执行内存非法；dotnet/runtime 的 mono 只在 macOS 接了 MAP_JIT（mono-mmap.c 里
 // TARGET_OSX 硬绑），iOS 必须我们显式打开。参考 OpenJDK/Pojav 的 W^X 处理。

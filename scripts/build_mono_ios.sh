@@ -107,11 +107,13 @@ for fn in ('mini/mini-arm64.c', 'mini/tramp-arm64.c'):
         print("!! 找不到", p, file=sys.stderr); continue
     s = open(p, encoding='utf-8', errors='replace').read()
     last = -1
-    for m in re.finditer(r'^\s*#\s*include\b', s, re.M):
-        last = m.end()
+    for m in re.finditer(r'^\s*#\s*include\b.*$', s, re.M):
+        last = m.end()  # 匹配整行（含换行），插在最后一个 #include 行之后，避免拼到同行
     if last < 0: last = 0
-    ins = ("\n#undef DISABLE_JIT  /* [Nebula iOS JIT] 放出 ARM64 JIT 实现："
-           "原本被 iOS 构建的 DISABLE_JIT 排除，只剩 g_assert_not_reached 占位 */\n")
+    # 注释独占一行，#undef 独占一行且后不跟注释，规避“#undef 后跟注释”被某些预处理实现误判
+    ins = ("\n"
+           "/* [Nebula iOS JIT] 放出 ARM64 JIT 实现：原本被 iOS 构建的 DISABLE_JIT 排除，只剩 g_assert_not_reached 占位 */\n"
+           "#undef DISABLE_JIT\n")
     s = s[:last] + ins + s[last:]
     open(p, 'w', encoding='utf-8').write(s)
     print("    #undef DISABLE_JIT 已插入:", fn)
