@@ -40,6 +40,10 @@
 // g_assert_not_reached），AOT-only 让 mono_trampolines_init 直接 return，
 // 彻底避开整组雷。这正是 .NET MAUI iOS 的运行方式。
 extern void mono_jit_set_aot_only (gboolean aot_only);
+// mono 公开 API：强制让 JIT 内存走 MAP_JIT 分配。iOS 严格 W^X 下，非 MAP_JIT 的
+// 可执行内存非法；dotnet/runtime 的 mono 只在 macOS 接了 MAP_JIT（mono-mmap.c 里
+// TARGET_OSX 硬绑），iOS 必须我们显式打开。参考 OpenJDK/Pojav 的 W^X 处理。
+extern void mono_setmmapjit (int flag);
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -580,9 +584,14 @@ static void *boot_thread(void *arg) {
     mono_config_parse(NULL);
 
     // 崩在这里 = mono 运行时自身初始化问题（sdb trampoline 那类）
-    // iOS 不能运行时生成 trampoline 代码：强制 AOT-only（.NET MAUI iOS 的运行方式）。
-    // 仅 pro/JIT 模式跳过（那需要 MAP_JIT + dynamic-codesigning entitlement）。
-    if (strcmp(CFG.runtime_mode, "jit") != 0) {
+    if (strcmp(CFG.runtime_mode, "jit") == 0) {
+        // pro/JIT 模式：保留 JIT，且强制 JIT 内存走 MAP_JIT 分配。
+        // iOS 严格 W^X：非 MAP_JIT 的可执行内存非法，必须 MAP_JIT + 后续
+        // pthread_jit_write_protect_np 翻转（参考 OpenJDK os_bsd_aarch64.cpp）。
+        mono_setmmapjit(1);
+        hlog("[host] pro/JIT 模式：保留 JIT + 强制 MAP_JIT 分配");
+    } else {
+        // standard：强制 AOT-only，避开运行时生成 trampoline（.NET MAUI iOS 的运行方式）。
         mono_jit_set_aot_only(TRUE);
         hlog("[host] 强制 mono AOT-only（iOS 禁止运行时生成 trampoline）");
     }

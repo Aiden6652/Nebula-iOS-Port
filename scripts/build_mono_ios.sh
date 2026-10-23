@@ -38,7 +38,10 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-2}"
+CACHE_VERSION="${CACHE_VERSION:-3}"
+# iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
+# 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
+MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
 
 # 缓存复用：CI 用 actions/cache 恢复 ~/mono-installs；产物完整就跳过全量编译
 if [ -f "$INSTALL/lib/libmonosgen-2.0.a" ] && [ -d "$INSTALL/include/mono-2.0" ] && [ -n "$(ls -A "$INSTALL/lib/net8.0" 2>/dev/null)" ] && [ "$(cat "$INSTALL/.cache_version" 2>/dev/null)" = "$CACHE_VERSION" ]; then
@@ -87,6 +90,66 @@ s = s[:m.start()] + new + s[m.end():]
 open(p, 'w', encoding='utf-8').write(s)
 print("    补丁已应用到 mini-arm64.c")
 PY
+
+echo "=== [3.5/5] iOS JIT 支持（参考 OpenJDK/Pojav 的 W^X 处理）==="
+if [ "${MONO_IOS_JIT:-1}" = "1" ]; then
+  RT="$WORK/runtime"
+  python3 - "$RT" <<'PY'
+import os, re, sys
+rt = sys.argv[1]
+mono = os.path.join(rt, 'src/mono')
+
+# (a) 放出 JIT：在 tramp-arm64.c / mini-arm64.c 的 #include 段之后取消 DISABLE_JIT 定义，
+#     让真正 的 ARM64 JIT 实现（generic trampoline + emit 后端）参与编译，而不是 g_assert_not_reached 占位。
+for fn in ('mini/mini-arm64.c', 'mini/tramp-arm64.c'):
+    p = os.path.join(mono, 'mono', fn)
+    if not os.path.exists(p):
+        print("!! 找不到", p, file=sys.stderr); continue
+    s = open(p, encoding='utf-8', errors='replace').read()
+    last = -1
+    for m in re.finditer(r'^\s*#\s*include\b', s, re.M):
+        last = m.end()
+    if last < 0: last = 0
+    ins = ("\n#undef DISABLE_JIT  /* [Nebula iOS JIT] 放出 ARM64 JIT 实现："
+           "原本被 iOS 构建的 DISABLE_JIT 排除，只剩 g_assert_not_reached 占位 */\n")
+    s = s[:last] + ins + s[last:]
+    open(p, 'w', encoding='utf-8').write(s)
+    print("    #undef DISABLE_JIT 已插入:", fn)
+
+# (a2) 兜底：中和构建系统里可能存在的 -DDISABLE_JIT / add_compile_definitions(DISABLE_JIT) / add_definitions(...DISABLE_JIT...)
+for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
+    for f in files:
+        if not (f == 'CMakeLists.txt' or f.endswith('.cmake') or f.endswith('.txt')):
+            continue
+        p = os.path.join(root, f)
+        try: s = open(p, encoding='utf-8', errors='replace').read()
+        except: continue
+        if 'DISABLE_JIT' not in s: continue
+        s2 = re.sub(r'-DDISABLE_JIT\b', '', s)
+        s2 = re.sub(r'\badd_compile_definitions\s*\(\s*DISABLE_JIT\s*\)', '', s2)
+        s2 = re.sub(r'\badd_definitions\s*\([^)]*DISABLE_JIT[^)]*\)', '', s2)
+        if s2 != s:
+            open(p,'w').write(s2)
+            print("    中和 DISABLE_JIT 定义:", os.path.relpath(p, mono))
+
+# (b) 把 MAP_JIT 分配从 macOS-only 扩展到 iOS（mono-mmap.c）。
+#     原守卫 #if ... && defined(TARGET_OSX) 让 iOS 完全跳过 MAP_JIT，导致 JIT 内存非法。
+mp = os.path.join(mono, 'mono', 'utils', 'mono-mmap.c')
+s = open(mp, encoding='utf-8', errors='replace').read()
+s2 = s.replace('#if defined(__APPLE__) && defined(MAP_JIT) && defined(TARGET_OSX)',
+               '#if defined(__APPLE__) && defined(MAP_JIT) && (defined(TARGET_OSX) || defined(TARGET_IOS))')
+s2 = s2.replace('if (__builtin_available (macOS 11, *))',
+                'if (__builtin_available (macOS 11, iOS 14, *))')
+if s2 != s:
+    open(mp,'w').write(s2)
+    print("    mono-mmap.c: MAP_JIT 已扩展到 iOS + 可用性修正为 iOS 14")
+else:
+    print("    !! mono-mmap.c 未匹配到 MAP_JIT 守卫（mono 版本可能已改结构）", file=sys.stderr)
+PY
+  echo "    [JIT] DISABLE_JIT 已放出 + MAP_JIT 已扩展到 iOS"
+else
+  echo "    MONO_IOS_JIT 未开启，保留标准 DISABLE_JIT 构建（standard 安全）"
+fi
 
 echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="
 cd "$WORK/runtime"
