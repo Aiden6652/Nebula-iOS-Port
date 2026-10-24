@@ -583,6 +583,14 @@ static void *boot_thread(void *arg) {
     hlog("[host] step: mono_config_parse");
     mono_config_parse(NULL);
 
+    // —— Pro 版二进制（编译期 -DNEBULA_PRO）：强制走 JIT，忽略任何配置/环境变量 ——
+    // 这样 libnebula_pro.dylib 注入即 JIT，无需 NEBULA_PROFILE 或 *.cfg 配合。
+    // 之前 pro / standard 是同一份二进制、仅靠 runtime.mode 配置切换，注入 pro 却
+    // 没配置就掉进解释器分支（真机日志实证）。现在 pro 自带 JIT，注入即用。
+#ifdef NEBULA_PRO
+    mono_setmmapjit(1);
+    hlog("[host] Pro 版二进制：强制 JIT + 强制 MAP_JIT（要求 dynamic-codesigning 权限，否则 SIGSEGV）");
+#else
     // 崩在这里 = mono 运行时自身初始化问题（sdb trampoline 那类）
     if (strcmp(CFG.runtime_mode, "jit") == 0) {
         // pro/JIT 模式：保留 JIT，且强制 JIT 内存走 MAP_JIT 分配。
@@ -595,12 +603,20 @@ static void *boot_thread(void *arg) {
         // 不能强制 aot-only！星云舰的 DLL 是未 AOT 预编译的 IL 程序集，
         // aot-only 模式下 mono 加载 mscorlib 等会因缺 AOT 镜像直接 fatal
         // （真机日志死在 mono_jit_init，桌面 runner 上同样复现）。
-        // 解释器不需要 JIT 也不需要 trampoline，纯软件执行 IL，
-        // 无需 JIT entitlement，是 iOS 无 JIT 权限时的正确路径。
+        // 解释器纯软件执行 IL，无需 JIT entitlement，是 iOS 无 JIT 权限时的正确路径。
         // 通过 MONO_ENV_OPTIONS=--interpreter 强制（mono_jit_init 会解析它）。
+        //
+        // 关键：standard 也要强制 MAP_JIT！mono 初始化时会生成 generic trampoline
+        // （写 ARM64 代码到可执行内存），与解释器/JIT 无关；iOS 严格 W^X，
+        // 非 MAP_JIT 内存写入后执行即 SIGSEGV（signal 11 @ mono_jit_init）。
+        // MAP_JIT 让代码管理器走 MAP_JIT 分配，mono 内部对 __APPLE__ 已有
+        // pthread_jit_write_protect_np 翻转（我们已把守卫扩到 iOS）。
+        // 没 JIT entitlement 时解释器不真正 JIT 代码，MAP_JIT 仅用于 trampoline，无害。
+        mono_setmmapjit(1);
         setenv("MONO_ENV_OPTIONS", "--interpreter", 1);
-        hlog("[host] standard 模式：强制 Mono 解释器（--interpreter），不用 aot-only");
+        hlog("[host] standard 模式：解释器 + 强制 MAP_JIT（trampoline 生成需可执行内存）");
     }
+#endif
 
     hlog("[host] step: mono_jit_init ...");
     MonoDomain *domain = mono_jit_init("NebulaHost");

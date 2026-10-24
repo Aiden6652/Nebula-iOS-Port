@@ -114,6 +114,8 @@ print("blob: %d 个程序集, %d bytes" % (len(entries), len(buf)))
 PY
 
 echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
+
+# standard / mono_host：不限定运行模式，由 runtime.mode 配置决定（默认 interp）。
 "$CCBIN" -arch arm64 \
   -isysroot "$SDK" \
   -miphoneos-version-min="$MIN_IOS" \
@@ -131,16 +133,33 @@ echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
   -framework Security \
   -lobjc -lc++ -lpthread -lz -lm
 
+cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_standard.dylib"
+
+# pro：编译期注入 -DNEBULA_PRO=1 → 二进制强制走 JIT，无需 NEBULA_PROFILE / cfg 配合。
+# 之前 pro / standard 是同一份二进制、仅靠 runtime.mode 配置切换，注入 pro 却没配
+# 置就会掉进解释器分支（真机日志实证）。现在 pro 自带 JIT，注入即用。
+"$CCBIN" -arch arm64 \
+  -isysroot "$SDK" \
+  -miphoneos-version-min="$MIN_IOS" \
+  -dynamiclib -fPIC \
+  -DBUILD_AS_LIB -DNEBULA_PRO=1 \
+  -I"$MONO_INC" \
+  -o "$OUT/libnebula_pro.dylib" \
+  "$ROOT/nebula_mono_host.c" \
+  "$ROOT/case_insensitive_fs.c" \
+  "$ROOT/fishhook.c" \
+  "${LIBS[@]}" \
+  -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
+  -framework Foundation \
+  -framework CoreFoundation \
+  -framework Security \
+  -lobjc -lc++ -lpthread -lz -lm
+
 # 注：BCL 已嵌入 dylib 的 __nebulabcl 段（见上方 blob 生成），不再散落 bcl/ 目录。
 # 运行时由 nebula_mono_host.c 的 Mono 预加载钩子从内存加载。
 BLOBSZ="$(wc -c < "$BLOB" 2>/dev/null || echo 0)"
 echo "BCL 状态: 已内嵌（${BLOBSZ} bytes 烧进 dylib 的 __nebulabcl 段）"
 rm -f "$BLOB"   # 临时 blob 已烧进段，删掉避免被打进 artifact
-
-# Standard / Pro 是同一份二进制，区别只在 nebula_host.<profile>.cfg 里的
-# runtime.mode（interp / jit）。这里各出一份带名字的副本，方便直接分发、不用改配置。
-cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_standard.dylib"
-cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_pro.dylib"
 
 echo "=== 校验 ==="
 lipo -info "$OUT/libnebula_mono_host.dylib"
