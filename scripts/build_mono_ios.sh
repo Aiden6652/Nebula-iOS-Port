@@ -203,16 +203,23 @@ if os.path.exists(cm):
     # 进程运行时内核提供实现（Pojav/Amethyst 同机制）。编译期必须自己声明，否则
     # "call to undeclared function" 报错。macOS 上重复 extern 声明无害。
     import re as _re
-    decl = ('#if defined(__APPLE__)\n'
-            '/* [Nebula iOS] iOS SDK 不公开声明 pthread_jit_write_protect_np；'
-            '带 JIT 能力的进程运行时可用。 */\n'
-            'extern int pthread_jit_write_protect_np(int enabled);\n'
+    # weak_import：iOS SDK 的 libpthread.tbd 不公开导出 pthread_jit_write_protect_np，
+    # 直接 extern 会让链接器报 undefined symbol。用 weak_import 声明让链接器允许该符号
+    # 在运行时由 dyld 解析（iOS 14+ libpthread 实际导出，配 StikDebug/JIT entitlement 可用；
+    # iOS<14 由 __builtin_available(iOS 14) 守卫不会进入调用，weak 引用为 NULL 也无妨）。
+    # 仅对 TARGET_IOS 生效，避免和 macOS SDK 已有的非 weak 声明冲突。
+    # 注入在最后一个 #include 之后（config.h 等已包含，TARGET_IOS 必已定义，且仍在调用点之前）。
+    decl = ('\n'
+            '#if defined(TARGET_IOS) && TARGET_IOS\n'
+            '/* [Nebula iOS] iOS SDK 不公开声明 pthread_jit_write_protect_np；weak_import 避免链接期 undefined symbol */\n'
+            'extern int pthread_jit_write_protect_np(int enabled) __attribute__((weak_import));\n'
             '#endif\n')
-    _m = _re.search(r'(?m)^#include', s2)
-    if _m:
-        s2 = s2[:_m.start()] + decl + '\n' + s2[_m.start():]
+    _incs = list(_re.finditer(r'(?m)^#\s*include\b.*$', s2))
+    if _incs:
+        _end = _incs[-1].end()
+        s2 = s2[:_end] + decl + s2[_end:]
     else:
-        s2 = decl + '\n' + s2
+        s2 = decl + s2
     if s2 != s:
         open(cm, 'w', encoding='utf-8').write(s2)
         print("    mono-codeman.c: W^X 翻转守卫已扩到 TARGET_IOS + 可用性 iOS 14 + 注入 pthread_jit_write_protect_np 声明")
