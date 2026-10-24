@@ -252,7 +252,9 @@ int nebula_ui_install_now(void)
             NebulaPanelCtl *ctl = objc_getAssociatedObject(g_panel, &g_ctl_key);
             [btn addTarget:ctl action:@selector(onToggle:) forControlEvents:UIControlEventTouchUpInside];
             [win addSubview:btn];
-            [win bringSubviewToFront:btn];
+            [win bringSubviewToFront:g_panel];   /* #13 面板 > 游戏 UI */
+            [win bringSubviewToFront:btn];        /* #13 按钮 > 面板（最顶层，确保可点） */
+            if (g_panel) g_panel.userInteractionEnabled = YES;
             ok = 1;
         } @catch (NSException *e) {
             nebula_log("面板：创建异常 %s", [[e reason] UTF8String]);
@@ -347,6 +349,11 @@ static void build_panel(UIWindow *win)
     [bar addSubview:addBtn];
 
     [panel addSubview:bar];
+
+    /* #13 UI 层级与触控接管：面板置顶（压在游戏原版 UI 之上）+ 开启交互，
+       确保悬浮按钮/面板不被原版底层吞掉触控事件。 */
+    panel.userInteractionEnabled = YES;
+    [win bringSubviewToFront:panel];
 
     /* ---- 267 行可滚动列表 ---- */
     UIScrollView *list = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 96, pw, ph - 96)];
@@ -443,6 +450,7 @@ static void build_panel(UIWindow *win)
     g_list  = list;
     g_panel = panel;
     [win addSubview:panel];
+    [win bringSubviewToFront:panel];   /* #13 确保面板在游戏原版 UI 之上 */
 }
 
 __attribute__((constructor))

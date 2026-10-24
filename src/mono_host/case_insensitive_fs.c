@@ -54,10 +54,21 @@ static char *resolve_ci(const char *path)
     struct stat st;
     if (orig_stat && orig_stat(abs, &st) == 0) return NULL;   // 精确存在就别折腾
 
+    // #6 防死锁：负向缓存。同一路径若最近解析失败过，直接返回失败，
+    // 不再走昂贵的逐层 opendir 遍历（避免高频 ENOENT 路径反复拖慢甚至卡顿）。
+    static char g_negcache[16][PATH_MAX];
+    static int  g_neg_i = 0;
+    for (int i = 0; i < 16; i++) {
+        if (g_negcache[i][0] && strcmp(g_negcache[i], abs) == 0) return NULL;
+    }
+
     char out[PATH_MAX];
     out[0] = '\0';
     char *save = NULL;
+    int opens = 0;
+    const int MAX_CIFS_OPENS = 64;   // #6 单次解析最多 opendir 次数上限，杜绝异常路径下的失控遍历
     for (char *tok = strtok_r(abs, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
+        if (opens++ >= MAX_CIFS_OPENS) return NULL;
         char parent[PATH_MAX];
         snprintf(parent, sizeof(parent), "/%s", out);
         DIR *d = orig_opendir ? orig_opendir(parent) : opendir(parent);
@@ -73,7 +84,12 @@ static char *resolve_ci(const char *path)
             }
         }
         closedir(d);
-        if (!hit) return NULL;
+        if (!hit) {
+            // 记录到负向缓存（环形覆盖），下次直接短路
+            snprintf(g_negcache[g_neg_i], sizeof(g_negcache[g_neg_i]), "%s", abs);
+            g_neg_i = (g_neg_i + 1) % 16;
+            return NULL;
+        }
         size_t n = strlen(out);
         snprintf(out + n, sizeof(out) - n, "%s%s", n ? "/" : "", found);
     }

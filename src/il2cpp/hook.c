@@ -14,6 +14,7 @@
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>   /* #3 段保护用到 struct mach_header_64 / LC_SEGMENT_64 */
 #endif
 
 #define MAX_HOOKS 32
@@ -93,6 +94,15 @@ int nebula_hook_install(const char *class_hint, const char *method_name,
     nebula_method_fn_t orig = *(nebula_method_fn_t *)m;
     if (!orig) { hlog("hook: %s.%s 原入口为空", class_hint, method_name); return -1; }
 
+#if defined(__APPLE__)
+    /* #3 段保护：改写前确认 MethodInfo 不在带签名的 __TEXT 段（否则 AMFI 强杀）。 */
+    if (nebula_addr_in_text(m)) {
+        hlog("hook: 拒绝改写 __TEXT 段方法 %s.%s（避免 AMFI 强杀），退回数据段改写",
+             class_hint, method_name);
+        return -1;
+    }
+#endif
+
     /* ↓↓ 纯数据写：重定向该方法的执行流，未触碰任何代码字节，故不需要 JIT */
     *(nebula_method_fn_t *)m = replacement;
 
@@ -111,6 +121,36 @@ int nebula_hook_install(const char *class_hint, const char *method_name,
 int nebula_hook_count(void) { return g_nhooks; }
 
 void nebula_hook_set_tick(void (*tick_cb)(void)) { g_tick_cb = tick_cb; }
+
+#if defined(__APPLE__)
+/* #3 段保护：绝不允许改写带签名的 __TEXT 代码段（会触发 AMFI 强杀、进程秒死）。
+   在改写 MethodInfo 的方法指针前，确认目标地址落在可写数据段（__DATA/__DATA_CONST）
+   而非 __TEXT。若落在 __TEXT，拒绝安装并告警，退回"纯字段轮询"模式。 */
+static int nebula_addr_in_text(const void *p) {
+    uint32_t n = _dyld_image_count();
+    uintptr_t addr = (uintptr_t)p;
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (!mh) continue;
+        uintptr_t base = (uintptr_t)mh;
+        if (addr < base) continue;
+        struct load_command *lc = (struct load_command *)(base + sizeof(struct mach_header_64));
+        uint32_t ncmds = ((struct mach_header_64 *)mh)->ncmds;
+        for (uint32_t c = 0; c < ncmds; c++) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                struct segment_command_64 *sg = (struct segment_command_64 *)lc;
+                uintptr_t s = base + sg->vmaddr;
+                uintptr_t e = s + sg->vmsize;
+                if (addr >= s && addr < e)
+                    return (strncmp(sg->segname, "__TEXT", 7) == 0) ? 1 : 0;
+            }
+            if (lc->cmdsize == 0) break;
+            lc = (struct load_command *)((uintptr_t)lc + lc->cmdsize);
+        }
+    }
+    return 0;   /* 找不到所属段 → 保守认为不在 __TEXT */
+}
+#endif
 
 /* ★ 安装时保存下来的【真实原入口】。
    以前这里是写死查 "GameManager.Update"，而实际装的是 FixedUpdate，

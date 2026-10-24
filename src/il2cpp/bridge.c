@@ -46,34 +46,71 @@ static void sleep_ms(int ms) {
     nanosleep(&ts, NULL);
 }
 
+/* #2 内存对齐防御：跨语言读取 IL2CPP 对象头/字段时，ARM64 要求 8 字节对齐的指针解引用。
+   传入指针若未对齐，强行解引用会触发 SIGBUS 硬件崩溃。这里做防御性校验，
+   未对齐直接返回失败（不崩），且只告警一次。 */
+static int g_align_warn = 0;
+static void nlog_deferred(const char *fmt, ...);   /* 前向声明（定义见下方） */
+static int nebula_ptr_aligned(const void *p) {
+    if (((uintptr_t)p & 7) == 0) return 1;
+    if (!g_align_warn) { g_align_warn = 1; nlog_deferred("BRIDGE: 检测到非 8 字节对齐的对象指针 %p（已拒绝读取，防 SIGBUS）", p); }
+    return 0;
+}
+
 /* ---------- 日志：syslog + 文件（文件可被 iTunes 文件共享取出，不需越狱） ---------- */
+/* #7 日志降级：高频写文件会拖慢主线程（甚至触发 iOS 看门狗 20s 强杀）。
+   改法：(1) openlog 只调一次；(2) 保持一个持久文件句柄，不每次 fopen/fclose；
+   (3) 每秒至多 60 行落盘，超出只走 syslog（内核队列、主线程安全且便宜）。 */
+static int  g_log_opened = 0;
+static FILE *g_neb_logfp = NULL;
+static time_t g_last_log_t = 0;
+static int  g_log_count = 0;
+static long g_neb_writes = 0;
+
+/* nebula_log 内部用：在还没装 syslog 前（极早期）也能暂存一行告警，避免丢掉关键错误。
+   实现很简单：直接 fputs 到 stderr（stderr 在 idevicesyslog 里也能看到）。 */
+static void nlog_deferred(const char *fmt, ...) {
+    char buf[512]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    fprintf(stderr, "[Nebula-iOS] %s\n", buf);
+}
+
 void nebula_log(const char *fmt, ...) {
     char buf[512];
     va_list ap;
     va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
 
-    openlog(NEBULA_LOG_TAG, LOG_PID | LOG_CONS, LOG_USER);
-    syslog(LOG_NOTICE, "%s", buf);
+    if (!g_log_opened) {
+        openlog(NEBULA_LOG_TAG, LOG_PID, LOG_USER);   /* #7 openlog 只调一次 */
+        g_log_opened = 1;
+    }
+    syslog(LOG_NOTICE, "%s", buf);   /* syslog 是内核队列，主线程安全且便宜 */
 
     const char *home = getenv("HOME");
     if (home) {
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/Documents/nebula_log.txt", home);
-        /* ★ 存储防护：日志不能无限增长（每轮都写，久了会撑满磁盘）。
-           超过上限就截断重写，只保留最新内容。 */
-        FILE *chk = fopen(path, "rb");
-        if (chk) {
-            fseek(chk, 0, SEEK_END);
-            long sz = ftell(chk);
-            fclose(chk);
-            if (sz > NEBULA_LOG_MAX_BYTES) {
-                FILE *tr = fopen(path, "w");       /* 超限：清空重来 */
-                if (tr) { fprintf(tr, "[Nebula-iOS] （日志超过 %d KB，已截断，以下为最新）\n",
-                                  NEBULA_LOG_MAX_BYTES / 1024); fclose(tr); }
+        time_t now = time(NULL);
+        if (now != g_last_log_t) { g_last_log_t = now; g_log_count = 0; }
+        g_log_count++;
+        if (g_log_count <= 60) {   /* #7 每秒至多 60 行落盘，防主线程卡死 */
+            if (!g_neb_logfp) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/Documents/nebula_log.txt", home);
+                FILE *chk = fopen(path, "rb");
+                if (chk) {
+                    fseek(chk, 0, SEEK_END); long sz = ftell(chk); fclose(chk);
+                    if (sz > NEBULA_LOG_MAX_BYTES) {
+                        FILE *tr = fopen(path, "w");   /* 超限：截断重写 */
+                        if (tr) { fprintf(tr, "[Nebula-iOS] （日志超过 %d KB，已截断）\n", NEBULA_LOG_MAX_BYTES / 1024); fclose(tr); }
+                    }
+                }
+                g_neb_logfp = fopen(path, "a");
+            }
+            if (g_neb_logfp) {
+                fprintf(g_neb_logfp, "[Nebula-iOS] %s\n", buf);
+                fflush(g_neb_logfp);
+                /* 周期性重开文件，确保超限能被截断（避免句柄一直指向超大文件） */
+                if (++g_neb_writes % 2000 == 0) { fclose(g_neb_logfp); g_neb_logfp = NULL; }
             }
         }
-        FILE *fp = fopen(path, "a");
-        if (fp) { fprintf(fp, "[Nebula-iOS] %s\n", buf); fclose(fp); }
     }
 }
 
@@ -394,7 +431,19 @@ void *nebula_il2cpp_find_class_by_hint(const char *substr) {
 void *nebula_il2cpp_class_get_method(void *klass, const char *name) {
     if (!g_api_ok || !klass || !name) return NULL;
     if (!A.class_get_method_from_name) return NULL;
-    return A.class_get_method_from_name(klass, name, -1);  /* -1 = 不限制参数个数 */
+    void *m = A.class_get_method_from_name(klass, name, -1);  /* -1 = 不限制参数个数 */
+    if (!m) {
+        /* #11 空指针兜底：找不到原版方法时打印 Missing Method 并返回 NULL（不崩）。
+           调用方（hook/字段定位）都做了 NULL 判断。频次较高，最多告警 32 次。 */
+        static int miss_log = 0;
+        if (miss_log < 32) {
+            const char *cn = (A.class_get_name) ? A.class_get_name(klass) : NULL;
+            nlog("BRIDGE: Missing Method: %s.%s（已返回 NULL，调用方安全降级）",
+                 cn ? cn : "?", name);
+            if (++miss_log == 32) nlog("BRIDGE: Missing Method 告警已达上限，后续不再打印");
+        }
+    }
+    return m;
 }
 
 /* ===================== 字段读写 ===================== */
@@ -402,6 +451,7 @@ static void *field_off_and_ptr(void *obj, const char *field, ptrdiff_t *out_off)
     if (!g_api_ok || !obj || !field) {
         return NULL;
     }
+    if (!nebula_ptr_aligned(obj)) return NULL;   /* #2 内存对齐防御（ARM64 指针解引用需 8 字节对齐） */
     /* 需要知道 class 才能查字段：从对象头读 klass 指针（offset 0） */
     void *klass = *(void **)obj;
     if (!klass) return NULL;
@@ -1080,6 +1130,7 @@ static int static_field_ptr(void *klass, const char *name, void **out)
 static int list_elements(void *list_obj, void **out, int max)
 {
     if (!list_obj || !out || max <= 0) return -1;
+    if (!nebula_ptr_aligned(list_obj)) return -1;   /* #2 内存对齐防御 */
     void *klass = *(void **)list_obj;
     if (!klass) return -1;
     ptrdiff_t items_off = -1, size_off = -1;

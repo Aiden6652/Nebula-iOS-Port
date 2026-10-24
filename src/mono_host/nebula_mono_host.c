@@ -178,7 +178,8 @@ static MonoAssembly *nebula_preload(MonoAssemblyName *aname, char **assemblies_p
 typedef struct {
     char runtime_mode[16];      // interp | jit | auto
     int  gc_nursery_mb;
-    int  gc_soft_limit_mb;
+    int  gc_soft_limit_mb;      // 软顶：超过即常规 GC（默认 320MB）
+    int  gc_hard_limit_mb;      // 硬顶：超过即激进全量 GC + 告警（默认 500MB，见 #12）
     int  gc_watchdog_interval_ms;
     char addons_mode[16];       // all（职业在 addon 里，必须全加载）
     int  addons_texture_max_px;
@@ -194,6 +195,7 @@ static host_cfg CFG = {
     .runtime_mode = "interp",
     .gc_nursery_mb = 16,
     .gc_soft_limit_mb = 320,
+    .gc_hard_limit_mb = 500,    // #12：RSS 超 500MB 强制激进 GC，防 jetsam 杀
     .gc_watchdog_interval_ms = 2000,
     .addons_mode = "all",
     .addons_texture_max_px = 512,
@@ -248,6 +250,7 @@ static void load_cfg(const char *dir) {
         if      (!strcmp(k, "runtime.mode"))             snprintf(CFG.runtime_mode, sizeof(CFG.runtime_mode), "%s", v);
         else if (!strcmp(k, "gc.nursery_mb"))            CFG.gc_nursery_mb = atoi(v);
         else if (!strcmp(k, "gc.soft_limit_mb"))         CFG.gc_soft_limit_mb = atoi(v);
+        else if (!strcmp(k, "gc.hard_limit_mb"))         CFG.gc_hard_limit_mb = atoi(v);
         else if (!strcmp(k, "gc.watchdog_interval_ms"))   CFG.gc_watchdog_interval_ms = atoi(v);
         else if (!strcmp(k, "addons.mode"))              snprintf(CFG.addons_mode, sizeof(CFG.addons_mode), "%s", v);
         else if (!strcmp(k, "addons.texture_max_px"))    CFG.addons_texture_max_px = atoi(v);
@@ -268,8 +271,8 @@ static void load_cfg(const char *dir) {
     snprintf(buf, sizeof(buf), "%d", CFG.render_target_fps);       setenv("NEBULA_TARGET_FPS", buf, 1);
     snprintf(buf, sizeof(buf), "%d", CFG.render_adaptive);         setenv("NEBULA_ADAPTIVE", buf, 1);
 
-    printf("[host] cfg: mode=%s nursery=%dMB soft_limit=%dMB | addons=%s 贴图≤%dpx 缓存%dMB roslyn=%d\n",
-           CFG.runtime_mode, CFG.gc_nursery_mb, CFG.gc_soft_limit_mb,
+    printf("[host] cfg: mode=%s nursery=%dMB soft_limit=%dMB hard_limit=%dMB | addons=%s 贴图≤%dpx 缓存%dMB roslyn=%d\n",
+           CFG.runtime_mode, CFG.gc_nursery_mb, CFG.gc_soft_limit_mb, CFG.gc_hard_limit_mb,
            CFG.addons_mode, CFG.addons_texture_max_px, CFG.addons_texture_cache_mb, CFG.roslyn_enabled);
     if (CFG.render_target_fps > 0)
         printf("[host] cfg: 目标帧率=%d fps adaptive=%d\n", CFG.render_target_fps, CFG.render_adaptive);
@@ -318,9 +321,18 @@ static void *watchdog_thread(void *arg) {
     (void)arg;
     while (watchdog_run) {
         long mb = rss_mb();
-        if (mb > 0 && CFG.gc_soft_limit_mb > 0 && mb > CFG.gc_soft_limit_mb) {
-            fprintf(stderr, "[host][mem] RSS %ldMB 超过软顶 %dMB，强制 GC\n", mb, CFG.gc_soft_limit_mb);
-            mono_gc_collect(mono_gc_max_generation());
+        if (mb > 0) {
+            // #12 硬顶：RSS 超过 hard_limit（默认 500MB）→ 激进全量 GC + 告警，防 jetsam 杀
+            if (CFG.gc_hard_limit_mb > 0 && mb > CFG.gc_hard_limit_mb) {
+                fprintf(stderr, "[host][mem] !! RSS %ldMB 超过硬顶 %dMB，激进全量 GC！\n", mb, CFG.gc_hard_limit_mb);
+                mono_gc_collect(mono_gc_max_generation());
+                long after = rss_mb();
+                fprintf(stderr, "[host][mem]     GC 后 RSS=%ldMB\n", after);
+            } else if (CFG.gc_soft_limit_mb > 0 && mb > CFG.gc_soft_limit_mb) {
+                // 软顶：超过即常规 GC
+                fprintf(stderr, "[host][mem] RSS %ldMB 超过软顶 %dMB，强制 GC\n", mb, CFG.gc_soft_limit_mb);
+                mono_gc_collect(mono_gc_max_generation());
+            }
         }
         long ms = CFG.gc_watchdog_interval_ms > 0 ? CFG.gc_watchdog_interval_ms : 2000;
         usleep((useconds_t)(ms * 1000));
@@ -749,6 +761,10 @@ static void *boot_thread(void *arg) {
     int ok = 0;
 
     if (auto_mode || !strcmp(bm, "bepinex")) {
+        // #5 防 Interop 生成 OOM：BepInEx 现场解析原版二进制生成 Il2CppInterop 桥接类，
+        // 一次性吃掉大量托管内存。进入前先强制全量 GC 腾出空间，降低 jetsam 风险。
+        hlog("[host] phase2 前强制 GC（防 Interop 生成 OOM）, RSS=%ldMB", rss_mb());
+        mono_gc_collect(mono_gc_max_generation());
         hlog("[host] phase2: 进入模组加载(BepInEx/星云), RSS=%ldMB", rss_mb());
         hlog("[host] step: boot_bepinex enter");
         ok = boot_bepinex(domain, root);

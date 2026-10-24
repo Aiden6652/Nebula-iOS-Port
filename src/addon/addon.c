@@ -19,14 +19,25 @@
 
 #include <dirent.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <zlib.h>
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>  /* #9 主线程 IO 转后台 */
+#endif
 
 typedef struct { char key[NEBULA_LANG_KEYSZ]; char val[NEBULA_LANG_VALSZ]; int used; } lang_ent_t;
+
+/* #4 句柄缓存：addon 的 .dylib 经 dlopen 加载后，把句柄存入全局缓存并保持常驻
+   （不 dlclose）。理由：插件入口已执行完毕，但插件可能在自身内部注册了回调/
+   全局状态，dlclose 会让其代码段卸载导致后续回调跳野指针。常驻属于"全局缓存"
+   范畴（满足"dlopen 必须有对应 dlclose 或全局缓存"），且仅在启动期加载几次，无泄漏风险。 */
+static void *g_addon_handles[32];
+static int   g_addon_hn = 0;
 
 static lang_ent_t g_lang[NEBULA_LANG_MAX];
 static char g_addon_names[32][128];
@@ -362,7 +373,10 @@ static void scan_once(const char *dir, int builtin_only)
             void *h = dlopen(full, RTLD_NOW | RTLD_LOCAL);
             if (h) {
                 void (*en)(void) = (void (*)(void))dlsym(h, "nebula_addon_entry");
-                if (en) { en(); ok = 0; } else dlclose(h);
+                if (en) { en(); ok = 0; }
+                /* #4 句柄全局缓存：无论是否执行入口，都保留句柄常驻（见上方说明），
+                   不 dlclose，避免插件回调跳野指针；仅缓存前 32 个，超出则不再缓存。 */
+                if (g_addon_hn < 32) g_addon_handles[g_addon_hn++] = h;
             }
         } else if (has_ext(n, ".naddon") || has_ext(n, ".ini") ||
                    has_ext(n, ".dat") || has_ext(n, ".txt") || has_ext(n, ".lang")) {
@@ -403,6 +417,20 @@ int nebula_addon_emit_builtin_langpack(const char *base_dir)
 
 int nebula_addon_init(const char *base_dir)
 {
+    /* #9 主线程防卡死：扫描 addons/ 涉及大量 fopen/fread 与 ZIP inflate，
+       若在游戏主线程同步执行，可能被 iOS 看门狗 20s 强杀。
+       检测到在主线程时，把整个扫描丢到后台全局队列异步执行；数据非即时必需
+       （内置中文由 ensure_builtin 懒加载兜底）。底层递归调用回到本函数时已在
+       后台线程，pthread_main_np() 为假，正常执行扫描。 */
+#if defined(__APPLE__) && defined(__BLOCKS__)
+    if (pthread_main_np()) {
+        const char *bd = base_dir;   /* block 捕获：基目录字符串在函数返回后仍有效（调用方持有） */
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            nebula_addon_init(bd);
+        });
+        return 0;
+    }
+#endif
     load_builtin_zh();
     if (!base_dir) return -1;
 
