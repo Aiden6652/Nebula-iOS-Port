@@ -30,6 +30,9 @@ static volatile int g_boot_want   = 0;   /* 是否应当显示（隐藏后置 0�
 static volatile int g_boot_done   = 0;   /* 是否已销毁 */
 static dispatch_source_t g_boot_timer = NULL;
 
+/* 前向声明：下方 boot_arm_safety 在 nebula_hide_boot_overlay 定义前就调用它 */
+static void nebula_hide_boot_overlay(void);
+
 static UIWindow *boot_find_window(void)
 {
     UIApplication *app = [UIApplication sharedApplication];
