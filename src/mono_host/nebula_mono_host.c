@@ -52,6 +52,10 @@ extern void mono_setmmapjit (int flag);
 #include <mach-o/getsect.h>
 #include <os/log.h>
 #include <signal.h>
+#include <sys/codesign.h>   // csops / CS_OPS_STATUS / CS_DEBUGGED（检测 JIT 能力）
+#ifndef CS_DEBUGGED
+#define CS_DEBUGGED 0x10000000   // 进程被调试器附加 → 内核授予 JIT 能力
+#endif
 #else
 #include <signal.h>
 typedef void *os_log_t;
@@ -528,6 +532,56 @@ static int log_try(const char *p)
     return 1;
 }
 
+// —— JIT 能力检测 + 等待 ——
+// iOS 严格 W^X：mono 初始化必然生成 trampoline（P/Invoke、委托、接口分派），
+// 无论解释器还是 JIT 模式都要可执行 MAP_JIT 内存。进程若没有 JIT 能力
+// （无 allow-jit 描述文件、也没被调试器附加），执行 trampoline 页会被内核
+// 以 CODESIGNING / Invalid Page 秒杀（SIGKILL，无法被 signal handler 捕获）。
+//
+// 检测手段：csops(CS_OPS_STATUS) 的 CS_DEBUGGED 位 —— 被调试器附加（StikDebug /
+// LiveContainer / SideJITServer 走 get-task-allow 附加）即置位，内核随后允许
+// pthread_jit_write_protect_np 翻转并执行 MAP_JIT 页。
+//
+// 等待的意义：boot 在独立 detached 线程跑，主线程照常。用户可在 app 启动后
+// 用 StikDebug 附加启用 JIT，本函数轮询到 CS_DEBUGGED 即放行 mono_jit_init，
+// 化解“先开 JIT 还是先启动”的死锁。
+static int nebula_have_jit(void) {
+#ifndef __APPLE__
+    return 1;   // 桌面平台天然可 JIT
+#else
+    int flags = 0;
+    if (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) != 0) return 0;
+    return (flags & CS_DEBUGGED) ? 1 : 0;
+#endif
+}
+
+// 返回 1 = JIT 已就绪；返回 0 = 超时仍未就绪（调用方应优雅退出，别硬崩）。
+static int nebula_wait_for_jit(void) {
+    int wait = 30;   // 秒；可用 NEBULA_JIT_WAIT 覆盖
+    const char *e = getenv("NEBULA_JIT_WAIT");
+    if (e && *e) { int v = atoi(e); if (v > 0) wait = v; }
+
+    if (nebula_have_jit()) {
+        hlog("[host] JIT 已就绪（进程拥有 JIT 能力）");
+        return 1;
+    }
+    hlog("[host] !! JIT 尚未就绪：进程无 JIT 能力，mono 无法生成/执行 trampoline");
+    hlog("[host] !! 标准版（解释器）同样需要 JIT —— 解释器跑 IL 仍要 trampoline");
+    hlog("[host] !! 解决（任选其一）：");
+    hlog("[host] !!   1) 用 StikDebug / SideJITServer 给 AmongUs 附加启用 JIT（靠 get-task-allow）");
+    hlog("[host] !!   2) 用含 com.apple.security.cs.allow-jit 的描述文件直签 AmongUs（付费开发证书）");
+    hlog("[host] !! 等待 JIT 就绪（最多 %ds，期间 app 保持存活，可现在去附加调试器）...", wait);
+    for (int i = 1; i <= wait; i++) {
+        sleep(1);
+        if (nebula_have_jit()) {
+            hlog("[host] JIT 已就绪（%ds 后检测到调试器附加），继续 mono 初始化", i);
+            return 1;
+        }
+    }
+    hlog("[host] !! JIT 在 %ds 内始终未就绪，放弃 mono 初始化（避免无意义 SIGKILL/SIGSEGV）", wait);
+    return 0;
+}
+
 static void *boot_thread(void *arg) {
     (void)arg;
     hlog("[host] boot thread started");
@@ -603,7 +657,6 @@ static void *boot_thread(void *arg) {
         // 不能强制 aot-only！星云舰的 DLL 是未 AOT 预编译的 IL 程序集，
         // aot-only 模式下 mono 加载 mscorlib 等会因缺 AOT 镜像直接 fatal
         // （真机日志死在 mono_jit_init，桌面 runner 上同样复现）。
-        // 解释器纯软件执行 IL，无需 JIT entitlement，是 iOS 无 JIT 权限时的正确路径。
         // 通过 MONO_ENV_OPTIONS=--interpreter 强制（mono_jit_init 会解析它）。
         //
         // 关键：standard 也要强制 MAP_JIT！mono 初始化时会生成 generic trampoline
@@ -611,7 +664,11 @@ static void *boot_thread(void *arg) {
         // 非 MAP_JIT 内存写入后执行即 SIGSEGV（signal 11 @ mono_jit_init）。
         // MAP_JIT 让代码管理器走 MAP_JIT 分配，mono 内部对 __APPLE__ 已有
         // pthread_jit_write_protect_np 翻转（我们已把守卫扩到 iOS）。
-        // 没 JIT entitlement 时解释器不真正 JIT 代码，MAP_JIT 仅用于 trampoline，无害。
+        //
+        // ⚠️ 误区纠正：解释器“不真正 JIT 代码”没错，但 trampoline 生成仍需
+        //    可执行 MAP_JIT 内存 —— 没有 JIT 能力（allow-jit 描述文件或被调试器
+        //    附加）照样被内核 CODESIGNING 秒杀。所以 standard 也必须有 JIT，
+        //    前面的 nebula_wait_for_jit() 闸门对两个档一视同仁。
         mono_setmmapjit(1);
         setenv("MONO_ENV_OPTIONS", "--interpreter", 1);
         hlog("[host] standard 模式：解释器 + 强制 MAP_JIT（trampoline 生成需可执行内存）");
@@ -619,6 +676,15 @@ static void *boot_thread(void *arg) {
 #endif
 
     hlog("[host] step: mono_jit_init ...");
+
+    // 先做 JIT 能力闸门：没 JIT 必崩在 mono_jit_init（标准/pro 都一样）。
+    // 有则放行；没有则等调试器附加，仍没有就优雅退出（保留游戏可玩、不硬崩）。
+    if (!nebula_wait_for_jit()) {
+        hlog("[host] step: 跳过 mono_jit_init（无 JIT 能力）。游戏本体不受影响，仅模组功能不可用。");
+        free(dir);
+        return NULL;
+    }
+
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
     hlog("[host] step: mono_jit_init OK, RSS=%ldMB", rss_mb());
