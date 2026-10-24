@@ -190,7 +190,7 @@ else:
 #     TARGET_OSX 直接排除 iOS，mono 在 iOS 上写 MAP_JIT 内存（trampoline/JIT 代码）
 #     从不翻转写保护，mono_jit_init 即 SIGSEGV（standard/pro 同崩）。
 #     扩到 TARGET_IOS，并把可用性检查 (macOS 11, *) 改成 (macOS 11, iOS 14, *)。
-cm = os.path.join(mono, 'mono', 'metadata', 'mono-codeman.c')
+cm = os.path.join(mono, 'mono', 'utils', 'mono-codeman.c')
 if os.path.exists(cm):
     s = open(cm, encoding='utf-8', errors='replace').read()
     s2 = s.replace(
