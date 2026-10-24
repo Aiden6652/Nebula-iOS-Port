@@ -52,7 +52,12 @@ extern void mono_setmmapjit (int flag);
 #include <mach-o/getsect.h>
 #include <os/log.h>
 #include <signal.h>
-#include <sys/codesign.h>   // csops / CS_OPS_STATUS / CS_DEBUGGED（检测 JIT 能力）
+// sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
+// 故手动声明 csops 及其常量。csops 是 libSystem 真实导出的符号，运行/链接均可用。
+extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersize);
+#ifndef CS_OPS_STATUS
+#define CS_OPS_STATUS 0          // 查询进程代码签名状态
+#endif
 #ifndef CS_DEBUGGED
 #define CS_DEBUGGED 0x10000000   // 进程被调试器附加 → 内核授予 JIT 能力
 #endif
