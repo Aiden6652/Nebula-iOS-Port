@@ -227,6 +227,28 @@ if os.path.exists(cm):
         print("    !! mono-codeman.c 未匹配到 TARGET_OSX 守卫（mono 版本可能已改结构）", file=sys.stderr)
 else:
     print("    !! 找不到 mono-codeman.c", file=sys.stderr)
+
+# (d) iOS 链接：pthread_jit_write_protect_np 在 iOS SDK 的 libpthread.tbd 不导出该符号，
+#     链接器报 undefined symbol。weak_import 声明只解决编译期；链接期必须显式
+#     -Wl,-U 允许该符号在运行时由 dyld 从 libSystem（umbrella libpthread）解析
+#     （iOS 14+ libpthread 实际导出，配 StikDebug/JIT entitlement 运行时可用）。
+mini_cmake = os.path.join(mono, 'mono', 'mini', 'CMakeLists.txt')
+if os.path.exists(mini_cmake):
+    s = open(mini_cmake, encoding='utf-8', errors='replace').read()
+    marker = 'add_library(monosgen-shared SHARED'
+    idx = s.find(marker)
+    if idx >= 0:
+        ins = ('\n'
+               '# [Nebula iOS] 允许 _pthread_jit_write_protect_np 运行时解析（iOS SDK 不导出该符号）\n'
+               'target_link_options(monosgen-shared PRIVATE "-Wl,-U,_pthread_jit_write_protect_np")\n')
+        nl = s.find('\n', idx)
+        s = s[:nl+1] + ins + s[nl+1:]
+        open(mini_cmake, 'w', encoding='utf-8').write(s)
+        print("    mono/mini/CMakeLists.txt: 给 monosgen-shared 加 -Wl,-U,_pthread_jit_write_protect_np")
+    else:
+        print("    !! 找不到 add_library(monosgen-shared SHARED) 标记", file=sys.stderr)
+else:
+    print("    !! 找不到 mono/mini/CMakeLists.txt", file=sys.stderr)
 PY
 # (c) iOS W^X 翻转核心补丁：mono_codeman_enable_write/disable_write 的守卫原本是
 #     `#if defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && defined(TARGET_OSX)`
