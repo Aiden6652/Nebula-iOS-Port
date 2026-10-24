@@ -185,34 +185,27 @@ if s2 != s:
 else:
     print("    !! mono-mmap.c 未匹配到 MAP_JIT 守卫（mono 版本可能已改结构）", file=sys.stderr)
 
-# (c) iOS W^X 翻转核心补丁：mono_codeman_enable_write/disable_write 的守卫原本是
-#     #if defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && defined(TARGET_OSX)
-#     TARGET_OSX 直接排除 iOS，mono 在 iOS 上写 MAP_JIT 内存（trampoline/JIT 代码）
-#     从不翻转写保护，mono_jit_init 即 SIGSEGV（standard/pro 同崩）。
-#     扩到 TARGET_IOS，并把可用性检查 (macOS 11, *) 改成 (macOS 11, iOS 14, *)。
+# (c) iOS W^X 翻转核心补丁：mono_codeman_enable_write/disable_write 的调用点守卫是
+#     #ifdef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP（已由 (a3) 强制定义），内部用
+#     __builtin_available (macOS 11, *) 在 iOS 上 `*` 通配为 true，但显式列出 iOS 14 更安全。
+#     iOS 14+ SDK 的 <pthread.h> 已声明 void 版本，旧 SDK 不声明——补齐 void 声明
+#     （避免 undeclared 与 conflicting types）。链接期靠 (d) 的 -Wl,-U 解决 libpthread 不导出。
+import re as _re
 cm = os.path.join(mono, 'mono', 'utils', 'mono-codeman.c')
 if os.path.exists(cm):
     s = open(cm, encoding='utf-8', errors='replace').read()
-    s2 = s.replace(
-        'defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && defined(TARGET_OSX)',
-        'defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && (defined(TARGET_OSX) || defined(TARGET_IOS))')
-    s2 = re.sub(r'__builtin_available\s*\(\s*macOS\s+11[^)]*\)',
-                '__builtin_available (macOS 11, iOS 14, *)', s2)
-    # 注入 extern 声明：iOS SDK 的 pthread.h 不公开声明 pthread_jit_write_protect_np
-    # （Apple 在 iOS 上刻意不暴露），但带 JIT 能力（StikDebug/dynamic-codesigning）的
-    # 进程运行时内核提供实现（Pojav/Amethyst 同机制）。编译期必须自己声明，否则
-    # "call to undeclared function" 报错。macOS 上重复 extern 声明无害。
-    import re as _re
-    # weak_import：iOS SDK 的 libpthread.tbd 不公开导出 pthread_jit_write_protect_np，
-    # 直接 extern 会让链接器报 undefined symbol。用 weak_import 声明让链接器允许该符号
-    # 在运行时由 dyld 解析（iOS 14+ libpthread 实际导出，配 StikDebug/JIT entitlement 可用；
-    # iOS<14 由 __builtin_available(iOS 14) 守卫不会进入调用，weak 引用为 NULL 也无妨）。
-    # 仅对 TARGET_IOS 生效，避免和 macOS SDK 已有的非 weak 声明冲突。
-    # 注入在最后一个 #include 之后（config.h 等已包含，TARGET_IOS 必已定义，且仍在调用点之前）。
+    # 可用性检查：__builtin_available (macOS 11, *) 在 iOS 上 `*` 已通配为 true，
+    # 但显式列出 iOS 14 更安全（iOS<14 不会进入调用，避免调用不存在的 API）。
+    s2 = _re.sub(r'__builtin_available\s*\(\s*macOS\s+11[^)]*\)',
+                '__builtin_available (macOS 11, iOS 14, *)', s)
+    # 补齐声明：iOS 14+ SDK 的 <pthread.h> 已声明 void 版本，旧 SDK 不声明。
+    # 必须用 void 返回类型（与系统一致，否则 conflicting types），且 TARGET_IOS 守卫，
+    # 不带 weak_import（链接期靠 -Wl,-U 解决 undefined symbol）。重复声明 void 版本
+    # 在 Clang 上类型兼容、无害。
     decl = ('\n'
             '#if defined(TARGET_IOS) && TARGET_IOS\n'
-            '/* [Nebula iOS] iOS SDK 不公开声明 pthread_jit_write_protect_np；weak_import 避免链接期 undefined symbol */\n'
-            'extern int pthread_jit_write_protect_np(int enabled) __attribute__((weak_import));\n'
+            '/* [Nebula iOS] 确保 pthread_jit_write_protect_np 已声明（旧 iOS SDK 不公开） */\n'
+            'extern void pthread_jit_write_protect_np(int enabled);\n'
             '#endif\n')
     _incs = list(_re.finditer(r'(?m)^#\s*include\b.*$', s2))
     if _incs:
@@ -222,9 +215,9 @@ if os.path.exists(cm):
         s2 = decl + s2
     if s2 != s:
         open(cm, 'w', encoding='utf-8').write(s2)
-        print("    mono-codeman.c: W^X 翻转守卫已扩到 TARGET_IOS + 可用性 iOS 14 + 注入 pthread_jit_write_protect_np 声明")
+        print("    mono-codeman.c: 可用性修正 iOS 14 + 补齐 pthread_jit_write_protect_np void 声明")
     else:
-        print("    !! mono-codeman.c 未匹配到 TARGET_OSX 守卫（mono 版本可能已改结构）", file=sys.stderr)
+        print("    !! mono-codeman.c 未匹配到 __builtin_available（mono 版本可能已改结构）", file=sys.stderr)
 else:
     print("    !! 找不到 mono-codeman.c", file=sys.stderr)
 
@@ -253,11 +246,6 @@ if os.path.exists(mini_cmake):
 else:
     print("    !! 找不到 mono/mini/CMakeLists.txt", file=sys.stderr)
 PY
-# (c) iOS W^X 翻转核心补丁：mono_codeman_enable_write/disable_write 的守卫原本是
-#     `#if defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && defined(TARGET_OSX)`
-#     —— TARGET_OSX 直接排除 iOS，mono 在 iOS 上写 MAP_JIT 内存（trampoline/JIT 代码）
-#     从不翻转写保护，mono_jit_init 即 SIGSEGV（standard/pro 同崩）。
-#     扩到 TARGET_IOS，并把可用性检查 (macOS 11, *) 改成 (macOS 11, iOS 14, *)。
   echo "    [JIT] DISABLE_JIT 已放出 + MAP_JIT 已扩展到 iOS + W^X 翻转已扩展到 iOS"
 else
   echo "    MONO_IOS_JIT 未开启，保留标准 DISABLE_JIT 构建（standard 安全）"
