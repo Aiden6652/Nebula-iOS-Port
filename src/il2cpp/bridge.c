@@ -1707,3 +1707,10 @@ int nebula_il2cpp_start_poll(int interval_ms) {
     nlog("poll: 后台线程已启动");
     return 0;
 }
+
+/* bridge.h 声明的占位函数：供 roles_ui.c 的 nebula_ui_add_dummy 调用，
+   纯返回 0，仅用于校验桥接层符号可达（避免 loader 链接期 undefined symbol）。
+   历史上该定义缺失导致 nebula_ios_loader.dylib 永远链接失败，本次补上。 */
+int nebula_il2cpp_add_dummy(void) {
+    return 0;
+}
