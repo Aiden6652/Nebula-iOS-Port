@@ -131,7 +131,8 @@ echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
   -framework Foundation \
   -framework CoreFoundation \
   -framework Security \
-  -lobjc -lc++ -lpthread -lz -lm
+  -lobjc -lc++ -lpthread -lz -lm \
+  -Wl,-U,_pthread_jit_write_protect_np
 
 cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_standard.dylib"
 
@@ -153,7 +154,8 @@ cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_standard.dylib"
   -framework Foundation \
   -framework CoreFoundation \
   -framework Security \
-  -lobjc -lc++ -lpthread -lz -lm
+  -lobjc -lc++ -lpthread -lz -lm \
+  -Wl,-U,_pthread_jit_write_protect_np
 
 # 注：BCL 已嵌入 dylib 的 __nebulabcl 段（见上方 blob 生成），不再散落 bcl/ 目录。
 # 运行时由 nebula_mono_host.c 的 Mono 预加载钩子从内存加载。
