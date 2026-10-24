@@ -207,6 +207,19 @@ if os.path.exists(cm):
                  lambda m: m.group(1) + noop, s2, count=1)
     n2 = _re.sub(r'(mono_codeman_disable_write \(void\)\s*\{\n)',
                  lambda m: m.group(1) + noop, n1, count=1)
+    # 补齐声明：no-op 后调用是死代码（-O3 会被消除），但编译期仍需声明，
+    # 否则 -Werror=implicit-function-declaration 报错（实测 run 40098995257）。
+    decl = ('\n'
+            '#if defined(TARGET_IOS) && TARGET_IOS\n'
+            '/* [Nebula iOS] 声明补齐：iOS 旧 SDK 不公开该 API；运行时 no-op，不会真正调用 */\n'
+            'extern void pthread_jit_write_protect_np(int enabled);\n'
+            '#endif\n')
+    _incs = list(_re.finditer(r'(?m)^#\s*include\b.*$', n2))
+    if _incs:
+        _end = _incs[-1].end()
+        n2 = n2[:_end] + decl + n2[_end:]
+    else:
+        n2 = decl + n2
     if n2 != s2:
         open(cm, 'w', encoding='utf-8').write(n2)
         print("    mono-codeman.c: iOS 翻转 no-op 已注入 (enable/disable 各一处)")
