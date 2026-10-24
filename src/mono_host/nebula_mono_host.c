@@ -488,10 +488,16 @@ void nebula_cifs_init(const char *root);
 
 /* boot_overlay.m：启动占位文本（防 Mono+BepInEx 初始化期间黑屏误判死机）。
    由宿主 dylib 同一编译单元导出，托管侧也可用 [DllImport("__Internal")] 调用
-   nebula_signal_ready() 在 Nebula.dll + Harmony 就绪时立刻销毁文字。 */
+   nebula_signal_ready() 在 Nebula.dll + Harmony 就绪时立刻销毁文字。
+   下方 weak 空实现：iOS 上 boot_overlay.m 链接了同名【非 weak】真实现，链接器
+   优先用真实现；macOS / 其它不含 boot_overlay.m 的构建只有这里 weak 空实现，
+   避免链接期 undefined symbol（boot_thread 调了这几个函数）。 */
 void nebula_show_boot_overlay(void);
 void nebula_hide_boot_overlay(void);
 void nebula_signal_ready(void);
+__attribute__((weak)) void nebula_show_boot_overlay(void) {}
+__attribute__((weak)) void nebula_hide_boot_overlay(void) {}
+__attribute__((weak)) void nebula_signal_ready(void) { nebula_hide_boot_overlay(); }
 
 /* iOS mono 产物里未必带 libSystem.Globalization.Native.a，而 mono 的
    native-library.c 会引用 _GlobalizationResolveDllImport（签名见 dotnet/runtime 的
