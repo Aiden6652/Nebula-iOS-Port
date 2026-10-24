@@ -198,9 +198,24 @@ if os.path.exists(cm):
         'defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && (defined(TARGET_OSX) || defined(TARGET_IOS))')
     s2 = re.sub(r'__builtin_available\s*\(\s*macOS\s+11[^)]*\)',
                 '__builtin_available (macOS 11, iOS 14, *)', s2)
+    # 注入 extern 声明：iOS SDK 的 pthread.h 不公开声明 pthread_jit_write_protect_np
+    # （Apple 在 iOS 上刻意不暴露），但带 JIT 能力（StikDebug/dynamic-codesigning）的
+    # 进程运行时内核提供实现（Pojav/Amethyst 同机制）。编译期必须自己声明，否则
+    # "call to undeclared function" 报错。macOS 上重复 extern 声明无害。
+    import re as _re
+    decl = ('#if defined(__APPLE__)\n'
+            '/* [Nebula iOS] iOS SDK 不公开声明 pthread_jit_write_protect_np；'
+            '带 JIT 能力的进程运行时可用。 */\n'
+            'extern int pthread_jit_write_protect_np(int enabled);\n'
+            '#endif\n')
+    _m = _re.search(r'(?m)^#include', s2)
+    if _m:
+        s2 = s2[:_m.start()] + decl + '\n' + s2[_m.start():]
+    else:
+        s2 = decl + '\n' + s2
     if s2 != s:
         open(cm, 'w', encoding='utf-8').write(s2)
-        print("    mono-codeman.c: W^X 翻转守卫已扩展到 TARGET_IOS + 可用性修正为 iOS 14")
+        print("    mono-codeman.c: W^X 翻转守卫已扩到 TARGET_IOS + 可用性 iOS 14 + 注入 pthread_jit_write_protect_np 声明")
     else:
         print("    !! mono-codeman.c 未匹配到 TARGET_OSX 守卫（mono 版本可能已改结构）", file=sys.stderr)
 else:
