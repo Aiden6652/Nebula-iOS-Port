@@ -53,6 +53,7 @@ extern void mono_setmmapjit (int flag);
 #include <TargetConditionals.h>   // TARGET_OS_IPHONE / TARGET_OS_MAC
 #include <os/log.h>
 #include <signal.h>
+#include <dispatch/dispatch.h>     // 启动占位文本的延时/主线程销毁
 // sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
 // 故手动声明 csops 及其常量。csops 是 libSystem 真实导出的符号，运行/链接均可用。
 extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersize);
@@ -485,6 +486,13 @@ static int boot_engine_poc(MonoDomain *domain, const char *dir) {
 /* case_insensitive_fs.c：iOS 文件系统大小写不敏感回退（需传入游戏根目录） */
 void nebula_cifs_init(const char *root);
 
+/* boot_overlay.m：启动占位文本（防 Mono+BepInEx 初始化期间黑屏误判死机）。
+   由宿主 dylib 同一编译单元导出，托管侧也可用 [DllImport("__Internal")] 调用
+   nebula_signal_ready() 在 Nebula.dll + Harmony 就绪时立刻销毁文字。 */
+void nebula_show_boot_overlay(void);
+void nebula_hide_boot_overlay(void);
+void nebula_signal_ready(void);
+
 /* iOS mono 产物里未必带 libSystem.Globalization.Native.a，而 mono 的
    native-library.c 会引用 _GlobalizationResolveDllImport（签名见 dotnet/runtime 的
    src/native/libs/System.Globalization.Native/entrypoints.c）。
@@ -634,6 +642,11 @@ static void *boot_thread(void *arg) {
     }
     if (!g_logfp) hlog("[host] !! 日志无法创建：所有候选路径都不可写");
 
+    // 启动占位文本：Mono + BepInEx 初始化期间显示在屏幕正中，防黑屏误判死机。
+    // 窗口可能还没起来，内部带重试；Nebula.dll + Harmony 就绪后由托管侧
+    // nebula_signal_ready() 销毁，或此处兜底延时/安全超时销毁。
+    nebula_show_boot_overlay();
+
     // 大小写回退必须在知道游戏根目录后装（只对它生效），且默认关闭
     hlog("[host] step: cifs init");
     nebula_cifs_init(root);
@@ -700,6 +713,7 @@ static void *boot_thread(void *arg) {
     // 有则放行；没有则等调试器附加，仍没有就优雅退出（保留游戏可玩、不硬崩）。
     if (!nebula_wait_for_jit()) {
         hlog("[host] step: 跳过 mono_jit_init（无 JIT 能力）。游戏本体不受影响，仅模组功能不可用。");
+        nebula_hide_boot_overlay();   // 无 JIT：销毁占位文字，让原版游戏正常可玩
         free(dir);
         return NULL;
     }
@@ -745,6 +759,24 @@ static void *boot_thread(void *arg) {
         hlog("[host] step: boot_engine_poc -> %d", ok);
     }
     if (!ok) hlog("[host] !! 没有任何启动路径成功");
+
+    // 启动占位文本：BepInEx 已接管（或所有启动路径都失败）—— 把画面交还游戏。
+    // 精确时机由托管侧 nebula_signal_ready() 提前触发（Nebula.dll + Harmony 就绪）；
+    // 这里给一个兜底延时（NEBULA_BOOT_OVERLAY_HOLD_MS，默认 2000ms），让星云舰
+    // 自己的加载动画先就位，再销毁文字；安全超时(默认30s)在 boot_overlay.m 内兜底。
+    {
+        int hold = 2000;
+        const char *he = getenv("NEBULA_BOOT_OVERLAY_HOLD_MS");
+        if (he && *he) { int v = atoi(he); if (v >= 0) hold = v; }
+        if (hold > 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)hold * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{ nebula_hide_boot_overlay(); });
+            hlog("[host] 占位文字将在 %dms 后销毁（或 Nebula 就绪即提前销毁）", hold);
+        } else {
+            nebula_hide_boot_overlay();
+            hlog("[host] 占位文字立即销毁（NEBULA_BOOT_OVERLAY_HOLD_MS=0）");
+        }
+    }
 
     watchdog_run = 0;
     mono_jit_cleanup(domain);

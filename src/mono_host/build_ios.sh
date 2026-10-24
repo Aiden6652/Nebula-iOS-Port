@@ -126,11 +126,13 @@ echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
   "$ROOT/nebula_mono_host.c" \
   "$ROOT/case_insensitive_fs.c" \
   "$ROOT/fishhook.c" \
+  "$ROOT/boot_overlay.m" \
   "${LIBS[@]}" \
   -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
   -framework Foundation \
   -framework CoreFoundation \
   -framework Security \
+  -framework UIKit \
   -lobjc -lc++ -lpthread -lz -lm \
   -Wl,-U,_pthread_jit_write_protect_np
 
@@ -149,11 +151,13 @@ cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_standard.dylib"
   "$ROOT/nebula_mono_host.c" \
   "$ROOT/case_insensitive_fs.c" \
   "$ROOT/fishhook.c" \
+  "$ROOT/boot_overlay.m" \
   "${LIBS[@]}" \
   -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
   -framework Foundation \
   -framework CoreFoundation \
   -framework Security \
+  -framework UIKit \
   -lobjc -lc++ -lpthread -lz -lm \
   -Wl,-U,_pthread_jit_write_protect_np
 

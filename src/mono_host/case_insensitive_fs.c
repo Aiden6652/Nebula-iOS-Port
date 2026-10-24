@@ -163,10 +163,13 @@ void nebula_cifs_init(const char *root)
     if (done) return;
     done = 1;
     if (root && *root) snprintf(g_root, sizeof(g_root), "%s", root);
-    // 默认关闭：hook 全局 open/stat 影响面太大，先保证不启用时一切正常；
-    // 需要时设 NEBULA_CIFS=1 开启。
-    if (!getenv("NEBULA_CIFS")) {
-        fprintf(stderr, "[cifs] 未启用（设 NEBULA_CIFS=1 开启）root=%s\n", g_root);
+    // 默认开启：星云舰在 iOS 上沿 PC 路径加载贴图/资源，iOS 文件系统大小写敏感，
+    // 精确路径会 ENOENT → FileNotFound。开启后仅在“精确路径失败(ENOENT)”时才逐级
+    // 做大小写不敏感匹配（命中零开销，未命中才遍历目录），且仅对游戏根目录生效，
+    // 不影响 /dev、/System 等系统路径。显式设 NEBULA_CIFS=0 可关闭。
+    const char *ce = getenv("NEBULA_CIFS");
+    if (ce && strcmp(ce, "0") == 0) {
+        fprintf(stderr, "[cifs] 显式关闭（NEBULA_CIFS=0）root=%s\n", g_root);
         return;
     }
     struct rebinding rb[] = {
