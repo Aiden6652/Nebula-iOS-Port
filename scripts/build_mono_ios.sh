@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-8}"
+CACHE_VERSION="${CACHE_VERSION:-9}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -182,36 +182,79 @@ for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
 #          mono_arch_create_generic_trampoline+88，与反汇编完全吻合）；
 #       2) plain RWX 本来就可用，W^X 纯属多余。
 #     mono_setmmapjit(1)（host 对 standard 的调用）在 iOS 变为无害 no-op。
+# ⚠️ 上一版（c0c500a/d324ae1）这里只有注释没有代码，真机实测（2026-10-24 log）：
+#     host 仍强制 MAP_JIT → mono-mmap.c 原版代码在 iOS 照样加 MAP_JIT：
+#       - L284: (flags & MONO_MMAP_JIT) && (use_mmap_jit || hardened)——host 调
+#         mono_setmmapjit(1) 后 use_mmap_jit=1 直接命中；
+#       - L286-291: HOST_ARM64 && !HOST_MACCAT 时无条件 mflags |= MAP_JIT。
+#     MAP_JIT 页默认「可执行不可写」，翻转已被 (c) no-op → 写 trampoline 必崩。
+# (b-code) [Nebula iOS] 保留 MAP_JIT：iOS 上 mono_valloc 继续走 MAP_JIT 分配
+#     （撤掉此前"整体禁 MAP_JIT"的做法）。理由（用户 2026-10-24 指正）：
+#       开 MAP_JIT + 运行时探测翻转，能同时兼容两条路——
+#         · 真机官方 JIT（allow-jit / dynamic-codesigning entitlement）：
+#           pthread_jit_write_protect_np 能解析到 → 走官方 W^X 翻转；
+#         · StikDebug 调试型 JIT（CS_DEBUGGED，tbd 不导出该符号）：
+#           解析不到 → 跳过翻转，内核已把 MAP_JIT 页当 RWX 给，可直接写。
+#     翻转的 NULL 安全由 (c) 的 dlsym 探测保证，本 (.b) 块不再改 mono-mmap.c。
 
-# (c) [Nebula iOS] 翻转整体 no-op（94f5693 真机 .ips 实证）：
-#     iOS 上 mono_codeman_enable_write/disable_write 直接 return。
-#     死因链条：enable_write 尾调（b 指令，先恢复 lr 再跳）符号桩
-#     _pthread_jit_write_protect_np → 懒绑定解析失败（tbd 不导出）→ 桩 br x16=0
-#     → SIGSEGV pc=0, lr=mono_arch_create_generic_trampoline+88（与 .ips 完全吻合）。
-#     plain-RWX 下页面恒可写，翻转本无必要；no-op 同时消灭跳零点。
-#     macOS 分支（TARGET_IOS=0）不受影响，保持原逻辑（CI 桌面冒烟验证）。
+# (c) [Nebula iOS] NULL 安全 W^X 翻转（替代 mono 官方的 __builtin_available 直接调用）：
+#     iOS（含 StikDebug）SDK 的 libpthread.tbd 不导出 pthread_jit_write_protect_np，
+#     -Wl,-U 只骗过链接器；运行时懒绑定解析失败 → 符号桩 = 0 → 直接调用跳零
+#     SIGSEGV pc=0（真机 .ips 实证 lr=mono_arch_create_generic_trampoline+88）。
+#     改法：enable_write/disable_write 开头用 dlsym(RTLD_DEFAULT,...) 一次性探测，
+#        · 解析到（真机官方 JIT / entitlement）→ 走官方 W^X 翻转（(0)可写 / (1)可执行）；
+#        · 解析不到（StikDebug 调试态，内核已给 RWX）→ 跳过翻转，MAP_JIT 页本就可写。
+#     这样跳零点彻底消灭，且两条 JIT 路径都正确。macOS 分支（TARGET_IOS=0）不受影响。
+#     注意：#if defined(TARGET_IOS) 守卫已被 CI 实证真实编译（run 40098995257），
+#     守卫内 return 后原调用变死代码（仍需 extern 声明以通过 -Werror=implicit-decl）。
 import re as _re
 cm = os.path.join(mono, 'mono', 'utils', 'mono-codeman.c')
 if os.path.exists(cm):
     s = open(cm, encoding='utf-8', errors='replace').read()
-    # 可用性检查：显式列出 iOS 14（macOS 分支用，iOS 分支已被 no-op 短路）
+    # 可用性检查：显式列出 iOS 14（macOS 分支用，iOS 分支已被 dlsym 探测短路）
     s2 = _re.sub(r'__builtin_available\s*\(\s*macOS\s+11[^)]*\)',
                 '__builtin_available (macOS 11, iOS 14, *)', s)
-    noop = ('#if defined(TARGET_IOS) && TARGET_IOS\n'
-            '\t/* [Nebula iOS] plain-RWX：无 MAP_JIT 则页面恒可写，无需翻转；\n'
-            '\t   且 pthread_jit_write_protect_np 在 iOS tbd 不导出，直接调用\n'
-            '\t   会在懒绑定时跳空指针（真机 .ips 实证 pc=0）。整体 no-op。 */\n'
-            '\treturn;\n'
-            '#endif\n')
+    # [Nebula iOS] dlsym 探测翻转：解析到才翻，解析不到跳过（调试态 RWX）。
+    # 用 G_GNUC_UNUSED 消除"静态变量未用"警告（两个函数各一份，enable 用到、disable 用到）。
+    probe = ('#if defined(TARGET_IOS) && TARGET_IOS\n'
+             '\t/* [Nebula iOS] NULL 安全翻转：dlsym 探测，解析到才翻，否则跳过 */\n'
+             '\t{\n'
+             '\t\tstatic void (*_nebula_wp)(int) = (void *)0;\n'
+             '\t\tstatic int _nebula_wp_init = 0;\n'
+             '\t\tif (!_nebula_wp_init) {\n'
+             '\t\t\t_nebula_wp = (void (*)(int))dlsym (RTLD_DEFAULT, "pthread_jit_write_protect_np");\n'
+             '\t\t\t_nebula_wp_init = 1;\n'
+             '\t\t}\n'
+             '\t\tif (_nebula_wp)\n'
+             '\t\t\t_nebula_wp (0);   /* 翻成可写 */\n'
+             '\t}\n'
+             '\treturn;\n'
+             '#endif\n')
+    probe_off = ('#if defined(TARGET_IOS) && TARGET_IOS\n'
+                '\t/* [Nebula iOS] NULL 安全翻转：dlsym 探测，解析到才翻，否则跳过 */\n'
+                '\t{\n'
+                '\t\tstatic void (*_nebula_wp)(int) = (void *)0;\n'
+                '\t\tstatic int _nebula_wp_init = 0;\n'
+                '\t\tif (!_nebula_wp_init) {\n'
+                '\t\t\t_nebula_wp = (void (*)(int))dlsym (RTLD_DEFAULT, "pthread_jit_write_protect_np");\n'
+                '\t\t\t_nebula_wp_init = 1;\n'
+                '\t\t}\n'
+                '\t\tif (_nebula_wp)\n'
+                '\t\t\t_nebula_wp (1);   /* 翻回可执行 */\n'
+                '\t}\n'
+                '\treturn;\n'
+                '#endif\n')
     n1 = _re.sub(r'(mono_codeman_enable_write \(void\)\s*\{\n)',
-                 lambda m: m.group(1) + noop, s2, count=1)
+                 lambda m: m.group(1) + probe, s2, count=1)
     n2 = _re.sub(r'(mono_codeman_disable_write \(void\)\s*\{\n)',
-                 lambda m: m.group(1) + noop, n1, count=1)
-    # 补齐声明：no-op 后调用是死代码（-O3 会被消除），但编译期仍需声明，
-    # 否则 -Werror=implicit-function-declaration 报错（实测 run 40098995257）。
+                 lambda m: m.group(1) + probe_off, n1, count=1)
+    # 补齐声明 + dlfcn.h：return 后原调用是死代码，但编译期仍需声明，否则
+    # -Werror=implicit-function-declaration 报错（实测 run 40098995257）。
     decl = ('\n'
             '#if defined(TARGET_IOS) && TARGET_IOS\n'
-            '/* [Nebula iOS] 声明补齐：iOS 旧 SDK 不公开该 API；运行时 no-op，不会真正调用 */\n'
+            '#include <dlfcn.h>\n'
+            '/* [Nebula iOS] 声明补齐：iOS 旧 SDK 不公开该 API；运行时经 dlsym 探测，\n'
+            '   真正调用走 dlsym 返回的指针而非此声明符号（避免跳零）。 */\n'
             'extern void pthread_jit_write_protect_np(int enabled);\n'
             '#endif\n')
     _incs = list(_re.finditer(r'(?m)^#\s*include\b.*$', n2))
@@ -222,7 +265,7 @@ if os.path.exists(cm):
         n2 = decl + n2
     if n2 != s2:
         open(cm, 'w', encoding='utf-8').write(n2)
-        print("    mono-codeman.c: iOS 翻转 no-op 已注入 (enable/disable 各一处)")
+        print("    mono-codeman.c: iOS dlsym 探测翻转已注入 (enable/disable 各一处)")
     else:
         print("    !! mono-codeman.c 未匹配到翻转函数（mono 版本可能已改结构）", file=sys.stderr)
 else:

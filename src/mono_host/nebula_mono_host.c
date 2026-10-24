@@ -62,6 +62,12 @@ extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersi
 #ifndef CS_DEBUGGED
 #define CS_DEBUGGED 0x10000000   // 进程被调试器附加 → 内核授予 JIT 能力
 #endif
+
+// [Nebula iOS] 始终强制 MAP_JIT——让 mono 的 trampoline 内存走 MAP_JIT 分配。
+// 翻转（pthread_jit_write_protect_np）的 NULL 安全由 mono 侧 dlsym 探测处理
+// （build_mono_ios.sh (c)）：真机官方 JIT 能解析到 → 走 W^X 翻转；
+// StikDebug 调试态解析不到 → 跳过翻转，内核已给 RWX 页，直接写即可。
+// macOS / iOS 统一调用 mono_setmmapjit(1)。
 #else
 #include <signal.h>
 typedef void *os_log_t;
@@ -673,14 +679,13 @@ static void *boot_thread(void *arg) {
         // （真机日志死在 mono_jit_init，桌面 runner 上同样复现）。
         // 通过 MONO_ENV_OPTIONS=--interpreter 强制（mono_jit_init 会解析它）。
         //
-        // 关键：standard 也要强制 MAP_JIT！mono 初始化时会生成 generic trampoline
-        // （写 ARM64 代码到可执行内存），与解释器/JIT 无关；iOS 严格 W^X，
-        // 非 MAP_JIT 内存写入后执行即 SIGSEGV（signal 11 @ mono_jit_init）。
-        // MAP_JIT 让代码管理器走 MAP_JIT 分配，mono 内部对 __APPLE__ 已有
-        // pthread_jit_write_protect_np 翻转（我们已把守卫扩到 iOS）。
+        // 关键：standard 也要 JIT 能力！mono 初始化时会生成 generic trampoline
+        // （写 ARM64 代码到可执行内存），与解释器/JIT 无关。
+        // iOS 严格 W^X：强制 MAP_JIT 分配（配合 mono 侧 dlsym 探测翻转：
+        // 真机官方 JIT 走 W^X 翻转；StikDebug 解析不到则跳过，RWX 页直接写）。
         //
         // ⚠️ 误区纠正：解释器“不真正 JIT 代码”没错，但 trampoline 生成仍需
-        //    可执行 MAP_JIT 内存 —— 没有 JIT 能力（allow-jit 描述文件或被调试器
+        //    可执行内存 —— 没有 JIT 能力（allow-jit 描述文件或被调试器
         //    附加）照样被内核 CODESIGNING 秒杀。所以 standard 也必须有 JIT，
         //    前面的 nebula_wait_for_jit() 闸门对两个档一视同仁。
         mono_setmmapjit(1);
