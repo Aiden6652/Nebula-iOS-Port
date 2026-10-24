@@ -2,30 +2,29 @@
 # 打包最终成品：一套可以直接塞进 iOS 版 Among Us 根目录的东西
 #
 # 用法:
-#   bash scripts/package_ios.sh <宿主产物目录 out-ios> <NOS改装包.zip> <输出目录> [standard|pro]
+#   bash scripts/package_ios.sh <宿主产物目录 out-ios> <NOS改装包.zip> <输出目录>
 #
 # 产物结构（放进 AU 根目录后，dylib 被注入即生效）:
-#   libnebula_mono_host.dylib       宿主（内含 MonoVM）
+#   libnebula_standard.dylib        宿主（单一编译器/JIT 版，内含 MonoVM）
 #   bcl/                            .NET 8 基础类库
 #   BepInEx/                        框架 + 插件 + 配置 + unity-libs
 #   NebulaLibs/                     星云舰依赖
 #   Addons/                         全部附加组件（职业在里面，必须全带）
-#   nebula_host.<profile>.cfg       运行时配置
-#   entitlements.plist              重签名时用（Pro 版要开 JIT）
+#   nebula_host.cfg                 运行时配置（统一编译器版）
+#   entitlements.plist              重签名时用（要开 JIT）
 set -euo pipefail
 
-ART="${1:?用法: package_ios.sh <out-ios目录> <NOS改装包.zip> <输出目录> [standard|pro]}"
+ART="${1:?用法: package_ios.sh <out-ios目录> <NOS改装包.zip> <输出目录>}"
 NOS="${2:?缺 NOS 改装包 zip}"
 OUT="${3:?缺输出目录}"
-PROFILE="${4:-standard}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "=== 打包 profile=$profile -> $OUT ===" 2>/dev/null
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 echo "=== [1/5] 宿主 dylib（BCL + BepInEx/core 已内嵌，无散文件）==="
-cp "$ART/libnebula_mono_host.dylib" "$OUT/"
-echo "    dylib $(du -h "$OUT/libnebula_mono_host.dylib" | cut -f1)（BCL + BepInEx.core 已烧进 __nebulabcl 段）"
+cp "$ART/libnebula_standard.dylib" "$OUT/"
+echo "    dylib $(du -h "$OUT/libnebula_standard.dylib" | cut -f1)（BCL + BepInEx.core 已烧进 __nebulabcl 段）"
 
 echo "=== [2/5] 从改装包提取模组文件 ==="
 python3 - "$NOS" "$OUT" <<'PY'
@@ -73,10 +72,8 @@ for k, v in kept.items():
 PY
 
 echo "=== [3/5] 配置 ==="
-cp "$ROOT/src/mono_host/nebula_host.standard.cfg" "$OUT/"
-cp "$ROOT/src/mono_host/nebula_host.pro.cfg" "$OUT/"
-cp "$OUT/nebula_host.$PROFILE.cfg" "$OUT/nebula_host.cfg"
-echo "    默认生效: nebula_host.cfg (= $PROFILE)"
+cp "$ROOT/src/mono_host/nebula_host.standard.cfg" "$OUT/nebula_host.cfg"
+echo "    默认生效: nebula_host.cfg（统一编译器/JIT 版配置）"
 
 echo "=== [3.5/5] 关掉星云舰联网自动更新 ==="
 # 加载器默认会联网拉最新版，iOS 上要么没网要么被墙，会卡住/失败。
@@ -104,18 +101,17 @@ cat > "$OUT/INSTALL.md" <<EOF
 # 安装（iOS 版 Among Us）
 
 1. 把本目录**整个内容**放进 Among Us 的可写根目录（与 \`AmongUs.app\` 同级或你 dylib 注入点同级）。
-2. 用你的注入方式加载 \`libnebula_mono_host.dylib\`。它会：
+2. 用你的注入方式加载 \`libnebula_standard.dylib\`。它会：
    - 起 MonoVM → 加载 \`BepInEx/core/BepInEx.Unity.IL2CPP.dll\` → 调 \`Doorstop.Entrypoint.Start()\`
    - 之后由 BepInEx 接管，加载 \`BepInEx/plugins/\` 里的插件（含星云舰）
-3. 版本选择：
-   - \`standard\`（默认）：纯解释器，不需要任何权限
-   - \`pro\`：强制 JIT，需要 \`dynamic-codesigning\` + \`increased-memory-limit\`
-   切换：设置环境变量 \`NEBULA_PROFILE=pro\`，或直接改 \`nebula_host.cfg\`。
+3. 单一编译器（JIT）版：解释器已废除，standard / pro 合并为一份。始终走 JIT，
+   需要 \`dynamic-codesigning\` 权限（由 StikDebug / 全能签 entitlements 提供），
+   否则 mono 初始化时会被内核秒杀。
 
 ## 目录
 | 目录/文件 | 作用 |
 |---|---|
-| \`libnebula_mono_host.dylib\` | 宿主（内含 MonoVM + BCL + BepInEx.core，自包含，无散 dll） |
+| \`libnebula_standard.dylib\` | 宿主（单一编译器/JIT 版，内含 MonoVM + BCL + BepInEx.core，自包含，无散 dll） |
 | \`BepInEx/plugins/\` | BepInEx 插件（星云舰加载器等）—— **新模组扔这里** |
 | \`BepInEx/interop/\` | Il2CppInterop 包装层（**首次启动自动生成 iOS 版**；不要带 PC 版） |
 | \`BepInEx/config/\` | 配置 |
@@ -126,7 +122,6 @@ cat > "$OUT/INSTALL.md" <<EOF
 ## 环境变量
 - \`NEBULA_GAME_DIR\`  游戏根目录（BepInEx 所在处）
 - \`NEBULA_BOOT\`      bepinex / mods / engine / auto（默认 auto）
-- \`NEBULA_PROFILE\`   standard / pro
 EOF
 echo "    已写入 INSTALL.md"
 

@@ -48,7 +48,7 @@ Engine.dll POC（仅桌面验证用）
 | 目标框架 | 运行时是 **.NET 8 MonoVM**，能跑 net6/net8。面向 .NET Framework 4.x 的老模组不一定兼容 |
 | interop | `BepInEx/interop/` **必须是 iOS 版重新生成的**。PC 那套 token 对不上会运行时崩 |
 | 原生依赖 | 模组若带 Windows 的 `.dll`（P/Invoke 到原生库），iOS 上不可用，需要对应 iOS 静态库 |
-| JIT | 用 Harmony 运行时打补丁的模组，在纯解释器模式下也能跑（解释器能执行动态 IL），只是慢 |
+| JIT | 用 Harmony 运行时打补丁的模组，在统一编译器（JIT）版下能跑（解释器已废除，始终走 JIT）|
 | 联网 | 星云舰加载器默认要联网拉最新版本，**要关掉**（见下） |
 
 ## 5. 加一个新模组的步骤

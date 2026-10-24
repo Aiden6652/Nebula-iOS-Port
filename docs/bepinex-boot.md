@@ -31,7 +31,7 @@ doorstop(winhttp.dll，Windows DLL 劫持)
 
 ```
 你注入的 dylib
-   └─> 我们的 libnebula_mono_host.dylib（constructor 异步 boot）
+   └─> 我们的 libnebula_standard.dylib（单一编译器/JIT 版，constructor 异步 boot）
          └─> mono_jit_init() 起 MonoVM
                └─> 加载 BepInEx/core/BepInEx.Unity.IL2CPP.dll
                      └─> 调用 Doorstop.Entrypoint.Start()   ← 同一入口
@@ -87,7 +87,7 @@ error: call to undeclared function 'mono_class_get_method_from_name'
 |---|---|
 | `NEBULA_BOOT` | `bepinex` / `engine` / `auto`（默认 auto：有 BepInEx 就走它） |
 | `NEBULA_GAME_DIR` | 游戏根目录（BepInEx 所在处），默认 dylib 同目录 |
-| `NEBULA_PROFILE` | `standard`（默认）/ `pro`，选配置预设 |
+| `NEBULA_PROFILE` | 已废除（解释器废弃，统一为编译器/JIT 版）|
 | `NEBULA_HOST_CFG` | 直接指定配置文件路径（优先级最高） |
 
 宿主会自动组装 `MONO_PATH` = BCL + `BepInEx/{core,interop,plugins,nebula,patchers}` + `NebulaLibs`，

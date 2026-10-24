@@ -4,25 +4,30 @@
 > 所以省内存不能靠"少加载 addon"，只能从别处省。
 > 本文所有体积数据来自对 PC 改装包 `星云3413.zip` 的实测清点。
 
-## 1. 两个版本
+## 1. 单一版本（编译器 / JIT）
 
-| | **Standard** | **Pro** |
-|---|---|---|
-| 运行模式 | `interp` 纯解释器 | `jit` 强制 JIT |
-| 需要 `dynamic-codesigning` | 否 | **是**（没有会直接崩）|
-| 需要 `increased-memory-limit` | 否 | **是**（软顶放到 512 MB）|
-| GC nursery | 16 MB | 32 MB |
-| RSS 软顶 | 320 MB | 512 MB |
-| 贴图长边上限 | 512 px | 1024 px |
-| 贴图 LRU 缓存 | 64 MB | 128 MB |
-| **目标帧率** | **锁 60 fps** | **不限制（0）** |
-| 掉帧自适应降画质 | 开 | 开 |
-| Addons | **全部加载** | **全部加载** |
-| Roslyn | 关（打包期预编译）| 关 |
+> 解释器已废除，原 Standard / Pro 合并为一份。实测两种旧模式都要在
+> `mono_trampolines_init` 生成 trampoline，解释器并未省下 JIT 能力，反而更慢、
+> 还多一套构建分支，故只出一个包（见 `nebula_host.standard.cfg`）。
 
-选择方式：`NEBULA_PROFILE=standard`（默认）或 `pro`；也可用 `NEBULA_HOST_CFG=<路径>` 直接指定配置文件。
+| | **统一编译器（JIT）版** |
+|---|---|
+| 运行模式 | `jit` 强制 JIT |
+| 需要 `dynamic-codesigning` | **是**（没有会直接崩）|
+| 需要 `increased-memory-limit` | **建议**（软顶放到 512 MB，防 jetsam）|
+| GC nursery | 32 MB |
+| RSS 软顶 / 硬顶 | 512 MB / 500 MB |
+| 贴图长边上限 | 1024 px |
+| 贴图 LRU 缓存 | 128 MB |
+| **目标帧率** | **不限制（0）** |
+| 掉帧自适应降画质 | 开 |
+| Addons | **全部加载** |
+| Roslyn | 关（打包期预编译）|
 
-**为什么 Standard 用解释器**：解释器不需要"可写又可执行"的内存，因此不依赖任何权限，发给谁都能跑。JIT 快，但没权限的设备上直接崩——不能作为默认。
+选择方式：默认即本配置（JIT 版）；可用 `NEBULA_HOST_CFG=<路径>` 直接指定配置文件。
+
+**为什么统一走 JIT**：iOS 上 mono 初始化必然生成 trampoline，两种模式都要 JIT 能力；
+既如此，直接用编译器版（更快、构建更简单），JIT 权限由 StikDebug / 全能签 entitlements 提供。
 
 **为什么 Standard 锁 60 帧**：解释器比 JIT 慢，同样的算力摊到每一秒里，更容易出现"某几帧做不完"，表现就是卡顿。**锁帧是把"每秒的算力"换成"每帧的预算"**——把上限压住，每帧就有确定的时间窗，宁可稳定 60，也不要忽高忽低。Pro 走 JIT 够快，不需要这个妥协，直接放开让设备跑满。
 

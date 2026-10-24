@@ -51,3 +51,28 @@ jobs:
         with:
           name: nebula-mono-host
           path: src/mono_host/out/
+
+  # 校验 iOS loader dylib（nebula_ios_loader.dylib）能正常交叉编译。
+  # 该 dylib 包含 bridge.c / hook.c / addon.c / overlay.m 的业务级防御加固，
+  # 但 build-ios.yml 只编宿主 dylib，故这里单独编一次，确保加固代码在
+  # arm64-ios 下真实可编译（与宿主产物分属不同 workflow，互不阻塞）。
+  build-loader:
+    name: '校验 iOS loader（bridge/hook/addon/overlay 加固编译）'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境
+        run: |
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo MISSING)"
+
+      - name: Build loader dylib (arm64-ios)
+        run: cd src/dylib && make clean && make
+
+      - name: Upload loader artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nebula-ios-loader
+          path: src/dylib/nebula_ios_loader.dylib
+          if-no-files-found: warn

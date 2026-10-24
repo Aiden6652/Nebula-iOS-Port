@@ -11,8 +11,9 @@
 // 两个必须遵守的约束：
 //   1) 构造器里必须异步 boot（pthread），绝不在 constructor/DllMain 同步初始化
 //      Mono —— 会与加载器锁死锁。
-//   2) 内存：全量 NOS 在 iOS 上很容易被 jetsam 杀，且分发包不能假定用户有
-//      increased-memory-limit。所以有 RSS 软顶看门狗 + 默认走解释器。
+//   2) 内存：全量 NOS 在 iOS 上很容易被 jetsam 杀，且有 RSS 软顶看门狗 + 硬顶
+//      （默认 500MB 激进 GC）。统一编译器（JIT）版需要 dynamic-codesigning 权限，
+//      没有则 mono 初始化会被内核秒杀（见下方 JIT 闸门）。
 //      详见 docs/ios-memory-budget.md
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -176,7 +177,7 @@ static MonoAssembly *nebula_preload(MonoAssemblyName *aname, char **assemblies_p
 // ---------------------------------------------------------------- 配置
 
 typedef struct {
-    char runtime_mode[16];      // interp | jit | auto
+    char runtime_mode[16];      // jit（解释器已废除，统一编译器版）
     int  gc_nursery_mb;
     int  gc_soft_limit_mb;      // 软顶：超过即常规 GC（默认 320MB）
     int  gc_hard_limit_mb;      // 硬顶：超过即激进全量 GC + 告警（默认 500MB，见 #12）
@@ -192,7 +193,7 @@ typedef struct {
 
 // 内置默认 = Standard 档
 static host_cfg CFG = {
-    .runtime_mode = "interp",
+    .runtime_mode = "jit",
     .gc_nursery_mb = 16,
     .gc_soft_limit_mb = 320,
     .gc_hard_limit_mb = 500,    // #12：RSS 超 500MB 强制激进 GC，防 jetsam 杀
@@ -213,7 +214,8 @@ static char *trim(char *s) {
     return s;
 }
 
-// 两套预设：standard（纯解释器）/ pro（强制 JIT）
+// 单一预设：编译器（JIT）版。解释器已被废除（见下方 mono_setmmapjit 处说明），
+// standard / pro 合并为一份二进制，始终走 JIT 编译执行。
 static void load_cfg(const char *dir) {
     const char *profile = getenv("NEBULA_PROFILE");
     if (!profile || !*profile) profile = "standard";
@@ -288,12 +290,7 @@ static void apply_gc_env(void) {
         setenv("MONO_GC_PARAMS", buf, 1);
         printf("[host] MONO_GC_PARAMS=%s\n", buf);
     }
-    if (!strcmp(CFG.runtime_mode, "interp")) {
-        setenv("MONO_ENV_OPTIONS", "--interp", 1);
-        printf("[host] 运行模式=解释器(interp)，不需要可执行内存权限\n");
-    } else if (!strcmp(CFG.runtime_mode, "jit")) {
-        printf("[host] 运行模式=JIT（要求 dynamic-codesigning，否则会崩）\n");
-    }
+    // 单一编译器（JIT）版：不再有解释器分支，统一走 JIT（见下方 mono_setmmapjit）。
 }
 
 // ---------------------------------------------------------------- RSS + 看门狗
@@ -572,7 +569,7 @@ static int log_try(const char *p)
 
 // —— JIT 能力检测 + 等待 ——
 // iOS 严格 W^X：mono 初始化必然生成 trampoline（P/Invoke、委托、接口分派），
-// 无论解释器还是 JIT 模式都要可执行 MAP_JIT 内存。进程若没有 JIT 能力
+// 统一编译器（JIT）版必须可执行 MAP_JIT 内存。进程若没有 JIT 能力
 // （无 allow-jit 描述文件、也没被调试器附加），执行 trampoline 页会被内核
 // 以 CODESIGNING / Invalid Page 秒杀（SIGKILL，无法被 signal handler 捕获）。
 //
@@ -611,8 +608,7 @@ static int nebula_wait_for_jit(void) {
         hlog("[host] JIT 已就绪（进程拥有 JIT 能力）");
         return 1;
     }
-    hlog("[host] !! JIT 尚未就绪：进程无 JIT 能力，mono 无法生成/执行 trampoline");
-    hlog("[host] !! 标准版（解释器）同样需要 JIT —— 解释器跑 IL 仍要 trampoline");
+    hlog("[host] !! JIT 尚未就绪：进程无 JIT 能力，统一编译器(JIT)版无法生成/执行 trampoline");
     hlog("[host] !! 解决（任选其一）：");
     hlog("[host] !!   1) 用 StikDebug / SideJITServer 给 AmongUs 附加启用 JIT（靠 get-task-allow）");
     hlog("[host] !!   2) 用含 com.apple.security.cs.allow-jit 的描述文件直签 AmongUs（付费开发证书）");
@@ -688,42 +684,13 @@ static void *boot_thread(void *arg) {
     hlog("[host] step: mono_config_parse");
     mono_config_parse(NULL);
 
-    // —— Pro 版二进制（编译期 -DNEBULA_PRO）：强制走 JIT，忽略任何配置/环境变量 ——
-    // 这样 libnebula_pro.dylib 注入即 JIT，无需 NEBULA_PROFILE 或 *.cfg 配合。
-    // 之前 pro / standard 是同一份二进制、仅靠 runtime.mode 配置切换，注入 pro 却
-    // 没配置就掉进解释器分支（真机日志实证）。现在 pro 自带 JIT，注入即用。
-#ifdef NEBULA_PRO
+    // 单一编译器（JIT）版本：废除解释器，standard / pro 合并为一份，始终走 JIT 编译执行。
+    // 实测旧两种模式都要在 mono_trampolines_init 生成 generic trampoline（写 ARM64 代码到
+    // 可执行内存），解释器并未省下 JIT 能力，反而更慢、还多一套构建分支 —— 故废除。
+    // MAP_JIT 分配保留（配合 mono 侧 dlsym 探测翻转：真机官方 JIT 走 W^X 翻转；
+    // StikDebug 解析不到则跳过，RWX 页直接写）。
     mono_setmmapjit(1);
-    hlog("[host] Pro 版二进制：强制 JIT + 强制 MAP_JIT（要求 dynamic-codesigning 权限，否则 SIGSEGV）");
-#else
-    // 崩在这里 = mono 运行时自身初始化问题（sdb trampoline 那类）
-    if (strcmp(CFG.runtime_mode, "jit") == 0) {
-        // pro/JIT 模式：保留 JIT，且强制 JIT 内存走 MAP_JIT 分配。
-        // iOS 严格 W^X：非 MAP_JIT 的可执行内存非法，必须 MAP_JIT + 后续
-        // pthread_jit_write_protect_np 翻转（参考 OpenJDK os_bsd_aarch64.cpp）。
-        mono_setmmapjit(1);
-        hlog("[host] pro/JIT 模式：保留 JIT + 强制 MAP_JIT 分配");
-    } else {
-        // standard：走解释器（Interpreter）模式。
-        // 不能强制 aot-only！星云舰的 DLL 是未 AOT 预编译的 IL 程序集，
-        // aot-only 模式下 mono 加载 mscorlib 等会因缺 AOT 镜像直接 fatal
-        // （真机日志死在 mono_jit_init，桌面 runner 上同样复现）。
-        // 通过 MONO_ENV_OPTIONS=--interpreter 强制（mono_jit_init 会解析它）。
-        //
-        // 关键：standard 也要 JIT 能力！mono 初始化时会生成 generic trampoline
-        // （写 ARM64 代码到可执行内存），与解释器/JIT 无关。
-        // iOS 严格 W^X：强制 MAP_JIT 分配（配合 mono 侧 dlsym 探测翻转：
-        // 真机官方 JIT 走 W^X 翻转；StikDebug 解析不到则跳过，RWX 页直接写）。
-        //
-        // ⚠️ 误区纠正：解释器“不真正 JIT 代码”没错，但 trampoline 生成仍需
-        //    可执行内存 —— 没有 JIT 能力（allow-jit 描述文件或被调试器
-        //    附加）照样被内核 CODESIGNING 秒杀。所以 standard 也必须有 JIT，
-        //    前面的 nebula_wait_for_jit() 闸门对两个档一视同仁。
-        mono_setmmapjit(1);
-        setenv("MONO_ENV_OPTIONS", "--interpreter", 1);
-        hlog("[host] standard 模式：解释器 + 强制 MAP_JIT（trampoline 生成需可执行内存）");
-    }
-#endif
+    hlog("[host] 编译器(JIT)模式：强制 MAP_JIT 分配（trampoline 生成需可执行内存）");
 
     hlog("[host] step: mono_jit_init ...");
 

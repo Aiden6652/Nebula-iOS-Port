@@ -3,7 +3,7 @@
 #
 # 用法: bash src/mono_host/build_ios.sh <Mono-iOS-安装前缀>
 #
-# 产物: out-ios/libnebula_mono_host.dylib
+# 产物: out-ios/libnebula_standard.dylib（单一编译器/JIT 版）
 #   带 BUILD_AS_LIB → 挂 __attribute__((constructor))，被游戏 dlopen 后
 #   自动 pthread 异步 boot Mono（绝不能在 constructor 里同步初始化，会撞加载器锁死锁）。
 #
@@ -115,39 +115,16 @@ PY
 
 echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 
-# standard / mono_host：不限定运行模式，由 runtime.mode 配置决定（默认 interp）。
+# 单一编译器（JIT）版：解释器已废除，standard / pro 合并为一份。
+# 宿主代码始终走 JIT（见 nebula_mono_host.c 的 mono_setmmapjit(1)），
+# 不再区分 NEBULA_PRO；仅产出一个包 libnebula_standard.dylib。
 "$CCBIN" -arch arm64 \
   -isysroot "$SDK" \
   -miphoneos-version-min="$MIN_IOS" \
   -dynamiclib -fPIC \
   -DBUILD_AS_LIB \
   -I"$MONO_INC" \
-  -o "$OUT/libnebula_mono_host.dylib" \
-  "$ROOT/nebula_mono_host.c" \
-  "$ROOT/case_insensitive_fs.c" \
-  "$ROOT/fishhook.c" \
-  "$ROOT/boot_overlay.m" \
-  "${LIBS[@]}" \
-  -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
-  -framework Foundation \
-  -framework CoreFoundation \
-  -framework Security \
-  -framework UIKit \
-  -lobjc -lc++ -lpthread -lz -lm \
-  -Wl,-U,_pthread_jit_write_protect_np
-
-cp "$OUT/libnebula_mono_host.dylib" "$OUT/libnebula_standard.dylib"
-
-# pro：编译期注入 -DNEBULA_PRO=1 → 二进制强制走 JIT，无需 NEBULA_PROFILE / cfg 配合。
-# 之前 pro / standard 是同一份二进制、仅靠 runtime.mode 配置切换，注入 pro 却没配
-# 置就会掉进解释器分支（真机日志实证）。现在 pro 自带 JIT，注入即用。
-"$CCBIN" -arch arm64 \
-  -isysroot "$SDK" \
-  -miphoneos-version-min="$MIN_IOS" \
-  -dynamiclib -fPIC \
-  -DBUILD_AS_LIB -DNEBULA_PRO=1 \
-  -I"$MONO_INC" \
-  -o "$OUT/libnebula_pro.dylib" \
+  -o "$OUT/libnebula_standard.dylib" \
   "$ROOT/nebula_mono_host.c" \
   "$ROOT/case_insensitive_fs.c" \
   "$ROOT/fishhook.c" \
@@ -168,11 +145,11 @@ echo "BCL 状态: 已内嵌（${BLOBSZ} bytes 烧进 dylib 的 __nebulabcl 段�
 rm -f "$BLOB"   # 临时 blob 已烧进段，删掉避免被打进 artifact
 
 echo "=== 校验 ==="
-lipo -info "$OUT/libnebula_mono_host.dylib"
-file "$OUT/libnebula_mono_host.dylib" 2>/dev/null || true
+lipo -info "$OUT/libnebula_standard.dylib"
+file "$OUT/libnebula_standard.dylib" 2>/dev/null || true
 
 echo "--- 关键符号检查（证明 MonoVM 真的链进来了）---"
-SYMS="$(nm -gU "$OUT/libnebula_mono_host.dylib" 2>/dev/null || true)"
+SYMS="$(nm -gU "$OUT/libnebula_standard.dylib" 2>/dev/null || true)"
 # 用 case 做纯字符串匹配，不用 echo|grep —— grep -q 会提前关管道，
 # 在 pipefail 下会让 echo 报 Broken pipe 而把脚本判失败（产物本身没问题）。
 for s in mono_jit_init mono_domain_assembly_open mono_runtime_invoke mono_gc_collect; do
@@ -184,7 +161,7 @@ done
 [ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号，链接有问题" >&2; exit 1; }
 
 echo "--- 产物 ---"
-for f in libnebula_mono_host.dylib libnebula_standard.dylib libnebula_pro.dylib; do
+for f in libnebula_standard.dylib; do
   [ -f "$OUT/$f" ] && printf "    %-30s %8s  sha256=%s\n" "$f" \
      "$(du -h "$OUT/$f" | cut -f1)" "$(shasum -a 256 "$OUT/$f" | cut -c1-16)"
 done
