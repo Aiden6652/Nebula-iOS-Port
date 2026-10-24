@@ -50,6 +50,7 @@ extern void mono_setmmapjit (int flag);
 #include <mach/task_info.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <TargetConditionals.h>   // TARGET_OS_IPHONE / TARGET_OS_MAC
 #include <os/log.h>
 #include <signal.h>
 // sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
@@ -552,11 +553,19 @@ static int log_try(const char *p)
 // 化解“先开 JIT 还是先启动”的死锁。
 static int nebula_have_jit(void) {
 #ifndef __APPLE__
-    return 1;   // 桌面平台天然可 JIT
+    return 1;   // 桌面平台（Linux/Windows）天然可 JIT
 #else
+#if TARGET_OS_IPHONE
+    // iOS：必须被调试器（StikDebug 等）附加获得 CS_DEBUGGED，或被签 allow-jit，
+    // 才有 JIT 能力（否则 mono 生成 trampoline 时会被内核 CODESIGNING 秒杀）。
     int flags = 0;
     if (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) != 0) return 0;
     return (flags & CS_DEBUGGED) ? 1 : 0;
+#else
+    // macOS：进程默认拥有 JIT 能力（不依赖 CS_DEBUGGED，无需调试器附加），
+    // 直接放行。CI 的 macOS runner 无人附加调试器，但 mono 仍能正常 JIT。
+    return 1;
+#endif
 #endif
 }
 
