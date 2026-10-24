@@ -15,6 +15,9 @@
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>   /* #3 段保护用到 struct mach_header_64 / LC_SEGMENT_64 */
+/* #3 段保护：nebula_addr_in_text 在 nebula_hook_install 中先调用、下方才定义，
+   static 函数需前向声明（C99 不允许隐式声明）。 */
+static int nebula_addr_in_text(const void *p);
 #endif
 
 #define MAX_HOOKS 32
