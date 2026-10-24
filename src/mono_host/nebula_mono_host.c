@@ -591,9 +591,15 @@ static void *boot_thread(void *arg) {
         mono_setmmapjit(1);
         hlog("[host] pro/JIT 模式：保留 JIT + 强制 MAP_JIT 分配");
     } else {
-        // standard：强制 AOT-only，避开运行时生成 trampoline（.NET MAUI iOS 的运行方式）。
-        mono_jit_set_aot_only(TRUE);
-        hlog("[host] 强制 mono AOT-only（iOS 禁止运行时生成 trampoline）");
+        // standard：走解释器（Interpreter）模式。
+        // 不能强制 aot-only！星云舰的 DLL 是未 AOT 预编译的 IL 程序集，
+        // aot-only 模式下 mono 加载 mscorlib 等会因缺 AOT 镜像直接 fatal
+        // （真机日志死在 mono_jit_init，桌面 runner 上同样复现）。
+        // 解释器不需要 JIT 也不需要 trampoline，纯软件执行 IL，
+        // 无需 JIT entitlement，是 iOS 无 JIT 权限时的正确路径。
+        // 通过 MONO_ENV_OPTIONS=--interpreter 强制（mono_jit_init 会解析它）。
+        setenv("MONO_ENV_OPTIONS", "--interpreter", 1);
+        hlog("[host] standard 模式：强制 Mono 解释器（--interpreter），不用 aot-only");
     }
 
     hlog("[host] step: mono_jit_init ...");
