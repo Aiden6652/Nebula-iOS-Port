@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-7}"
+CACHE_VERSION="${CACHE_VERSION:-8}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -171,60 +171,47 @@ for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
             open(p,'w').write(s2)
             print("    中和 DISABLE_JIT 定义:", os.path.relpath(p, mono))
 
-# (b) 把 MAP_JIT 分配从 macOS-only 扩展到 iOS（mono-mmap.c）。
-#     原守卫 #if ... && defined(TARGET_OSX) 让 iOS 完全跳过 MAP_JIT，导致 JIT 内存非法。
-mp = os.path.join(mono, 'mono', 'utils', 'mono-mmap.c')
-s = open(mp, encoding='utf-8', errors='replace').read()
-s2 = s.replace('#if defined(__APPLE__) && defined(MAP_JIT) && defined(TARGET_OSX)',
-               '#if defined(__APPLE__) && defined(MAP_JIT) && (defined(TARGET_OSX) || defined(TARGET_IOS))')
-s2 = s2.replace('if (__builtin_available (macOS 11, *))',
-                'if (__builtin_available (macOS 11, iOS 14, *))')
-if s2 != s:
-    open(mp,'w').write(s2)
-    print("    mono-mmap.c: MAP_JIT 已扩展到 iOS + 可用性修正为 iOS 14")
-else:
-    print("    !! mono-mmap.c 未匹配到 MAP_JIT 守卫（mono 版本可能已改结构）", file=sys.stderr)
+# (b) [Nebula iOS] plain-RWX 模式（94f5693 真机 .ips 实证后的定案）：
+#     不再把 MAP_JIT 扩展到 iOS，iOS 上 mono_valloc 走 plain mmap RWX。
+#     依据：StikDebug 调试型 JIT 给进程 CS_DEBUGGED，内核直接允许 RWX 匿名映射
+#     （本次崩溃 run 里 mono_global_codeman_reserve 的 plain RWX mmap 已实测成功）。
+#     mono 自建 MAP_JIT/W^X（翻转可写/可执行）在 iOS 上有两个死穴：
+#       1) iOS SDK 的 libpthread.tbd 不导出 pthread_jit_write_protect_np，
+#          -Wl,-U 只让链接通过；运行时懒绑定解析失败 → 符号桩 br 到 0 →
+#          mono_trampolines_init 首次翻转即 SIGSEGV pc=0（.ips: lr=
+#          mono_arch_create_generic_trampoline+88，与反汇编完全吻合）；
+#       2) plain RWX 本来就可用，W^X 纯属多余。
+#     mono_setmmapjit(1)（host 对 standard 的调用）在 iOS 变为无害 no-op。
 
-# (c) iOS W^X 翻转核心补丁：mono_codeman_enable_write/disable_write 的调用点守卫是
-#     #ifdef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP（已由 (a3) 强制定义），内部用
-#     __builtin_available (macOS 11, *) 在 iOS 上 `*` 通配为 true，但显式列出 iOS 14 更安全。
-#     iOS 14+ SDK 的 <pthread.h> 已声明 void 版本，旧 SDK 不声明——补齐 void 声明
-#     （避免 undeclared 与 conflicting types）。链接期靠 (d) 的 -Wl,-U 解决 libpthread 不导出。
+# (c) [Nebula iOS] 翻转整体 no-op（94f5693 真机 .ips 实证）：
+#     iOS 上 mono_codeman_enable_write/disable_write 直接 return。
+#     死因链条：enable_write 尾调（b 指令，先恢复 lr 再跳）符号桩
+#     _pthread_jit_write_protect_np → 懒绑定解析失败（tbd 不导出）→ 桩 br x16=0
+#     → SIGSEGV pc=0, lr=mono_arch_create_generic_trampoline+88（与 .ips 完全吻合）。
+#     plain-RWX 下页面恒可写，翻转本无必要；no-op 同时消灭跳零点。
+#     macOS 分支（TARGET_IOS=0）不受影响，保持原逻辑（CI 桌面冒烟验证）。
 import re as _re
 cm = os.path.join(mono, 'mono', 'utils', 'mono-codeman.c')
 if os.path.exists(cm):
     s = open(cm, encoding='utf-8', errors='replace').read()
-    # 可用性检查：__builtin_available (macOS 11, *) 在 iOS 上 `*` 已通配为 true，
-    # 但显式列出 iOS 14 更安全（iOS<14 不会进入调用，避免调用不存在的 API）。
+    # 可用性检查：显式列出 iOS 14（macOS 分支用，iOS 分支已被 no-op 短路）
     s2 = _re.sub(r'__builtin_available\s*\(\s*macOS\s+11[^)]*\)',
                 '__builtin_available (macOS 11, iOS 14, *)', s)
-    # [Nebula iOS] 保留 mono 原生的 pthread_jit_write_protect_np 翻转（不禁用）。
-    # 关键：trampoline 内存是 MAP_JIT 分配的（见 (b) 扩展 iOS），MAP_JIT 页在 iOS 上
-    # 默认处于「可执行但不可写」态，必须靠 pthread_jit_write_protect_np(0) 翻成可写、
-    # 写完 trampoline 再 (1) 翻回可执行，才能正常生成/执行跳板。禁用翻转会导致
-    # mono 写 trampoline 时 KERN_PROTECTION_FAILURE → SIGSEGV（实测 87f9f3a 崩于此）。
-    # StikDebug 调试型 JIT 提供 CS_DEBUGGED，使该 API 在运行时可用（Pojav/Amethyst
-    # 同款官方 iOS JIT 模式），故保留翻转即可，无需改动这两处调用。
-    # 补齐声明：iOS 14+ SDK 的 <pthread.h> 已声明 void 版本，旧 SDK 不声明。
-    # 必须用 void 返回类型（与系统一致，否则 conflicting types），且 TARGET_IOS 守卫，
-    # 不带 weak_import（链接期靠 -Wl,-U 解决 undefined symbol）。重复声明 void 版本
-    # 在 Clang 上类型兼容、无害。
-    decl = ('\n'
-            '#if defined(TARGET_IOS) && TARGET_IOS\n'
-            '/* [Nebula iOS] 确保 pthread_jit_write_protect_np 已声明（旧 iOS SDK 不公开） */\n'
-            'extern void pthread_jit_write_protect_np(int enabled);\n'
+    noop = ('#if defined(TARGET_IOS) && TARGET_IOS\n'
+            '\t/* [Nebula iOS] plain-RWX：无 MAP_JIT 则页面恒可写，无需翻转；\n'
+            '\t   且 pthread_jit_write_protect_np 在 iOS tbd 不导出，直接调用\n'
+            '\t   会在懒绑定时跳空指针（真机 .ips 实证 pc=0）。整体 no-op。 */\n'
+            '\treturn;\n'
             '#endif\n')
-    _incs = list(_re.finditer(r'(?m)^#\s*include\b.*$', s2))
-    if _incs:
-        _end = _incs[-1].end()
-        s2 = s2[:_end] + decl + s2[_end:]
+    n1 = _re.sub(r'(mono_codeman_enable_write \(void\)\s*\{\n)',
+                 lambda m: m.group(1) + noop, s2, count=1)
+    n2 = _re.sub(r'(mono_codeman_disable_write \(void\)\s*\{\n)',
+                 lambda m: m.group(1) + noop, n1, count=1)
+    if n2 != s2:
+        open(cm, 'w', encoding='utf-8').write(n2)
+        print("    mono-codeman.c: iOS 翻转 no-op 已注入 (enable/disable 各一处)")
     else:
-        s2 = decl + s2
-    if s2 != s:
-        open(cm, 'w', encoding='utf-8').write(s2)
-        print("    mono-codeman.c: 可用性修正 iOS 14 + 补齐 pthread_jit_write_protect_np void 声明")
-    else:
-        print("    !! mono-codeman.c 未匹配到 __builtin_available（mono 版本可能已改结构）", file=sys.stderr)
+        print("    !! mono-codeman.c 未匹配到翻转函数（mono 版本可能已改结构）", file=sys.stderr)
 else:
     print("    !! 找不到 mono-codeman.c", file=sys.stderr)
 
@@ -253,7 +240,7 @@ if os.path.exists(mini_cmake):
 else:
     print("    !! 找不到 mono/mini/CMakeLists.txt", file=sys.stderr)
 PY
-  echo "    [JIT] DISABLE_JIT 已放出 + MAP_JIT 已扩展到 iOS + W^X 翻转已扩展到 iOS"
+  echo "    [JIT] DISABLE_JIT 已放出 + iOS plain-RWX（无 MAP_JIT/无翻转，翻转 no-op 防跳零）"
 else
   echo "    MONO_IOS_JIT 未开启，保留标准 DISABLE_JIT 构建（standard 安全）"
 fi
