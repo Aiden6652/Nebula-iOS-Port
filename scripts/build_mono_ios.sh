@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-4}"
+CACHE_VERSION="${CACHE_VERSION:-5}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -198,6 +198,14 @@ if os.path.exists(cm):
     # 但显式列出 iOS 14 更安全（iOS<14 不会进入调用，避免调用不存在的 API）。
     s2 = _re.sub(r'__builtin_available\s*\(\s*macOS\s+11[^)]*\)',
                 '__builtin_available (macOS 11, iOS 14, *)', s)
+    # [Nebula iOS] 调试型 JIT (StikDebug) 自带 RWX：mono 原生的 pthread_jit_write_protect_np
+    # 翻转会把 StikDebug 提供的 RWX 页改坏（变成可写不可执行），执行 trampoline 时
+    # SIGSEGV / CODESIGNING 秒杀。现在开 JIT 的教程全用 StikDebug（调试型 JIT），
+    # 故直接禁用 write-protect 翻转，让 mono 直接用 StikDebug 给的 RWX 页。
+    s2 = s2.replace('\t\tpthread_jit_write_protect_np (0);',
+                    '\t\t/* [Nebula iOS] 调试型JIT自带RWX，禁用翻转 */')
+    s2 = s2.replace('\t\t\tpthread_jit_write_protect_np (1);',
+                    '\t\t\t/* [Nebula iOS] 调试型JIT自带RWX，禁用翻转 */')
     # 补齐声明：iOS 14+ SDK 的 <pthread.h> 已声明 void 版本，旧 SDK 不声明。
     # 必须用 void 返回类型（与系统一致，否则 conflicting types），且 TARGET_IOS 守卫，
     # 不带 weak_import（链接期靠 -Wl,-U 解决 undefined symbol）。重复声明 void 版本
