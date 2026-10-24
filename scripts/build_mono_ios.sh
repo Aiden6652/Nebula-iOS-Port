@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-3}"
+CACHE_VERSION="${CACHE_VERSION:-4}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -134,6 +134,27 @@ if os.path.exists(cfg):
     else:
         print("    !! config.h.in 未匹配到 #cmakedefine DISABLE_JIT", file=sys.stderr)
 
+# (a3) iOS 强制定义 HAVE_PTHREAD_JIT_WRITE_PROTECT_NP：
+#      cross-compile 下 cmake 的 check_symbol_exists 默认 no，导致 mono-codeman.c 的
+#      W^X 翻转守卫（#if HAVE_... && TARGET_OSX）不编译 → iOS 上写 MAP_JIT 内存
+#      从不翻转写保护，mono_jit_init 生成 trampoline 即 SIGSEGV（standard/pro 同崩）。
+#      iOS 14+ 的 libsystem_pthread 已导出该符号（配 StikDebug 的 CS_DEBUGGED JIT 能力可用）。
+cfg = os.path.join(mono, 'cmake', 'config.h.in')
+if os.path.exists(cfg):
+    s = open(cfg, encoding='utf-8', errors='replace').read()
+    if '#cmakedefine HAVE_PTHREAD_JIT_WRITE_PROTECT_NP' in s:
+        s2 = s.replace('#cmakedefine HAVE_PTHREAD_JIT_WRITE_PROTECT_NP',
+                       '#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 1 /* [Nebula iOS] iOS 14+ 已导出，配 StikDebug 可用 */')
+        open(cfg, 'w', encoding='utf-8').write(s2)
+        print("    config.h.in: HAVE_PTHREAD_JIT_WRITE_PROTECT_NP → 强制 #define（iOS）")
+    elif 'HAVE_PTHREAD_JIT_WRITE_PROTECT_NP' not in s:
+        s += "\n/* [Nebula iOS] 强制定义：iOS 14+ libsystem_pthread 已导出，配 StikDebug JIT 能力可用 */\n"
+        s += "#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 1\n"
+        open(cfg, 'w', encoding='utf-8').write(s)
+        print("    config.h.in: 末尾追加 HAVE_PTHREAD_JIT_WRITE_PROTECT_NP=1（iOS）")
+    else:
+        print("    config.h.in: HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 已存在，跳过")
+
 # (a2) 兜底：中和构建系统里可能存在的 -DDISABLE_JIT / add_compile_definitions(DISABLE_JIT) / add_definitions(...DISABLE_JIT...)
 for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
     for f in files:
@@ -163,8 +184,34 @@ if s2 != s:
     print("    mono-mmap.c: MAP_JIT 已扩展到 iOS + 可用性修正为 iOS 14")
 else:
     print("    !! mono-mmap.c 未匹配到 MAP_JIT 守卫（mono 版本可能已改结构）", file=sys.stderr)
+
+# (c) iOS W^X 翻转核心补丁：mono_codeman_enable_write/disable_write 的守卫原本是
+#     #if defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && defined(TARGET_OSX)
+#     TARGET_OSX 直接排除 iOS，mono 在 iOS 上写 MAP_JIT 内存（trampoline/JIT 代码）
+#     从不翻转写保护，mono_jit_init 即 SIGSEGV（standard/pro 同崩）。
+#     扩到 TARGET_IOS，并把可用性检查 (macOS 11, *) 改成 (macOS 11, iOS 14, *)。
+cm = os.path.join(mono, 'mono', 'metadata', 'mono-codeman.c')
+if os.path.exists(cm):
+    s = open(cm, encoding='utf-8', errors='replace').read()
+    s2 = s.replace(
+        'defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && defined(TARGET_OSX)',
+        'defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && (defined(TARGET_OSX) || defined(TARGET_IOS))')
+    s2 = re.sub(r'__builtin_available\s*\(\s*macOS\s+11[^)]*\)',
+                '__builtin_available (macOS 11, iOS 14, *)', s2)
+    if s2 != s:
+        open(cm, 'w', encoding='utf-8').write(s2)
+        print("    mono-codeman.c: W^X 翻转守卫已扩展到 TARGET_IOS + 可用性修正为 iOS 14")
+    else:
+        print("    !! mono-codeman.c 未匹配到 TARGET_OSX 守卫（mono 版本可能已改结构）", file=sys.stderr)
+else:
+    print("    !! 找不到 mono-codeman.c", file=sys.stderr)
 PY
-  echo "    [JIT] DISABLE_JIT 已放出 + MAP_JIT 已扩展到 iOS"
+# (c) iOS W^X 翻转核心补丁：mono_codeman_enable_write/disable_write 的守卫原本是
+#     `#if defined(HAVE_PTHREAD_JIT_WRITE_PROTECT_NP) && defined(TARGET_OSX)`
+#     —— TARGET_OSX 直接排除 iOS，mono 在 iOS 上写 MAP_JIT 内存（trampoline/JIT 代码）
+#     从不翻转写保护，mono_jit_init 即 SIGSEGV（standard/pro 同崩）。
+#     扩到 TARGET_IOS，并把可用性检查 (macOS 11, *) 改成 (macOS 11, iOS 14, *)。
+  echo "    [JIT] DISABLE_JIT 已放出 + MAP_JIT 已扩展到 iOS + W^X 翻转已扩展到 iOS"
 else
   echo "    MONO_IOS_JIT 未开启，保留标准 DISABLE_JIT 构建（standard 安全）"
 fi
