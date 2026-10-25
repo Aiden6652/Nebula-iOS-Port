@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-16}"
+CACHE_VERSION="${CACHE_VERSION:-17}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -338,7 +338,7 @@ if mm:
         '\t\t} else {\n'
         '\t\t\tsnprintf (path, sizeof (path), "%s/nebula_mono_mem.log", tmp && *tmp ? tmp : "/tmp");\n'
         '\t\t}\n'
-        '\t\tfp = fopen (path, "a");\n'
+        '\t\tfp = fopen (path, "w");\n'
         '\t}\n'
         '\tif (fp) {\n'
         '\t\tstruct timespec ts;\n'
@@ -366,6 +366,27 @@ if mm:
         '\t\tneb_wx_log ("register addr=%p len=%zu (n=%d)", addr, len, neb_wx_nregions);\n'
         '\t}\n'
         '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
+        '}\n'
+        '\n'
+        '/* [Nebula iOS] 若 addr 已在表内返回 1；否则补登记并返回 0（用于 mono_mprotect\n'
+        '   直接翻 R-X 的可执行块——绕过 mono_valloc 的路径也能纳入翻转表）。*/\n'
+        'static int\n'
+        'nebula_wx_ensure (void *addr, size_t len)\n'
+        '{\n'
+        '\tif (!addr || !len) return 1;\n'
+        '\tpthread_mutex_lock (&neb_wx_mutex);\n'
+        '\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
+        '\t\tif (neb_wx_regions [i].active && neb_wx_regions [i].addr == addr) { pthread_mutex_unlock (&neb_wx_mutex); return 1; }\n'
+        '\t}\n'
+        '\tif (neb_wx_nregions < (int)(sizeof (neb_wx_regions) / sizeof (neb_wx_regions [0]))) {\n'
+        '\t\tneb_wx_regions [neb_wx_nregions].addr = addr;\n'
+        '\t\tneb_wx_regions [neb_wx_nregions].len = len;\n'
+        '\t\tneb_wx_regions [neb_wx_nregions].active = 1;\n'
+        '\t\tneb_wx_nregions++;\n'
+        '\t\tneb_wx_log ("ensure-register addr=%p len=%zu (n=%d)", addr, len, neb_wx_nregions);\n'
+        '\t}\n'
+        '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
+        '\treturn 0;\n'
         '}\n'
         '\n'
         'static void\n'
@@ -447,7 +468,12 @@ if mm:
         sys.exit(1)
     _mp_new = ('\tint _r = mprotect (addr, length, prot);\n'
                '#if defined(__APPLE__)\n'
-               '\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d", addr, length, flags, prot, _r, _r ? errno : 0);\n'
+               '\tif (prot & PROT_EXEC) {\n'
+               '\t\tint was = nebula_wx_ensure (addr, length);\n'
+               '\t\tneb_wx_log ("mprotect-EXEC %p len=%zu prot_out=%d ret=%d errno=%d registered_before=%d", addr, length, prot, _r, _r ? errno : 0, was);\n'
+               '\t} else {\n'
+               '\t\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d", addr, length, flags, prot, _r, _r ? errno : 0);\n'
+               '\t}\n'
                '#endif\n'
                '\treturn _r;\n}')
     s2 = s2.replace(_mp_old, _mp_new, 1)
