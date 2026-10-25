@@ -831,6 +831,30 @@ static int nebula_jit_smoke(void)
                     ((void (*)(void))p)();
                     hlog("[host] 冒烟: 路线F 执行 OK —— plain(RW)+mprotect W^X 路线畅通!");
                     ok = 1;
+                    // mono 需要反复 W^X 循环：验证 RX → 回翻 RW → 再写 → 再 RX → 再执行
+                    if (mprotect(p, 4096, PROT_READ | PROT_WRITE) != 0 ||
+                        nebula_page_prot(p, &cur, &mx) != 0 || !(cur & PROT_WRITE)) {
+                        hlog("[host] !! 路线F 回翻 RW 失败 (cur=%x errno=%d) —— mono 反复写代码会崩!",
+                             cur, errno);
+                        ok = 0;
+                    } else {
+                        *(unsigned int *)p = ret_insn;   // 再写一次（内容同 ret）
+                        if (mprotect(p, 4096, PROT_READ | PROT_EXEC) != 0 ||
+                            nebula_page_prot(p, &cur, &mx) != 0 || !(cur & PROT_EXEC)) {
+                            hlog("[host] !! 路线F 二次翻 R-X 失败 (cur=%x errno=%d)", cur, errno);
+                            ok = 0;
+                        } else {
+                            sys_icache_invalidate(p, 4096);
+                            if (sigsetjmp(g_smoke_jmp, 1) == 0) {
+                                ((void (*)(void))p)();
+                                hlog("[host] 冒烟: 路线F 二次循环执行 OK —— W^X 反复翻转可用, 放行 mono_jit_init");
+                            } else {
+                                hlog("[host] !! 路线F 二次执行段错误 signal=%d fault=%p",
+                                     g_smoke_sig, g_smoke_fault);
+                                ok = 0;
+                            }
+                        }
+                    }
                 } else {
                     hlog("[host] 冒烟: 路线F 执行段错误 signal=%d fault=%p",
                          g_smoke_sig, g_smoke_fault);

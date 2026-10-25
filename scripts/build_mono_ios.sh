@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-12}"
+CACHE_VERSION="${CACHE_VERSION:-13}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -217,57 +217,30 @@ if os.path.exists(cm):
     # 可用性检查：显式列出 iOS 14（macOS 分支用，iOS 分支已被 dlsym 探测短路）
     s2 = _re.sub(r'__builtin_available\s*\(\s*macOS\s+11[^)]*\)',
                 '__builtin_available (macOS 11, iOS 14, *)', s)
-    # [Nebula iOS] dlsym 探测翻转：解析到才翻，解析不到跳过（调试态 RWX）。
-    # 用 G_GNUC_UNUSED 消除"静态变量未用"警告（两个函数各一份，enable 用到、disable 用到）。
+    # [Nebula iOS] mprotect W^X 翻转：真机路线 F 已验证（RW 写 → mprotect R-X → 执行 OK）。
+    # enable_write → 翻 RW；disable_write → 翻 R-X + icache（实现见 mono-mmap.c (b3)）。
     probe = ('#if defined(TARGET_IOS) && TARGET_IOS\n'
-             '\t/* [Nebula iOS] NULL 安全翻转：dlsym 探测，解析到才翻，否则跳过 */\n'
-             '\t{\n'
-             '\t\tstatic void (*_nebula_wp)(int) = (void *)0;\n'
-             '\t\tstatic int _nebula_wp_init = 0;\n'
-             '\t\tif (!_nebula_wp_init) {\n'
-             '\t\t\t_nebula_wp = nebula_ios_jit_toggle ();   /* 多源 dlsym 解析，解析不到=NULL */\n'
-             '\t\t\t_nebula_wp_init = 1;\n'
-             '\t\t}\n'
-             '\t\tif (_nebula_wp)\n'
-             '\t\t\t_nebula_wp (0);   /* 翻成可写 */\n'
-             '\t}\n'
+             '\t/* [Nebula iOS] 翻成可写：登记区全局 mprotect RW（真机路线 F 已验证） */\n'
+             '\tnebula_mono_wx_set_write (1);\n'
              '\treturn;\n'
              '#endif\n')
     probe_off = ('#if defined(TARGET_IOS) && TARGET_IOS\n'
-                '\t/* [Nebula iOS] NULL 安全翻转：dlsym 探测，解析到才翻，否则跳过 */\n'
-                '\t{\n'
-                '\t\tstatic void (*_nebula_wp)(int) = (void *)0;\n'
-                '\t\tstatic int _nebula_wp_init = 0;\n'
-                '\t\tif (!_nebula_wp_init) {\n'
-                '\t\t\t_nebula_wp = nebula_ios_jit_toggle ();   /* 多源 dlsym 解析，解析不到=NULL */\n'
-                '\t\t\t_nebula_wp_init = 1;\n'
-                '\t\t}\n'
-                '\t\tif (_nebula_wp)\n'
-                '\t\t\t_nebula_wp (1);   /* 翻回可执行 */\n'
-                '\t}\n'
+                '\t/* [Nebula iOS] 翻回可执行：登记区全局 mprotect R-X + 刷 icache */\n'
+                '\tnebula_mono_wx_set_write (0);\n'
                 '\treturn;\n'
                 '#endif\n')
     n1 = _re.sub(r'(mono_codeman_enable_write \(void\)\s*\{\n)',
                  lambda m: m.group(1) + probe, s2, count=1)
     n2 = _re.sub(r'(mono_codeman_disable_write \(void\)\s*\{\n)',
                  lambda m: m.group(1) + probe_off, n1, count=1)
-    # 补齐声明 + dlfcn.h：return 后原调用是死代码，但编译期仍需声明，否则
+    # 补齐声明：return 后原调用是死代码，但编译期仍需声明，否则
     # -Werror=implicit-function-declaration 报错（实测 run 40098995257）。
     decl = ('\n'
             '#if defined(TARGET_IOS) && TARGET_IOS\n'
-            '#include <dlfcn.h>\n'
-            '/* [Nebula iOS] 多源解析 pthread_jit_write_protect_np：iOS SDK 不公开该符号，\n'
-            '   且 RTLD_DEFAULT 在某些命名空间解析不到，回退 dlopen libsystem_pthread.dylib。\n'
-            '   解析不到返回 NULL（调用方跳过翻转，避免 pc=0 跳零）。 */\n'
-            'static void (*nebula_ios_jit_toggle (void))(int)\n'
-            '{\n'
-            '\tvoid (*fn)(int) = (void (*)(int)) dlsym (RTLD_DEFAULT, "pthread_jit_write_protect_np");\n'
-            '\tif (fn) return fn;\n'
-            '\tvoid *h = dlopen ("/usr/lib/system/libsystem_pthread.dylib", RTLD_NOW | RTLD_LOCAL);\n'
-            '\tif (!h) h = dlopen ("libsystem_pthread.dylib", RTLD_NOW | RTLD_LOCAL);\n'
-            '\tif (h) fn = (void (*)(int)) dlsym (h, "pthread_jit_write_protect_np");\n'
-            '\treturn fn;   /* 不 dlclose，保持句柄与函数指针持续有效 */\n'
-            '}\n'
+            '/* [Nebula iOS] mprotect W^X 翻转（实现在 mono-mmap.c (b3)：登记的 JIT 区全局\n'
+            '   mprotect 翻 RW/R-X，真机 2026-10-25 路线 F 已验证） */\n'
+            'extern void nebula_mono_wx_set_write (int writable);\n'
+            '/* 死代码声明补齐：return 之后的原翻转调用仍会编译 */\n'
             'extern void pthread_jit_write_protect_np(int enabled);\n'
             '#endif\n')
     _incs = list(_re.finditer(r'(?m)^#\s*include\b.*$', n2))
@@ -291,6 +264,124 @@ else:
 #      多源解析 pthread_jit_write_protect_np（RTLD_DEFAULT → libsystem_pthread.dylib）。
 #      调试态（StikDebug/CS_DEBUGGED）与官方 allow-jit 直签都能解析到并正确翻转。
 #      本块不再修改 mono-mmap.c（保持与上游一致，避免引入未覆盖的代码路径）。
+
+# (b3) [Nebula iOS] mono 代码页改走「plain RW + mprotect W^X 翻转」——真机 2026-10-25
+#      冒烟路线 F 已验证：plain(RW) mmap → 写入 → mprotect R-X（cur 真实变 r-b）→
+#      执行 OK。MAP_JIT 在此真机内核上 mmap 直接 EPERM errno=1（无 JIT entitlement，
+#      CS_DEBUGGED 不豁免 MAP_JIT 检查）。
+#      实现：
+#        1) iOS 上短路 mono_valloc 的 MAP_JIT 块（MAP_JIT 申请必被拒，还会让
+#           hardened-runtime 探测误判）；
+#        2) mono_valloc 成功且请求含 EXEC → 登记 (addr,len) 进翻转表（内核对
+#           RWX 请求只给 rw-，写入天然可行）；
+#        3) 导出 nebula_mono_wx_set_write(writable)：遍历登记区全局 mprotect——
+#           (1)=翻 RW 供 mono 写代码；(0)=翻 R-X + sys_icache_invalidate 供执行；
+#        4) mono_vfree 注销，防地址复用后误翻数据页。
+#      mono-codeman.c 的 enable/disable_write（(c2)）改调此函数，替代已不存在的
+#      pthread_jit_write_protect_np —— 与 macOS 上 MAP_JIT 翻转的调用纪律完全一致
+#      （enable 写代码 / disable 执行代码），只是把「每线程 pthread 翻转」换成
+#      「每进程 mprotect 翻转」。CACHE_VERSION 联动升版。
+mm = os.path.join(mono, 'mono', 'metadata', 'mono-mmap.c')
+if os.path.exists(mm):
+    s = open(mm, encoding='utf-8', errors='replace').read()
+    _old_guard = '#if defined(__APPLE__) && defined(MAP_JIT) && defined(TARGET_OSX)'
+    _new_guard = ('#if defined(__APPLE__) && defined(MAP_JIT) && defined(TARGET_OSX)'
+                  ' && !(defined(TARGET_IOS) && TARGET_IOS)')
+    if _old_guard not in s:
+        print("    !! mono-mmap.c: MAP_JIT 块守卫未命中（mono 结构变化，需人工适配）", file=sys.stderr)
+        sys.exit(1)
+    wx_block = (
+        '#if defined(TARGET_IOS) && TARGET_IOS\n'
+        '/* [Nebula iOS] W^X 翻转表：登记 mono 的 JIT 页，mprotect 全局翻 RW/R-X。\n'
+        '   真机 2026-10-25 冒烟路线 F 实测：RW 写入 → mprotect R-X → 执行 OK\n'
+        '   （CS_DEBUGGED 态，CS_KILL/CS_HARD 已关，无效页允许执行）。 */\n'
+        '#include <pthread.h>\n'
+        '#include <libkern/OSCacheControl.h>\n'
+        '\n'
+        'typedef struct { void *addr; size_t len; int active; } neb_wx_region_t;\n'
+        'static neb_wx_region_t neb_wx_regions[4096];\n'
+        'static int neb_wx_nregions = 0;\n'
+        'static pthread_mutex_t neb_wx_mutex = PTHREAD_MUTEX_INITIALIZER;\n'
+        '\n'
+        'static void\n'
+        'nebula_wx_register (void *addr, size_t len)\n'
+        '{\n'
+        '\tif (!addr || !len) return;\n'
+        '\tpthread_mutex_lock (&neb_wx_mutex);\n'
+        '\tif (neb_wx_nregions < (int)(sizeof (neb_wx_regions) / sizeof (neb_wx_regions [0]))) {\n'
+        '\t\tneb_wx_regions [neb_wx_nregions].addr = addr;\n'
+        '\t\tneb_wx_regions [neb_wx_nregions].len = len;\n'
+        '\t\tneb_wx_regions [neb_wx_nregions].active = 1;\n'
+        '\t\tneb_wx_nregions++;\n'
+        '\t}\n'
+        '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
+        '}\n'
+        '\n'
+        'static void\n'
+        'nebula_wx_unregister (void *addr, size_t len)\n'
+        '{\n'
+        '\t(void)len;\n'
+        '\tpthread_mutex_lock (&neb_wx_mutex);\n'
+        '\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
+        '\t\tif (neb_wx_regions [i].active && neb_wx_regions [i].addr == addr) {\n'
+        '\t\t\tneb_wx_regions [i].active = 0;\n'
+        '\t\t\tbreak;\n'
+        '\t\t}\n'
+        '\t}\n'
+        '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
+        '}\n'
+        '\n'
+        '/* [Nebula iOS] 全局 W^X 翻转（pthread_jit_write_protect_np 的 mprotect 替身，\n'
+        '   由 mono-codeman.c 的 enable/disable_write 调用）：\n'
+        '   writable=1 → 全部登记区翻 RW（mono 写代码）；\n'
+        '   writable=0 → 全部登记区翻 R-X + 刷 icache（mono 执行代码）。 */\n'
+        'void\n'
+        'nebula_mono_wx_set_write (int writable)\n'
+        '{\n'
+        '\tpthread_mutex_lock (&neb_wx_mutex);\n'
+        '\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
+        '\t\tif (!neb_wx_regions [i].active) continue;\n'
+        '\t\tint prot = writable ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);\n'
+        '\t\tif (mprotect (neb_wx_regions [i].addr, neb_wx_regions [i].len, prot) == 0 && !writable)\n'
+        '\t\t\tsys_icache_invalidate (neb_wx_regions [i].addr, neb_wx_regions [i].len);\n'
+        '\t}\n'
+        '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
+        '}\n'
+        '#endif /* TARGET_IOS */\n'
+        '\n')
+    s2 = s.replace(_old_guard, wx_block + _new_guard, 1)
+
+    # mono_valloc 成功 → 登记（含 EXEC 请求的才登记；内核对 RWX 实际只给 rw-，
+    # mono 随后的写入天然可行，执行交给 disable_write 翻 RX）
+    _va_anchor = '\tEND_CRITICAL_SECTION;\n\n\tif (ptr == MAP_FAILED)\n\t\treturn NULL;'
+    if s2.count(_va_anchor) != 1:
+        print("    !! mono-mmap.c: mono_valloc 锚点未唯一命中 (%d)" % s2.count(_va_anchor), file=sys.stderr)
+        sys.exit(1)
+    _va_repl = (_va_anchor + '\n'
+        '#if defined(TARGET_IOS) && TARGET_IOS\n'
+        '\tif (prot & PROT_EXEC)\n'
+        '\t\tnebula_wx_register (ptr, length);   /* [Nebula iOS] JIT 页登记进翻转表 */\n'
+        '#endif')
+    s2 = s2.replace(_va_anchor, _va_repl, 1)
+
+    # mono_vfree → 注销（防地址复用后误翻数据页）
+    _vf_old = ('mono_vfree (void *addr, size_t length, MonoMemAccountType type)\n'
+               '{\n\tint res;\n\tBEGIN_CRITICAL_SECTION;')
+    _vf_new = ('mono_vfree (void *addr, size_t length, MonoMemAccountType type)\n'
+               '{\n\tint res;\n'
+               '#if defined(TARGET_IOS) && TARGET_IOS\n'
+               '\tnebula_wx_unregister (addr, length);   /* [Nebula iOS] 注销翻转表 */\n'
+               '#endif\n\tBEGIN_CRITICAL_SECTION;')
+    if _vf_old not in s2:
+        print("    !! mono-mmap.c: mono_vfree 锚点未命中", file=sys.stderr)
+        sys.exit(1)
+    s2 = s2.replace(_vf_old, _vf_new, 1)
+
+    open(mm, 'w', encoding='utf-8').write(s2)
+    print("    mono-mmap.c: MAP_JIT 短路 + 翻转表 + mprotect W^X 已注入")
+else:
+    print("    !! 找不到 mono-mmap.c", file=sys.stderr)
+    sys.exit(1)
 
 # (d) iOS 链接：pthread_jit_write_protect_np 在 iOS SDK 的 libpthread.tbd 不导出该符号，
 #     链接器报 undefined symbol。weak_import 声明只解决编译期；链接期必须显式
