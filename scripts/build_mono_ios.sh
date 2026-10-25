@@ -445,7 +445,7 @@ if mm:
     if s2.count(_mp_old) != 1:
         print("    !! mono-mmap.c: mono_mprotect 锚点未唯一命中 (%d)" % s2.count(_mp_old), file=sys.stderr)
         sys.exit(1)
-    _mp_new = ('\t{ int _r = mprotect (addr, length, prot);\n'
+    _mp_new = ('\tint _r = mprotect (addr, length, prot);\n'
                '#if defined(__APPLE__)\n'
                '\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d", addr, length, flags, prot, _r, _r ? errno : 0);\n'
                '#endif\n'
