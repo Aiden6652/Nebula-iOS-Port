@@ -218,7 +218,7 @@ static host_cfg CFG = {
     .gc_nursery_mb = 16,
     .gc_soft_limit_mb = 320,
     .gc_hard_limit_mb = 500,    // #12：RSS 超 500MB 强制激进 GC，防 jetsam 杀
-    .gc_watchdog_interval_ms = 2000,
+    .gc_watchdog_interval_ms = 500,
     .addons_mode = "all",
     .addons_texture_max_px = 512,
     .addons_texture_cache_mb = 64,
@@ -334,31 +334,42 @@ static long rss_mb(void) {
 }
 
 static volatile int watchdog_run = 1;
+static volatile int g_mono_ready = 0;   // mono_jit_init 成功后才置 1，看门狗据此决定能否 GC
 
 static void *watchdog_thread(void *arg) {
     (void)arg;
     while (watchdog_run) {
         long mb = rss_mb();
-        if (mb > 0) {
-            // #12 硬顶：RSS 超过 hard_limit（默认 500MB）→ 激进全量 GC + 告警，防 jetsam 杀
-            if (CFG.gc_hard_limit_mb > 0 && mb > CFG.gc_hard_limit_mb) {
-                fprintf(stderr, "[host][mem] !! RSS %ldMB 超过硬顶 %dMB，激进全量 GC！\n", mb, CFG.gc_hard_limit_mb);
+        if (mb > 0 && g_logfp) {
+            // mono 未就绪前只记录 RSS（GC 尚未初始化，不能调 mono_gc_collect，否则崩）；
+            // 就绪后依软/硬顶强制 GC，防 jetsam 杀。内存日志一律写文件（fflush）——
+            // 旧版写 stderr 不进 nebula_host.log，导致 OOM 时彻底失明。
+            if (g_mono_ready && CFG.gc_hard_limit_mb > 0 && mb > CFG.gc_hard_limit_mb) {
+                fprintf(g_logfp, "[host][mem] !! RSS %ldMB 超过硬顶 %dMB，激进全量 GC！\n", mb, CFG.gc_hard_limit_mb);
+                fflush(g_logfp);
                 mono_gc_collect(mono_gc_max_generation());
                 long after = rss_mb();
-                fprintf(stderr, "[host][mem]     GC 后 RSS=%ldMB\n", after);
-            } else if (CFG.gc_soft_limit_mb > 0 && mb > CFG.gc_soft_limit_mb) {
-                // 软顶：超过即常规 GC
-                fprintf(stderr, "[host][mem] RSS %ldMB 超过软顶 %dMB，强制 GC\n", mb, CFG.gc_soft_limit_mb);
+                fprintf(g_logfp, "[host][mem]     GC 后 RSS=%ldMB\n", after); fflush(g_logfp);
+            } else if (g_mono_ready && CFG.gc_soft_limit_mb > 0 && mb > CFG.gc_soft_limit_mb) {
+                fprintf(g_logfp, "[host][mem] RSS %ldMB 超过软顶 %dMB，强制 GC\n", mb, CFG.gc_soft_limit_mb);
+                fflush(g_logfp);
                 mono_gc_collect(mono_gc_max_generation());
+            } else {
+                fprintf(g_logfp, "[host][mem] RSS=%ldMB soft=%d hard=%d ready=%d\n",
+                        mb, CFG.gc_soft_limit_mb, CFG.gc_hard_limit_mb, g_mono_ready);
+                fflush(g_logfp);
             }
         }
-        long ms = CFG.gc_watchdog_interval_ms > 0 ? CFG.gc_watchdog_interval_ms : 2000;
+        long ms = CFG.gc_watchdog_interval_ms > 0 ? CFG.gc_watchdog_interval_ms : 500;
         usleep((useconds_t)(ms * 1000));
     }
     return NULL;
 }
 
 static void start_watchdog(void) {
+    static int started = 0;
+    if (started) return;   // 幂等：boot_thread 已启动，nebula_mono_init 再调不重复起线程
+    started = 1;
     pthread_t t;
     if (pthread_create(&t, NULL, watchdog_thread, NULL) == 0) pthread_detach(t);
 }
@@ -572,7 +583,7 @@ static void neb_crash(int sig)
     if (g_neb_log)
         os_log(g_neb_log, "!! 崩溃信号 %d，最后执行到: %{public}s",
                sig, g_last_step ? g_last_step : "(null)");
-    if (g_logfp) { fprintf(g_logfp, "!! signal %d @ %s\n", sig, g_last_step); fflush(g_logfp); }
+    if (g_logfp) { fprintf(g_logfp, "!! signal %d @ %s | RSS=%ldMB\n", sig, g_last_step, rss_mb()); fflush(g_logfp); }
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -1038,6 +1049,8 @@ static void *boot_thread(void *arg) {
         hlog("[host] === boot start ===");
     }
 
+    start_watchdog();   // 尽早启动内存看门狗，覆盖 mono_jit_init 全程（含其内存高峰）
+
     char *dir = module_dir();
     hlog("[host] module dir = %s", dir);
 
@@ -1108,8 +1121,10 @@ static void *boot_thread(void *arg) {
         return NULL;
     }
 
+    hlog("[host] step: mono_jit_init 进入, RSS=%ldMB", rss_mb());
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
+    g_mono_ready = 1;   // 看门狗自此起可安全 GC
     hlog("[host] step: mono_jit_init OK, RSS=%ldMB", rss_mb());
 
     // 注册预加载钩子：程序集依赖优先从 blob 内存加载（BCL/BepInEx.core 已内嵌）
