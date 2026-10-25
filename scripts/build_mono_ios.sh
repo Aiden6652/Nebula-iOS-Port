@@ -281,8 +281,14 @@ else:
 #      pthread_jit_write_protect_np —— 与 macOS 上 MAP_JIT 翻转的调用纪律完全一致
 #      （enable 写代码 / disable 执行代码），只是把「每线程 pthread 翻转」换成
 #      「每进程 mprotect 翻转」。CACHE_VERSION 联动升版。
-mm = os.path.join(mono, 'mono', 'metadata', 'mono-mmap.c')
-if os.path.exists(mm):
+mm = None
+for _cand in (os.path.join(mono, 'mono', 'utils', 'mono-mmap.c'),
+              os.path.join(mono, 'mono', 'metadata', 'mono-mmap.c')):
+    if os.path.exists(_cand):
+        mm = _cand
+        break
+if mm:
+    print("    mono-mmap.c 位置:", mm)
     s = open(mm, encoding='utf-8', errors='replace').read()
     _old_guard = '#if defined(__APPLE__) && defined(MAP_JIT) && defined(TARGET_OSX)'
     _new_guard = ('#if defined(__APPLE__) && defined(MAP_JIT) && defined(TARGET_OSX)'
