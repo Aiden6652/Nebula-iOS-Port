@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-14}"
+CACHE_VERSION="${CACHE_VERSION:-15}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -219,12 +219,12 @@ if os.path.exists(cm):
                 '__builtin_available (macOS 11, iOS 14, *)', s)
     # [Nebula iOS] mprotect W^X 翻转：真机路线 F 已验证（RW 写 → mprotect R-X → 执行 OK）。
     # enable_write → 翻 RW；disable_write → 翻 R-X + icache（实现见 mono-mmap.c (b3)）。
-    probe = ('#if defined(TARGET_IOS) && TARGET_IOS\n'
+    probe = ('#if defined(__APPLE__)\n'
              '\t/* [Nebula iOS] 翻成可写：登记区全局 mprotect RW（真机路线 F 已验证） */\n'
              '\tnebula_mono_wx_set_write (1);\n'
              '\treturn;\n'
              '#endif\n')
-    probe_off = ('#if defined(TARGET_IOS) && TARGET_IOS\n'
+    probe_off = ('#if defined(__APPLE__)\n'
                 '\t/* [Nebula iOS] 翻回可执行：登记区全局 mprotect R-X + 刷 icache */\n'
                 '\tnebula_mono_wx_set_write (0);\n'
                 '\treturn;\n'
@@ -236,7 +236,7 @@ if os.path.exists(cm):
     # 补齐声明：return 后原调用是死代码，但编译期仍需声明，否则
     # -Werror=implicit-function-declaration 报错（实测 run 40098995257）。
     decl = ('\n'
-            '#if defined(TARGET_IOS) && TARGET_IOS\n'
+            '#if defined(__APPLE__)\n'
             '/* [Nebula iOS] mprotect W^X 翻转（实现在 mono-mmap.c (b3)：登记的 JIT 区全局\n'
             '   mprotect 翻 RW/R-X，真机 2026-10-25 路线 F 已验证） */\n'
             'extern void nebula_mono_wx_set_write (int writable);\n'
@@ -297,7 +297,7 @@ if mm:
         print("    !! mono-mmap.c: MAP_JIT 块守卫未命中（mono 结构变化，需人工适配）", file=sys.stderr)
         sys.exit(1)
     wx_block = (
-        '#if defined(TARGET_IOS) && TARGET_IOS\n'
+        '#if defined(__APPLE__)\n'
         '/* [Nebula iOS] W^X 翻转表：登记 mono 的 JIT 页，mprotect 全局翻 RW/R-X。\n'
         '   真机 2026-10-25 冒烟路线 F 实测：RW 写入 → mprotect R-X → 执行 OK\n'
         '   （CS_DEBUGGED 态，CS_KILL/CS_HARD 已关，无效页允许执行）。 */\n'
@@ -354,7 +354,7 @@ if mm:
         '\t}\n'
         '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
         '}\n'
-        '#endif /* TARGET_IOS */\n'
+        '#endif /* __APPLE__ */\n'
         '\n')
     # 守卫只做短路改写（iOS 不编译 MAP_JIT 块）；wx_block（函数定义+全局变量）
     # 单独置于文件顶层最前，绝不能塞进 mono_valloc 函数体（否则函数定义嵌套报错 +
@@ -369,7 +369,7 @@ if mm:
         print("    !! mono-mmap.c: mono_valloc 锚点未唯一命中 (%d)" % s2.count(_va_anchor), file=sys.stderr)
         sys.exit(1)
     _va_repl = (_va_anchor + '\n'
-        '#if defined(TARGET_IOS) && TARGET_IOS\n'
+        '#if defined(__APPLE__)\n'
         '\tif (prot & PROT_EXEC)\n'
         '\t\tnebula_wx_register (ptr, length);   /* [Nebula iOS] JIT 页登记进翻转表 */\n'
         '#endif')
@@ -380,7 +380,7 @@ if mm:
                '{\n\tint res;\n\tBEGIN_CRITICAL_SECTION;')
     _vf_new = ('mono_vfree (void *addr, size_t length, MonoMemAccountType type)\n'
                '{\n\tint res;\n'
-               '#if defined(TARGET_IOS) && TARGET_IOS\n'
+               '#if defined(__APPLE__)\n'
                '\tnebula_wx_unregister (addr, length);   /* [Nebula iOS] 注销翻转表 */\n'
                '#endif\n\tBEGIN_CRITICAL_SECTION;')
     if _vf_old not in s2:
