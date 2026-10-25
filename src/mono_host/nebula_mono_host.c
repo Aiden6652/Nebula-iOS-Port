@@ -336,28 +336,32 @@ static long rss_mb(void) {
 static volatile int watchdog_run = 1;
 static volatile int g_mono_ready = 0;   // mono_jit_init 成功后才置 1，看门狗据此决定能否 GC
 static FILE     *g_logfp   = NULL;      // 日志文件句柄（前移：供前置的 watchdog_thread 使用）
+static struct timespec g_wd_t0;         // 看门狗启动时刻，心跳打相对时间戳（与 nebula_mono_mem.log 对表）
 
 static void *watchdog_thread(void *arg) {
     (void)arg;
+    clock_gettime(CLOCK_MONOTONIC, &g_wd_t0);
     while (watchdog_run) {
         long mb = rss_mb();
         if (mb > 0 && g_logfp) {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            long el = (now.tv_sec - g_wd_t0.tv_sec) * 1000 + (now.tv_nsec - g_wd_t0.tv_nsec) / 1000000;
             // mono 未就绪前只记录 RSS（GC 尚未初始化，不能调 mono_gc_collect，否则崩）；
             // 就绪后依软/硬顶强制 GC，防 jetsam 杀。内存日志一律写文件（fflush）——
             // 旧版写 stderr 不进 nebula_host.log，导致 OOM 时彻底失明。
             if (g_mono_ready && CFG.gc_hard_limit_mb > 0 && mb > CFG.gc_hard_limit_mb) {
-                fprintf(g_logfp, "[host][mem] !! RSS %ldMB 超过硬顶 %dMB，激进全量 GC！\n", mb, CFG.gc_hard_limit_mb);
+                fprintf(g_logfp, "[host][mem][t+%ldms] !! RSS %ldMB 超过硬顶 %dMB，激进全量 GC！\n", el, mb, CFG.gc_hard_limit_mb);
                 fflush(g_logfp);
                 mono_gc_collect(mono_gc_max_generation());
                 long after = rss_mb();
-                fprintf(g_logfp, "[host][mem]     GC 后 RSS=%ldMB\n", after); fflush(g_logfp);
+                fprintf(g_logfp, "[host][mem][t+%ldms]     GC 后 RSS=%ldMB\n", el, after); fflush(g_logfp);
             } else if (g_mono_ready && CFG.gc_soft_limit_mb > 0 && mb > CFG.gc_soft_limit_mb) {
-                fprintf(g_logfp, "[host][mem] RSS %ldMB 超过软顶 %dMB，强制 GC\n", mb, CFG.gc_soft_limit_mb);
+                fprintf(g_logfp, "[host][mem][t+%ldms] RSS %ldMB 超过软顶 %dMB，强制 GC\n", el, mb, CFG.gc_soft_limit_mb);
                 fflush(g_logfp);
                 mono_gc_collect(mono_gc_max_generation());
             } else {
-                fprintf(g_logfp, "[host][mem] RSS=%ldMB soft=%d hard=%d ready=%d\n",
-                        mb, CFG.gc_soft_limit_mb, CFG.gc_hard_limit_mb, g_mono_ready);
+                fprintf(g_logfp, "[host][mem][t+%ldms] RSS=%ldMB soft=%d hard=%d ready=%d\n",
+                        el, mb, CFG.gc_soft_limit_mb, CFG.gc_hard_limit_mb, g_mono_ready);
                 fflush(g_logfp);
             }
         }

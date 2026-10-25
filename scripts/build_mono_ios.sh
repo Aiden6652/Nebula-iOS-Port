@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-15}"
+CACHE_VERSION="${CACHE_VERSION:-16}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -310,6 +310,49 @@ if mm:
         'static int neb_wx_nregions = 0;\n'
         'static pthread_mutex_t neb_wx_mutex = PTHREAD_MUTEX_INITIALIZER;\n'
         '\n'
+        '/* [Nebula iOS] 内存操作追踪：mono 侧 JIT 页 mmap/mprotect/翻转全部落盘，\n'
+        '   进程被 SIGKILL（无 .ips 无 signal handler 输出）时，本文件最后一行即死前\n'
+        '   最后一个内存操作。写 $TMPDIR/nebula_mono_mem.log（Documents 与 nebula_host.log\n'
+        '   同级可取）。*/\n'
+        '#include <stdio.h>\n'
+        '#include <stdlib.h>\n'
+        '#include <time.h>\n'
+        '#include <stdarg.h>\n'
+        '#include <errno.h>\n'
+        'static void neb_wx_log (const char *fmt, ...)\n'
+        '{\n'
+        '\tstatic pthread_mutex_t neb_log_mutex = PTHREAD_MUTEX_INITIALIZER;\n'
+        '\tstatic FILE *fp = NULL;\n'
+        '\tpthread_mutex_lock (&neb_log_mutex);\n'
+        '\tif (!fp) {\n'
+        '\t\t/* 路径优先级：NEBULA_MONO_MEM_LOG → $HOME/Documents（文件 App 可取，\n'
+        '\t\t   与 nebula_host.log 同级）→ $TMPDIR → /tmp */\n'
+        '\t\tconst char *env = getenv ("NEBULA_MONO_MEM_LOG");\n'
+        '\t\tconst char *home = getenv ("HOME");\n'
+        '\t\tconst char *tmp = getenv ("TMPDIR");\n'
+        '\t\tchar path [1024];\n'
+        '\t\tif (env && *env) {\n'
+        '\t\t\tsnprintf (path, sizeof (path), "%s", env);\n'
+        '\t\t} else if (home && *home) {\n'
+        '\t\t\tsnprintf (path, sizeof (path), "%s/Documents/nebula_mono_mem.log", home);\n'
+        '\t\t} else {\n'
+        '\t\t\tsnprintf (path, sizeof (path), "%s/nebula_mono_mem.log", tmp && *tmp ? tmp : "/tmp");\n'
+        '\t\t}\n'
+        '\t\tfp = fopen (path, "a");\n'
+        '\t}\n'
+        '\tif (fp) {\n'
+        '\t\tstruct timespec ts;\n'
+        '\t\tclock_gettime (CLOCK_MONOTONIC, &ts);\n'
+        '\t\tfprintf (fp, "[%ld.%03ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000000);\n'
+        '\t\tva_list ap; va_start (ap, fmt);\n'
+        '\t\tvfprintf (fp, fmt, ap);\n'
+        '\t\tva_end (ap);\n'
+        '\t\tfputc (10, fp);\n'
+        '\t\tfflush (fp);\n'
+        '\t}\n'
+        '\tpthread_mutex_unlock (&neb_log_mutex);\n'
+        '}\n'
+        '\n'
         'static void\n'
         'nebula_wx_register (void *addr, size_t len)\n'
         '{\n'
@@ -320,6 +363,7 @@ if mm:
         '\t\tneb_wx_regions [neb_wx_nregions].len = len;\n'
         '\t\tneb_wx_regions [neb_wx_nregions].active = 1;\n'
         '\t\tneb_wx_nregions++;\n'
+        '\t\tneb_wx_log ("register addr=%p len=%zu (n=%d)", addr, len, neb_wx_nregions);\n'
         '\t}\n'
         '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
         '}\n'
@@ -346,12 +390,16 @@ if mm:
         'nebula_mono_wx_set_write (int writable)\n'
         '{\n'
         '\tpthread_mutex_lock (&neb_wx_mutex);\n'
+        '\tneb_wx_log ("set_write(%d) enter, n=%d", writable, neb_wx_nregions);\n'
         '\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
         '\t\tif (!neb_wx_regions [i].active) continue;\n'
         '\t\tint prot = writable ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);\n'
-        '\t\tif (mprotect (neb_wx_regions [i].addr, neb_wx_regions [i].len, prot) == 0 && !writable)\n'
+        '\t\tint mr = mprotect (neb_wx_regions [i].addr, neb_wx_regions [i].len, prot);\n'
+        '\t\tneb_wx_log ("  mprotect %p len=%zu prot=%d ret=%d errno=%d", neb_wx_regions [i].addr, neb_wx_regions [i].len, prot, mr, mr ? errno : 0);\n'
+        '\t\tif (mr == 0 && !writable)\n'
         '\t\t\tsys_icache_invalidate (neb_wx_regions [i].addr, neb_wx_regions [i].len);\n'
         '\t}\n'
+        '\tneb_wx_log ("set_write(%d) done", writable);\n'
         '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
         '}\n'
         '#endif /* __APPLE__ */\n'
@@ -370,8 +418,12 @@ if mm:
         sys.exit(1)
     _va_repl = (_va_anchor + '\n'
         '#if defined(__APPLE__)\n'
-        '\tif (prot & PROT_EXEC)\n'
+        '\tif (ptr != MAP_FAILED && (prot & PROT_EXEC)) {\n'
+        '\t\tneb_wx_log ("valloc EXEC addr=%p len=%zu prot=%d flags=%d", ptr, length, prot, mflags);\n'
         '\t\tnebula_wx_register (ptr, length);   /* [Nebula iOS] JIT 页登记进翻转表 */\n'
+        '\t} else if (ptr == MAP_FAILED && (prot & PROT_EXEC)) {\n'
+        '\t\tneb_wx_log ("valloc EXEC FAILED len=%zu prot=%d errno=%d", length, prot, errno);\n'
+        '\t}\n'
         '#endif')
     s2 = s2.replace(_va_anchor, _va_repl, 1)
 
@@ -387,6 +439,18 @@ if mm:
         print("    !! mono-mmap.c: mono_vfree 锚点未命中", file=sys.stderr)
         sys.exit(1)
     s2 = s2.replace(_vf_old, _vf_new, 1)
+
+    # mono_mprotect → 埋点（codeman 等绕过翻转表直接改保护位的路径全可见）
+    _mp_old = '\treturn mprotect (addr, length, prot);\n}'
+    if s2.count(_mp_old) != 1:
+        print("    !! mono-mmap.c: mono_mprotect 锚点未唯一命中 (%d)" % s2.count(_mp_old), file=sys.stderr)
+        sys.exit(1)
+    _mp_new = ('\t{ int _r = mprotect (addr, length, prot);\n'
+               '#if defined(__APPLE__)\n'
+               '\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d", addr, length, flags, prot, _r, _r ? errno : 0);\n'
+               '#endif\n'
+               '\treturn _r;\n}')
+    s2 = s2.replace(_mp_old, _mp_new, 1)
 
     open(mm, 'w', encoding='utf-8').write(s2)
     print("    mono-mmap.c: MAP_JIT 短路 + 翻转表 + mprotect W^X 已注入")
