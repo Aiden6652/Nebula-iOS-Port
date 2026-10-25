@@ -606,8 +606,17 @@ static int nebula_have_jit(void) {
     return 1;   // 桌面平台（Linux/Windows）天然可 JIT
 #else
 #if TARGET_OS_IPHONE
-    // iOS：必须被调试器（StikDebug 等）附加获得 CS_DEBUGGED，或被签 allow-jit，
-    // 才有 JIT 能力（否则 mono 生成 trampoline 时会被内核 CODESIGNING 秒杀）。
+    // 强制开关：用户确认已用 StikDebug 等开好 JIT，但内核 CS_DEBUGGED 位检测
+    // 不到时（iOS 17/18 新式无调试器 JIT 通道 / detach 后该位被清 / 检测时机错过），
+    // 用它跳过 JIT 闸门。风险自担：若实际并无 JIT，mono_jit_init 会被内核
+    // CODESIGNING SIGKILL（游戏同崩，无 .ips）。
+    const char *fj = getenv("NEBULA_FORCE_JIT");
+    if (fj && *fj) {
+        hlog("[host] JIT 强制放行（NEBULA_FORCE_JIT 已设，用户确认已开 JIT）");
+        return 1;
+    }
+    // 判据：进程被调试器（StikDebug 等）附加 → 内核置 CS_DEBUGGED → 授予 JIT 能力。
+    // 没这个位，mono 生成 trampoline 时会被内核 CODESIGNING 秒杀。
     int flags = 0;
     if (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) != 0) return 0;
     return (flags & CS_DEBUGGED) ? 1 : 0;
@@ -621,7 +630,8 @@ static int nebula_have_jit(void) {
 
 // 返回 1 = JIT 已就绪；返回 0 = 超时仍未就绪（调用方应优雅退出，别硬崩）。
 static int nebula_wait_for_jit(void) {
-    int wait = 30;   // 秒；可用 NEBULA_JIT_WAIT 覆盖
+    int wait = 60;   // 秒；可用 NEBULA_JIT_WAIT 覆盖。放宽到 60s，给用户充足时间
+                    // 去 StikDebug 启用 JIT（此前 30s 常被错过，导致“明明开了却判没开”）。
     const char *e = getenv("NEBULA_JIT_WAIT");
     if (e && *e) { int v = atoi(e); if (v > 0) wait = v; }
 
@@ -629,15 +639,14 @@ static int nebula_wait_for_jit(void) {
         hlog("[host] JIT 已就绪（进程拥有 JIT 能力）");
         return 1;
     }
-    hlog("[host] !! JIT 尚未就绪：进程无 JIT 能力，统一编译器(JIT)版无法生成/执行 trampoline");
-    hlog("[host] !! 解决（任选其一）：");
-    hlog("[host] !!   1) 用 StikDebug / SideJITServer 给 AmongUs 附加启用 JIT（靠 get-task-allow）");
-    hlog("[host] !!   2) 用含 com.apple.security.cs.allow-jit 的描述文件直签 AmongUs（付费开发证书）");
-    hlog("[host] !! 等待 JIT 就绪（最多 %ds，期间 app 保持存活，可现在去附加调试器）...", wait);
+    hlog("[host] !! JIT 尚未就绪：当前内核 CS_DEBUGGED 位未置位，进程暂无 JIT 能力。");
+    hlog("[host] !! 现在就用 StikDebug 给 AmongUs 启用 JIT（debugserver 附加 → 置 CS_DEBUGGED）。");
+    hlog("[host] !! 若已开却仍判无，可在启动前设 NEBULA_FORCE_JIT=1 强制放行（风险自担）。");
+    hlog("[host] !! 轮询等待 JIT 就绪（最多 %ds，期间 app 保持存活）...", wait);
     for (int i = 1; i <= wait; i++) {
         sleep(1);
         if (nebula_have_jit()) {
-            hlog("[host] JIT 已就绪（%ds 后检测到调试器附加），继续 mono 初始化", i);
+            hlog("[host] JIT 已就绪（%ds 后检测到 JIT 能力），继续 mono 初始化", i);
             return 1;
         }
     }
