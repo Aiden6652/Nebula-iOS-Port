@@ -56,6 +56,7 @@ extern void mono_setmmapjit (int flag);
 #include <signal.h>
 #include <dispatch/dispatch.h>     // 启动占位文本的延时/主线程销毁
 #include <sys/mman.h>              // mmap / MAP_JIT（JIT 冒烟测试）
+#include <libkern/OSCacheControl.h> // sys_icache_invalidate（指令缓存刷新）
 #include <errno.h>
 #include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
 #include <unistd.h>                // getpid
@@ -630,16 +631,31 @@ static int nebula_wait_for_jit(void) {
     return 0;
 }
 
-// —— JIT 冒烟测试（仅 iOS）：mono_jit_init 之前真实预演「分配 → 写入 → 执行」 ——
+// —— JIT 冒烟测试（仅 iOS）：mono_jit_init 之前真实预演
+//   「MAP_JIT 分配 → 翻转可写 → 写 ret → 翻回可执行 → sys_icache_invalidate → 执行」 ——
 // 内核对无 JIT 权限的写/执行是 SIGKILL（CODESIGNING / Invalid Page），不可捕获、
-// 往往不生成 .ips（2026-10-25 真机实测：mono_jit_init 内被杀，无任何报告）。
+// 往往不生成 .ips（2026-10-25 真机实测多轮：mono_jit_init 内被杀，无任何报告）。
 // 只能靠 nebula_host.log 的最后一行定位死亡步骤：
-//   · 停在「试写入」 = 页不可写（MAP_JIT 未翻转 / 无 RWX 权限）
-//   · 停在「试执行」 = 页不可执行
-//   · 分配即失败     = 进程根本无 JIT 能力
+//   · 停在「试 mmap」 = 进程无 JIT 能力 / 无 allow-jit，MAP_JIT mmap 被拒
+//   · 停在「试写入」 = 翻转函数解析不到或翻可写失败（MAP_JIT 页不可写）
+//   · 停在「试执行」 = 翻回可执行失败（页仍不可执行）
 // 冒烟不过就优雅退出，绝不进 mono_jit_init 黑盒硬崩。
 // 写入的是 arm64 ret（0xD65F03C0）而非 nop：跳入后立即返回，
 // 不会落到页内后续零字节（udf #0 → SIGILL）。
+#if TARGET_OS_IPHONE
+// 多源解析 pthread_jit_write_protect_np：iOS SDK 不导出该符号，且 RTLD_DEFAULT
+// 在某些命名空间下解析不到，必须回退 dlopen /usr/lib/system/libsystem_pthread.dylib。
+static void (*nebula_jit_toggle(void))(int)
+{
+    void (*fn)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
+    if (fn) return fn;
+    void *h = dlopen("/usr/lib/system/libsystem_pthread.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen("libsystem_pthread.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (h) fn = (void (*)(int))dlsym(h, "pthread_jit_write_protect_np");
+    return fn;   // 不 dlclose：保持句柄与函数指针持续有效
+}
+#endif
+
 static int nebula_jit_smoke(void)
 {
 #if TARGET_OS_IPHONE
@@ -648,53 +664,38 @@ static int nebula_jit_smoke(void)
     int debugged = (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) == 0 &&
                     (flags & CS_DEBUGGED)) ? 1 : 0;
 
-    if (debugged) {
-        hlog("[host] 冒烟: 路线=plain-RWX（CS_DEBUGGED 调试态）");
-        void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                       MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (p == MAP_FAILED) {
-            hlog("[host] !! 冒烟失败: plain RWX mmap 被拒 errno=%d（进程无 JIT 能力）", errno);
-            return 0;
-        }
-        hlog("[host] 冒烟: plain RWX mmap OK %p, 试 mprotect RWX ...", p);
-        // 真机 2026-10-25 .ips 铁证：iOS 内核对匿名 mmap 在映射瞬间剥离「当前」
-        // PROT_EXEC（vmRegion 显示 rw-/rwx）→ 写入 OK 但执行 SIGBUS。
-        // max_prot=rwx 证明调试态下 mprotect 补回 EXEC 被允许 —— 必须显式补。
-        if (mprotect(p, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            hlog("[host] !! 冒烟失败: mprotect RWX 被拒 errno=%d（调试态也无执行权限，检查 StikDebug 是否真正附加）", errno);
-            munmap(p, 4096);
-            return 0;
-        }
-        hlog("[host] 冒烟: mprotect RWX OK, 试写入 ret ...");
-        *(unsigned int *)p = ret_insn;
-        hlog("[host] 冒烟: 写入 OK, 试执行 ...");
-        ((void (*)(void))p)();
-        hlog("[host] 冒烟: 执行 OK —— JIT 链路畅通, 放行 mono_jit_init");
-        munmap(p, 4096);
-        return 1;
-    }
-
-    // 非调试态：官方 allow-jit 直签路，依赖翻转符号
-    void *wp = dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
+    hlog("[host] 冒烟: 解析翻转函数 pthread_jit_write_protect_np ...");
+    void (*wp)(int) = nebula_jit_toggle();
     if (!wp) {
-        hlog("[host] !! 冒烟失败: 非调试态且 pthread_jit_write_protect_np 不可解析"
-             " → MAP_JIT 无法翻成可写, 放弃 mono 初始化（保游戏可玩）");
+        hlog("[host] !! 冒烟失败: 各路 dlsym 均解析不到 pthread_jit_write_protect_np"
+             "（含 libsystem_pthread.dylib）—— MAP_JIT 页无法翻成可写/可执行");
+        hlog("[host] !! 放弃 mono 初始化（保游戏可玩）。若已用 StikDebug 附加仍解析不到，"
+             "检查 StikDebug 是否在游戏启动后才附加（需重开游戏让附加先于宿主冒烟）");
         return 0;
     }
-    hlog("[host] 冒烟: 路线=MAP_JIT+W^X翻转（检测到翻转符号）");
-    void *p = mmap(NULL, 4096, PROT_READ | PROT_EXEC,
+    hlog("[host] 冒烟: 翻转函数已解析（%s），路线=MAP_JIT+W^X翻转",
+         debugged ? "CS_DEBUGGED 调试态" : "官方 allow-jit");
+
+    // MAP_JIT 页：iOS codesigning monitor 只对 MAP_JIT 标记的页面放行执行权限
+    // （2026-10-25 实证：plain/RWX+mprotect 即使 mprotect 返回 0，执行仍 SIGBUS，
+    //  内核在更底层压住了执行位）。必须走 MAP_JIT + 翻转函数。
+    void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (p == MAP_FAILED) {
-        hlog("[host] !! 冒烟失败: MAP_JIT mmap 被拒 errno=%d", errno);
+        hlog("[host] !! 冒烟失败: MAP_JIT mmap 被拒 errno=%d（进程无 JIT 能力）", errno);
         return 0;
     }
-    ((void (*)(int))wp)(0);
+    hlog("[host] 冒烟: MAP_JIT mmap OK %p, 翻可写 ...", p);
+    wp(0);   // 翻成可写
     hlog("[host] 冒烟: 已翻可写, 试写入 ret ...");
     *(unsigned int *)p = ret_insn;
-    ((void (*)(int))wp)(1);
-    hlog("[host] 冒烟: 已翻回可执行, 试执行 ...");
+    hlog("[host] 冒烟: 写入 OK, 翻回可执行 ...");
+    wp(1);   // 翻回可执行
+    sys_icache_invalidate(p, 4096);   // 强制刷新指令缓存（arm64 硬件一致性保险，按要求加）
+    hlog("[host] 冒烟: icache 已刷新, 试执行 ...");
     ((void (*)(void))p)();
     hlog("[host] 冒烟: 执行 OK —— JIT 链路畅通, 放行 mono_jit_init");
+    wp(0);   // 还原全局可写态，交还 mono 后续自行管理
     munmap(p, 4096);
     return 1;
 #else

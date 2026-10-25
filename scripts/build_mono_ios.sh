@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-11}"
+CACHE_VERSION="${CACHE_VERSION:-12}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -201,9 +201,12 @@ for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
 #     iOS（含 StikDebug）SDK 的 libpthread.tbd 不导出 pthread_jit_write_protect_np，
 #     -Wl,-U 只骗过链接器；运行时懒绑定解析失败 → 符号桩 = 0 → 直接调用跳零
 #     SIGSEGV pc=0（真机 .ips 实证 lr=mono_arch_create_generic_trampoline+88）。
-#     改法：enable_write/disable_write 开头用 dlsym(RTLD_DEFAULT,...) 一次性探测，
-#        · 解析到（真机官方 JIT / entitlement）→ 走官方 W^X 翻转（(0)可写 / (1)可执行）；
-#        · 解析不到（StikDebug 调试态，内核已给 RWX）→ 跳过翻转，MAP_JIT 页本就可写。
+#     改法：enable_write/disable_write 开头用 nebula_ios_jit_toggle() 一次性探测：
+#        · 解析到（真机官方 JIT / entitlement / StikDebug 调试态）→ 走官方 W^X 翻转
+#          （(0)可写 / (1)可执行）；
+#        · 解析不到 → 跳过翻转，避免 pc=0 跳零。
+#     多源解析：先 RTLD_DEFAULT，解析不到再 dlopen /usr/lib/system/libsystem_pthread.dylib
+#     （RTLD_DEFAULT 在某些命名空间/镜像下解析不到该符号，必须回退到具体 dylib）。
 #     这样跳零点彻底消灭，且两条 JIT 路径都正确。macOS 分支（TARGET_IOS=0）不受影响。
 #     注意：#if defined(TARGET_IOS) 守卫已被 CI 实证真实编译（run 40098995257），
 #     守卫内 return 后原调用变死代码（仍需 extern 声明以通过 -Werror=implicit-decl）。
@@ -222,7 +225,7 @@ if os.path.exists(cm):
              '\t\tstatic void (*_nebula_wp)(int) = (void *)0;\n'
              '\t\tstatic int _nebula_wp_init = 0;\n'
              '\t\tif (!_nebula_wp_init) {\n'
-             '\t\t\t_nebula_wp = (void (*)(int))dlsym (RTLD_DEFAULT, "pthread_jit_write_protect_np");\n'
+             '\t\t\t_nebula_wp = nebula_ios_jit_toggle ();   /* 多源 dlsym 解析，解析不到=NULL */\n'
              '\t\t\t_nebula_wp_init = 1;\n'
              '\t\t}\n'
              '\t\tif (_nebula_wp)\n'
@@ -236,7 +239,7 @@ if os.path.exists(cm):
                 '\t\tstatic void (*_nebula_wp)(int) = (void *)0;\n'
                 '\t\tstatic int _nebula_wp_init = 0;\n'
                 '\t\tif (!_nebula_wp_init) {\n'
-                '\t\t\t_nebula_wp = (void (*)(int))dlsym (RTLD_DEFAULT, "pthread_jit_write_protect_np");\n'
+                '\t\t\t_nebula_wp = nebula_ios_jit_toggle ();   /* 多源 dlsym 解析，解析不到=NULL */\n'
                 '\t\t\t_nebula_wp_init = 1;\n'
                 '\t\t}\n'
                 '\t\tif (_nebula_wp)\n'
@@ -253,8 +256,18 @@ if os.path.exists(cm):
     decl = ('\n'
             '#if defined(TARGET_IOS) && TARGET_IOS\n'
             '#include <dlfcn.h>\n'
-            '/* [Nebula iOS] 声明补齐：iOS 旧 SDK 不公开该 API；运行时经 dlsym 探测，\n'
-            '   真正调用走 dlsym 返回的指针而非此声明符号（避免跳零）。 */\n'
+            '/* [Nebula iOS] 多源解析 pthread_jit_write_protect_np：iOS SDK 不公开该符号，\n'
+            '   且 RTLD_DEFAULT 在某些命名空间解析不到，回退 dlopen libsystem_pthread.dylib。\n'
+            '   解析不到返回 NULL（调用方跳过翻转，避免 pc=0 跳零）。 */\n'
+            'static void (*nebula_ios_jit_toggle (void))(int)\n'
+            '{\n'
+            '\tvoid (*fn)(int) = (void (*)(int)) dlsym (RTLD_DEFAULT, "pthread_jit_write_protect_np");\n'
+            '\tif (fn) return fn;\n'
+            '\tvoid *h = dlopen ("/usr/lib/system/libsystem_pthread.dylib", RTLD_NOW | RTLD_LOCAL);\n'
+            '\tif (!h) h = dlopen ("libsystem_pthread.dylib", RTLD_NOW | RTLD_LOCAL);\n'
+            '\tif (h) fn = (void (*)(int)) dlsym (h, "pthread_jit_write_protect_np");\n'
+            '\treturn fn;   /* 不 dlclose，保持句柄与函数指针持续有效 */\n'
+            '}\n'
             'extern void pthread_jit_write_protect_np(int enabled);\n'
             '#endif\n')
     _incs = list(_re.finditer(r'(?m)^#\s*include\b.*$', n2))
@@ -271,91 +284,13 @@ if os.path.exists(cm):
 else:
     print("    !! 找不到 mono-codeman.c", file=sys.stderr)
 
-# (b2) [Nebula iOS] 调试态剥 MAP_JIT、走 plain RWX（真机 2026-10-25 实测定案）：
-#      上版 (b-code) 保留 MAP_JIT + dlsym 探测翻转，但真机两次实证该路走不通：
-#        · 第一次（.ips，pc=0）：pthread_jit_write_protect_np 运行时懒绑定解析失败
-#          → 直接调用跳零；说明真机运行时该符号不可解析，dlsym 同样为 NULL；
-#        · 第二次（2026-10-25，无 .ips）：dlsym=NULL → 永远跳过翻转 → 写 MAP_JIT 页
-#          （默认可执行不可写）被内核 Invalid Page SIGKILL，且不生成崩溃报告。
-#      修正：iOS 上 csops(CS_DEBUGGED) 置位（StikDebug/调试器附加）时剥掉 MAP_JIT，
-#      mono_valloc 走 plain mmap RWX（94f5693 实测成功之路）；非调试态（官方
-#      allow-jit 直签）保留 MAP_JIT，由 (c) 的 dlsym 探测翻转。
-#      补丁未命中（mono 结构变化）直接 exit 1 让 CI 变红，杜绝静默失败。
-mm = os.path.join(mono, 'mono', 'utils', 'mono-mmap.c')
-if not os.path.exists(mm):
-    print("    !! 找不到 mono/utils/mono-mmap.c", file=sys.stderr); sys.exit(1)
-_s = open(mm, encoding='utf-8', errors='replace').read()
-if 'nebula_ios_debugged' in _s:
-    print("    mono-mmap.c: 已注入过，跳过")
-else:
-    helper = (
-        "/* [Nebula iOS] 调试态判定：CS_DEBUGGED（StikDebug/调试器附加）时内核对普通匿名\n"
-        "   mmap 直接给 RWX（94f5693 实测），而 MAP_JIT 页在无 allow-jit entitlement 的\n"
-        "   进程上无法用 pthread_jit_write_protect_np 翻转（真机 .ips 实证该符号运行时\n"
-        "   解析不到，dlsym 亦为 NULL）——写 trampoline 必被内核 Invalid Page SIGKILL\n"
-        "   （且无 .ips）。因此调试态必须剥掉 MAP_JIT 走 plain RWX；\n"
-        "   非调试态（官方 allow-jit 直签）保留 MAP_JIT，配合 codeman 的 dlsym 探测翻转。 */\n"
-        "#if defined(TARGET_IOS) && TARGET_IOS\n"
-        "#include <dlfcn.h>\n"
-        "#include <unistd.h>\n"
-        "#include <sys/types.h>\n"
-        "extern int csops (int pid, unsigned int ops, void *useraddr, unsigned long usersize);\n"
-        "#ifndef NEBULA_CS_OPS_STATUS\n"
-        "#define NEBULA_CS_OPS_STATUS 0\n"
-        "#endif\n"
-        "#ifndef NEBULA_CS_DEBUGGED\n"
-        "#define NEBULA_CS_DEBUGGED 0x10000000\n"
-        "#endif\n"
-        "static int\n"
-        "nebula_ios_debugged (void)\n"
-        "{\n"
-        "\tstatic int cached = -1;\n"
-        "\tif (cached < 0) {\n"
-        "\t\tint f = 0;\n"
-        "\t\tcached = (csops (getpid (), NEBULA_CS_OPS_STATUS, &f, sizeof (f)) == 0 &&\n"
-        "\t\t\t  (f & NEBULA_CS_DEBUGGED)) ? 1 : 0;\n"
-        "\t}\n"
-        "\treturn cached;\n"
-        "}\n"
-        "#else\n"
-        "__attribute__((unused)) static int nebula_ios_debugged (void) { return 0; }\n"
-        "#endif\n")
-    _s2 = helper + _s
-    _cnt = [0]
-    def _guard(m):
-        _cnt[0] += 1
-        return "%sif (!nebula_ios_debugged ()) %s|= MAP_JIT;" % (m.group(1), m.group(2))
-    _s2 = re.sub(r'(?m)^([ \t]*)([A-Za-z_][A-Za-z0-9_]*[ \t]*)\|= MAP_JIT;', _guard, _s2)
-    if _cnt[0] == 0:
-        print("    !! mono-mmap.c 未匹配到 |= MAP_JIT（mono 结构变化，需人工适配）", file=sys.stderr)
-        sys.exit(1)
-    # (b2-b) 调试态 mmap 后补 mprotect RWX（真机 2026-10-25 .ips 铁证）：
-    #   崩溃页 vmRegion 实测 "rw-/rwx" —— iOS 18.6 内核对匿名 mmap（即使显式请求
-    #   PROT_EXEC）会在映射瞬间把「当前」PROT_EXEC 剥掉，只保留在 max_prot；
-    #   结果是：写入 OK（rw- 可写）、执行 SIGBUS KERN_PROTECTION_FAILURE（不可执行）。
-    #   max_prot=rwx 证明 mprotect 补 PROT_EXEC 被内核允许——这正是调试态 JIT 的
-    #   正确姿势：mmap → mprotect RWX → 写/执行。mono_valloc 是代码页分配主入口
-    #   （codeman reserve / mono_valloc_aligned 都汇聚到它），在这一处补即可全覆盖。
-    if 'nebula_ios_mprotect_rwx' not in _s2:
-        _anchor = "\tEND_CRITICAL_SECTION;\n\n\tif (ptr == MAP_FAILED)\n\t\treturn NULL;"
-        _mprot = ("\tEND_CRITICAL_SECTION;\n\n"
-                  "#if defined(TARGET_IOS) && TARGET_IOS\n"
-                  "\t/* [Nebula iOS] 内核在 mmap 时剥离当前 PROT_EXEC（真机 vmRegion 实测 rw-/rwx），\n"
-                  "\t   调试态（CS_DEBUGGED）max_prot=rwx，mprotect 可把页补成 RWX。 */\n"
-                  "\tif (ptr != MAP_FAILED && nebula_ios_debugged ()) /* nebula_ios_mprotect_rwx */\n"
-                  "\t\tmprotect (ptr, length, PROT_READ | PROT_WRITE | PROT_EXEC);\n"
-                  "#endif\n\n"
-                  "\tif (ptr == MAP_FAILED)\n"
-                  "\t\treturn NULL;")
-        if _anchor in _s2:
-            _s2 = _s2.replace(_anchor, _mprot, 1)
-            print("    mono-mmap.c: mono_valloc 调试态 mprotect RWX 已注入")
-        else:
-            print("    !! mono-mmap.c 未找到 mono_valloc END_CRITICAL_SECTION 锚点（mono 结构变化，需人工适配）",
-                  file=sys.stderr)
-            sys.exit(1)
-    open(mm, 'w', encoding='utf-8').write(_s2)
-    print("    mono-mmap.c: 调试态剥 MAP_JIT 守卫已注入（%d 处）" % _cnt[0])
+# (b2) [Nebula iOS] 已撤销：恢复 mono 原版 MAP_JIT 行为（2026-10-25 最新实证）。
+#      真机多轮实测证明：iOS 18 codesigning monitor 只对 MAP_JIT 标记的页面放行执行权限
+#      —— plain/RWX + mprotect 即使 mprotect 返回 0，执行仍 SIGBUS（内核在更底层压住执行位）。
+#      故不再剥 MAP_JIT；MAP_JIT 页的「可写↔可执行」翻转由 (c) 的 dlsym 探测负责：
+#      多源解析 pthread_jit_write_protect_np（RTLD_DEFAULT → libsystem_pthread.dylib）。
+#      调试态（StikDebug/CS_DEBUGGED）与官方 allow-jit 直签都能解析到并正确翻转。
+#      本块不再修改 mono-mmap.c（保持与上游一致，避免引入未覆盖的代码路径）。
 
 # (d) iOS 链接：pthread_jit_write_protect_np 在 iOS SDK 的 libpthread.tbd 不导出该符号，
 #     链接器报 undefined symbol。weak_import 声明只解决编译期；链接期必须显式
