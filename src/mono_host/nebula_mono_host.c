@@ -48,7 +48,9 @@ extern void mono_setmmapjit (int flag);
 
 #ifdef __APPLE__
 #include <mach/mach.h>
+#include <mach/mach_vm.h>          // mach_vm_write / mach_vm_region（JIT 冒烟）
 #include <mach/task_info.h>
+#include <setjmp.h>                // sigsetjmp/siglongjmp（冒烟段错误兜底）
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <TargetConditionals.h>   // TARGET_OS_IPHONE / TARGET_OS_MAC
@@ -70,13 +72,12 @@ extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersi
 #define CS_DEBUGGED 0x10000000   // 进程被调试器附加 → 内核授予 JIT 能力
 #endif
 
-// [Nebula iOS] JIT 内存路线（真机 2026-10-25 实测定案）：
-//  · StikDebug 调试态（csops CS_DEBUGGED）：内核对普通匿名 mmap 直接给 RWX；
-//    mono-mmap.c 已由 build_mono_ios.sh (b2) 注入守卫——调试态剥掉 MAP_JIT。
-//  · 非调试态（官方 allow-jit 直签）：保留 MAP_JIT，由 mono 侧 dlsym 探测翻转。
-// 真机两次实证 pthread_jit_write_protect_np 运行时解析不到（懒绑定 pc=0 /
-// dlsym 亦 NULL），MAP_JIT 页永远无法翻成可写——调试态绝不能再走 MAP_JIT。
-// mono_setmmapjit(1) 保留，iOS 调试态下由 (b2) 守卫统一剥除。
+// [Nebula iOS] JIT 内存路线（2026-10-25 多轮实测定案，详见 nebula_jit_smoke 注释）：
+//  · pthread_jit_write_protect_np 在 iOS 官方不导出（Apple 文档明言），dlsym 全路 NULL。
+//  · plain RWX + mprotect 补 EXEC：内核假成功（rw-/rwx），执行 SIGBUS —— 死路。
+//  · 统一走 MAP_JIT（mono_setmmapjit(1)）；翻转/写入手段由冒烟测试四路线实测决定：
+//    mach_vm_write（调试态首选）/ mprotect+WRITE / 翻转函数 / RWX 直配。
+//  · 冒烟通过哪条路线，后续就把同款手段注入 mono-mmap.c（(b2)/(b2-b) 已撤销待重做）。
 #else
 #include <signal.h>
 typedef void *os_log_t;
@@ -631,20 +632,54 @@ static int nebula_wait_for_jit(void) {
     return 0;
 }
 
-// —— JIT 冒烟测试（仅 iOS）：mono_jit_init 之前真实预演
-//   「MAP_JIT 分配 → 翻转可写 → 写 ret → 翻回可执行 → sys_icache_invalidate → 执行」 ——
-// 内核对无 JIT 权限的写/执行是 SIGKILL（CODESIGNING / Invalid Page），不可捕获、
-// 往往不生成 .ips（2026-10-25 真机实测多轮：mono_jit_init 内被杀，无任何报告）。
-// 只能靠 nebula_host.log 的最后一行定位死亡步骤：
-//   · 停在「试 mmap」 = 进程无 JIT 能力 / 无 allow-jit，MAP_JIT mmap 被拒
-//   · 停在「试写入」 = 翻转函数解析不到或翻可写失败（MAP_JIT 页不可写）
-//   · 停在「试执行」 = 翻回可执行失败（页仍不可执行）
-// 冒烟不过就优雅退出，绝不进 mono_jit_init 黑盒硬崩。
-// 写入的是 arm64 ret（0xD65F03C0）而非 nop：跳入后立即返回，
-// 不会落到页内后续零字节（udf #0 → SIGILL）。
+// —— JIT 冒烟测试（仅 iOS）：mono_jit_init 之前多路线真实预演
+//   「分配 → 写入 ret → sys_icache_invalidate → 执行」 ——
+// 内核对非法 JIT 操作的惩罚是 SIGKILL（CODESIGNING / Invalid Page），不可捕获、
+// 往往不生成 .ips（2026-10-25 真机实测多轮）。只能靠 nebula_host.log 定位死因。
+// 写入的是 arm64 ret（0xD65F03C0）：跳入后立即返回，不会落到页内零字节。
+//
+// 2026-10-25 定案背景（Apple 官方文档 + 社区实测交叉证实）：
+//   · pthread_jit_write_protect_np 在 iOS 上【官方不导出】——Apple 文档明言
+//     "isn't available on iOS"；iOS 14.2~14.4 曾短暂误加后移除。真机 dlsym 各路
+//     （含 dlopen libsystem_pthread.dylib）均 NULL，日志实证。macOS 专属 API。
+//   · plain mmap RWX + mprotect 补 EXEC：mprotect 返回 0 但内核假成功
+//     （.ips vmRegion rw-/rwx，执行仍 SIGBUS KERN_PROTECTION_FAILURE）——死路。
+//   · 活路：StikDebug 原理 = debugserver 附加 → 内核打 CS_DEBUGGED → 分离后保留。
+//     debugserver 写内存用的是 mach_vm_write（调试器原语，不经 mprotect 的
+//     W^X 检查）。本进程 CS_DEBUGGED=1 时这条路从未测过。
+//
+// 四条路线按序自动探测，任一成功即放行 mono_jit_init；全失败优雅退出保游戏可玩：
+//   A. MAP_JIT mmap(R-X) + mach_vm_write 自写（调试态首选，debugserver 同款原语）
+//   B. MAP_JIT mmap(R-X) + mprotect 补 WRITE（真实保护位校验，假成功不写入）
+//   C. MAP_JIT + pthread_jit_write_protect_np 翻转（解析到才走，官方路径）
+//   D. MAP_JIT mmap(RWX) 直接分配（debugged 态内核可能直接给真 RWX）
+// 安全网：
+//   · 每次冒险操作（写/执行）前用 mach_vm_region 查内核真实保护位，不合格不动作；
+//   · 装 SIGBUS/SIGSEGV/SIGILL 处理器 + sigsetjmp，执行段错误可捕获并尝试下一路线
+//     （SIGKILL 无法捕获，但日志最后一行仍能定位死因）。
 #if TARGET_OS_IPHONE
-// 多源解析 pthread_jit_write_protect_np：iOS SDK 不导出该符号，且 RTLD_DEFAULT
-// 在某些命名空间下解析不到，必须回退 dlopen /usr/lib/system/libsystem_pthread.dylib。
+
+// 查询 addr 所在页的内核真实保护位（cur/max）。成功返回 0。
+// mach_vm_region 查的是内核权威视图 —— mprotect 可能"假成功"（返回 0 但实际没改，
+// codesigning monitor 拦截），必须以这里的结果为准再决定是否写入/执行。
+static int nebula_page_prot(void *addr, vm_prot_t *cur, vm_prot_t *mx)
+{
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t bi;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz,
+                                      VM_REGION_BASIC_INFO_64,
+                                      (vm_region_info_t)&bi, &cnt, &obj);
+    if (kr != KERN_SUCCESS) return -1;
+    if (cur) *cur = bi.protection;
+    if (mx)  *mx  = bi.max_protection;
+    return 0;
+}
+
+// 多源解析 pthread_jit_write_protect_np（iOS 官方不导出，多半解析不到，仅
+// macOS / 特殊环境可用）：RTLD_DEFAULT → dlopen libsystem_pthread.dylib。
 static void (*nebula_jit_toggle(void))(int)
 {
     void (*fn)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
@@ -654,7 +689,40 @@ static void (*nebula_jit_toggle(void))(int)
     if (h) fn = (void (*)(int))dlsym(h, "pthread_jit_write_protect_np");
     return fn;   // 不 dlclose：保持句柄与函数指针持续有效
 }
-#endif
+
+// 诊断：pthread_jit_write_protect_supported_np 是否可解析 / 返回什么。
+// 社区实测它比 write_protect_np 更可能存在——若它返回 1 而翻转函数解析不到，
+// 说明平台声称支持却没给用户态入口（Apple 半成品状态）。
+static int nebula_jit_supported(void)
+{
+    typedef int (*fn_t)(void);
+    fn_t fn = (fn_t)dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_supported_np");
+    if (fn) return fn();
+    void *h = dlopen("/usr/lib/system/libsystem_pthread.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen("libsystem_pthread.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (h) {
+        fn = (fn_t)dlsym(h, "pthread_jit_write_protect_supported_np");
+        if (fn) return fn();
+    }
+    return -1;   // 符号本身也不存在
+}
+
+// 冒烟期间的 SIGBUS/SIGSEGV/SIGILL 兜底：写入/执行段错误时跳回冒烟框架尝试
+// 下一路线，而不是整个游戏崩掉。SIGKILL 无法捕获（codesigning monitor 直接杀），
+// 但日志最后一行能定位是哪条路线哪个步骤死的。
+static sigjmp_buf g_smoke_jmp;
+static volatile sig_atomic_t g_smoke_sig = 0;
+static volatile uintptr_t g_smoke_fault = 0;
+
+static void nebula_smoke_sigaction(int sig, siginfo_t *si, void *uc)
+{
+    (void)uc;
+    g_smoke_sig = sig;
+    g_smoke_fault = si ? (uintptr_t)si->si_addr : 0;
+    siglongjmp(g_smoke_jmp, 1);
+}
+
+#endif // TARGET_OS_IPHONE
 
 static int nebula_jit_smoke(void)
 {
@@ -663,41 +731,169 @@ static int nebula_jit_smoke(void)
     int flags = 0;
     int debugged = (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) == 0 &&
                     (flags & CS_DEBUGGED)) ? 1 : 0;
-
-    hlog("[host] 冒烟: 解析翻转函数 pthread_jit_write_protect_np ...");
+    hlog("[host] 冒烟: CS_DEBUGGED=%d csflags=0x%x", debugged, flags);
+    hlog("[host] 冒烟: pthread_jit_write_protect_supported_np -> %d", nebula_jit_supported());
     void (*wp)(int) = nebula_jit_toggle();
-    if (!wp) {
-        hlog("[host] !! 冒烟失败: 各路 dlsym 均解析不到 pthread_jit_write_protect_np"
-             "（含 libsystem_pthread.dylib）—— MAP_JIT 页无法翻成可写/可执行");
-        hlog("[host] !! 放弃 mono 初始化（保游戏可玩）。若已用 StikDebug 附加仍解析不到，"
-             "检查 StikDebug 是否在游戏启动后才附加（需重开游戏让附加先于宿主冒烟）");
-        return 0;
-    }
-    hlog("[host] 冒烟: 翻转函数已解析（%s），路线=MAP_JIT+W^X翻转",
-         debugged ? "CS_DEBUGGED 调试态" : "官方 allow-jit");
+    hlog("[host] 冒烟: pthread_jit_write_protect_np -> %p", (void *)wp);
 
-    // MAP_JIT 页：iOS codesigning monitor 只对 MAP_JIT 标记的页面放行执行权限
-    // （2026-10-25 实证：plain/RWX+mprotect 即使 mprotect 返回 0，执行仍 SIGBUS，
-    //  内核在更底层压住了执行位）。必须走 MAP_JIT + 翻转函数。
-    void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-    if (p == MAP_FAILED) {
-        hlog("[host] !! 冒烟失败: MAP_JIT mmap 被拒 errno=%d（进程无 JIT 能力）", errno);
-        return 0;
+    // 信号兜底：装 SIGBUS/SIGSEGV/SIGILL 处理器（可捕获的执行/写入段错误），
+    // 旧处理器存档，冒烟结束还原
+    struct sigaction sa, old_bus, old_segv, old_ill;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = nebula_smoke_sigaction;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    int have_bus  = (sigaction(SIGBUS,  &sa, &old_bus)  == 0);
+    int have_segv = (sigaction(SIGSEGV, &sa, &old_segv) == 0);
+    int have_ill  = (sigaction(SIGILL,  &sa, &old_ill)  == 0);
+
+    int ok = 0;
+    void *p = NULL;
+    vm_prot_t cur = 0, mx = 0;
+
+    // ── 路线 A：MAP_JIT mmap(R-X) + mach_vm_write 自写（调试态首选）──
+    // debugserver 给被调试进程写内存就用 mach_vm_write；本进程 CS_DEBUGGED=1，
+    // 同款原语对自家 MAP_JIT 页写入，绕开 mprotect 被压死的 W^X 检查。
+    // 页面保持 R-X（可执行），写入走调试器通道，天然符合 W^X。
+    if (!ok) {
+        p = mmap(NULL, 4096, PROT_READ | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (p == MAP_FAILED) {
+            hlog("[host] 冒烟: 路线A MAP_JIT mmap 被拒 errno=%d（进程无 JIT 能力）", errno);
+        } else {
+            nebula_page_prot(p, &cur, &mx);
+            hlog("[host] 冒烟: 路线A MAP_JIT mmap OK %p (cur=%x max=%x), 试 mach_vm_write ...",
+                 p, cur, mx);
+            kern_return_t kr = mach_vm_write(mach_task_self(),
+                                             (mach_vm_address_t)(uintptr_t)p,
+                                             (vm_offset_t)(uintptr_t)&ret_insn,
+                                             (mach_msg_type_number_t)sizeof(ret_insn));
+            if (kr != KERN_SUCCESS) {
+                hlog("[host] 冒烟: 路线A mach_vm_write 失败 kr=%d", kr);
+            } else if (*(volatile unsigned int *)p != ret_insn) {
+                hlog("[host] 冒烟: 路线A mach_vm_write 报成功但读回不符 —— 假写入");
+            } else {
+                hlog("[host] 冒烟: 路线A mach_vm_write 写入 OK（读回一致）, 刷 icache, 试执行 ...");
+                sys_icache_invalidate(p, 4096);
+                if (sigsetjmp(g_smoke_jmp, 1) == 0) {
+                    ((void (*)(void))p)();
+                    hlog("[host] 冒烟: 路线A 执行 OK —— MAP_JIT+mach_vm_write 路线畅通!");
+                    ok = 1;
+                } else {
+                    hlog("[host] 冒烟: 路线A 执行段错误 signal=%d fault=%p（页不可执行）",
+                         g_smoke_sig, g_smoke_fault);
+                }
+            }
+            if (!ok) munmap(p, 4096);
+        }
     }
-    hlog("[host] 冒烟: MAP_JIT mmap OK %p, 翻可写 ...", p);
-    wp(0);   // 翻成可写
-    hlog("[host] 冒烟: 已翻可写, 试写入 ret ...");
-    *(unsigned int *)p = ret_insn;
-    hlog("[host] 冒烟: 写入 OK, 翻回可执行 ...");
-    wp(1);   // 翻回可执行
-    sys_icache_invalidate(p, 4096);   // 强制刷新指令缓存（arm64 硬件一致性保险，按要求加）
-    hlog("[host] 冒烟: icache 已刷新, 试执行 ...");
-    ((void (*)(void))p)();
-    hlog("[host] 冒烟: 执行 OK —— JIT 链路畅通, 放行 mono_jit_init");
-    wp(0);   // 还原全局可写态，交还 mono 后续自行管理
-    munmap(p, 4096);
-    return 1;
+
+    // ── 路线 B：MAP_JIT mmap(R-X) + mprotect 补 WRITE（校验真实保护位再写）──
+    if (!ok) {
+        p = mmap(NULL, 4096, PROT_READ | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (p == MAP_FAILED) {
+            hlog("[host] 冒烟: 路线B MAP_JIT mmap 被拒 errno=%d", errno);
+        } else {
+            hlog("[host] 冒烟: 路线B MAP_JIT mmap OK %p, 试 mprotect +WRITE ...", p);
+            if (mprotect(p, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                hlog("[host] 冒烟: 路线B mprotect 被拒 errno=%d", errno);
+            } else if (nebula_page_prot(p, &cur, &mx) != 0 || !(cur & PROT_WRITE)) {
+                hlog("[host] 冒烟: 路线B mprotect 假成功（真实 cur=%x max=%x）—— 内核拒绝写, 不冒险",
+                     cur, mx);
+            } else {
+                hlog("[host] 冒烟: 路线B mprotect 真实生效 cur=%x, 试写入 ret ...", cur);
+                *(unsigned int *)p = ret_insn;
+                if (mprotect(p, 4096, PROT_READ | PROT_EXEC) != 0) {
+                    hlog("[host] 冒烟: 路线B 翻回 R-X 被拒 errno=%d", errno);
+                } else if (nebula_page_prot(p, &cur, &mx) != 0 || !(cur & PROT_EXEC)) {
+                    hlog("[host] 冒烟: 路线B 翻回后真实 cur=%x 无 EXEC, 不执行", cur);
+                } else {
+                    sys_icache_invalidate(p, 4096);
+                    hlog("[host] 冒烟: 路线B icache 已刷, 试执行 ...");
+                    if (sigsetjmp(g_smoke_jmp, 1) == 0) {
+                        ((void (*)(void))p)();
+                        hlog("[host] 冒烟: 路线B 执行 OK —— MAP_JIT+mprotect W^X 循环可用!");
+                        ok = 1;
+                    } else {
+                        hlog("[host] 冒烟: 路线B 执行段错误 signal=%d fault=%p",
+                             g_smoke_sig, g_smoke_fault);
+                    }
+                }
+            }
+            if (!ok) munmap(p, 4096);
+        }
+    }
+
+    // ── 路线 C：MAP_JIT + 翻转函数（官方路径，解析到才走）──
+    if (!ok && wp) {
+        p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (p == MAP_FAILED) {
+            hlog("[host] 冒烟: 路线C MAP_JIT mmap 被拒 errno=%d", errno);
+        } else {
+            hlog("[host] 冒烟: 路线C MAP_JIT mmap OK %p, 翻转(0)可写 ...", p);
+            wp(0);
+            hlog("[host] 冒烟: 路线C 已翻可写, 试写入 ret ...");
+            *(unsigned int *)p = ret_insn;
+            hlog("[host] 冒烟: 路线C 写入 OK, 翻转(1)回可执行 ...");
+            wp(1);
+            sys_icache_invalidate(p, 4096);
+            hlog("[host] 冒烟: 路线C icache 已刷, 试执行 ...");
+            if (sigsetjmp(g_smoke_jmp, 1) == 0) {
+                ((void (*)(void))p)();
+                hlog("[host] 冒烟: 路线C 执行 OK —— MAP_JIT+翻转函数 可用!");
+                ok = 1;
+            } else {
+                hlog("[host] 冒烟: 路线C 执行段错误 signal=%d fault=%p",
+                     g_smoke_sig, g_smoke_fault);
+            }
+            wp(0);   // 还原全局可写态（mono 后续自行管理）
+            if (!ok) munmap(p, 4096);
+        }
+    }
+
+    // ── 路线 D：MAP_JIT + RWX 直接分配（debugged 态内核可能直接给真 RWX）──
+    if (!ok) {
+        p = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (p == MAP_FAILED) {
+            hlog("[host] 冒烟: 路线D MAP_JIT+RWX mmap 被拒 errno=%d", errno);
+        } else if (nebula_page_prot(p, &cur, &mx) != 0) {
+            hlog("[host] 冒烟: 路线D mmap OK %p 但 prot 查询失败", p);
+        } else {
+            hlog("[host] 冒烟: 路线D MAP_JIT+RWX mmap OK %p (cur=%x max=%x)", p, cur, mx);
+            if ((cur & PROT_WRITE) && (cur & PROT_EXEC)) {
+                *(unsigned int *)p = ret_insn;
+                sys_icache_invalidate(p, 4096);
+                hlog("[host] 冒烟: 路线D 页面真实 RWX, 写入 OK, 试执行 ...");
+                if (sigsetjmp(g_smoke_jmp, 1) == 0) {
+                    ((void (*)(void))p)();
+                    hlog("[host] 冒烟: 路线D 执行 OK —— MAP_JIT+RWX 直接分配可用!");
+                    ok = 1;
+                } else {
+                    hlog("[host] 冒烟: 路线D 执行段错误 signal=%d fault=%p",
+                         g_smoke_sig, g_smoke_fault);
+                }
+            } else {
+                hlog("[host] 冒烟: 路线D 页面非真实 RWX (cur=%x)", cur);
+            }
+            if (!ok) munmap(p, 4096);
+        }
+    }
+
+    // 还原信号处理器
+    if (have_bus)  sigaction(SIGBUS,  &old_bus,  NULL);
+    if (have_segv) sigaction(SIGSEGV, &old_segv, NULL);
+    if (have_ill)  sigaction(SIGILL,  &old_ill,  NULL);
+
+    if (ok) {
+        hlog("[host] 冒烟: JIT 链路畅通, 放行 mono_jit_init");
+        return 1;
+    }
+    hlog("[host] !! 冒烟失败: 四条 JIT 路线（mach_vm_write / mprotect+WRITE / 翻转函数 / RWX直配）均不可用");
+    hlog("[host] !! 放弃 mono 初始化（保游戏可玩）。日志上方各路线的失败点即内核给出的精确边界。");
+    return 0;
 #else
     return 1;   // 桌面/macOS：JIT 天然可用，无需冒烟
 #endif
