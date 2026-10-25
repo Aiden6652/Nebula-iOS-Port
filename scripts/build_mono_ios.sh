@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-18}"
+CACHE_VERSION="${CACHE_VERSION:-19}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -326,6 +326,7 @@ if mm:
         '#include <time.h>\n'
         '#include <stdarg.h>\n'
         '#include <errno.h>\n'
+        '#include <unistd.h>\n'
         '#include <dlfcn.h>\n'
         'extern int csops (int pid, unsigned int ops, void *useraddr, unsigned long usersize);\n'
         '#ifndef CS_OPS_STATUS\n'
