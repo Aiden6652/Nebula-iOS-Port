@@ -48,7 +48,6 @@ extern void mono_setmmapjit (int flag);
 
 #ifdef __APPLE__
 #include <mach/mach.h>
-#include <mach/mach_vm.h>          // mach_vm_write / mach_vm_region（JIT 冒烟）
 #include <mach/task_info.h>
 #include <setjmp.h>                // sigsetjmp/siglongjmp（冒烟段错误兜底）
 #include <mach-o/dyld.h>
@@ -65,6 +64,20 @@ extern void mono_setmmapjit (int flag);
 // sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
 // 故手动声明 csops 及其常量。csops 是 libSystem 真实导出的符号，运行/链接均可用。
 extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersize);
+// mach_vm.h 在 iOS SDK 带 #error unsupported（Apple 剥离），但 mach_vm_write /
+// mach_vm_region 是 libsystem_kernel 真实导出的符号（.ips 可见），手动声明。
+// 用途：JIT 冒烟的调试态写入原语（debugserver 同款）与真实保护位校验。
+extern kern_return_t mach_vm_write(vm_map_t target_task,
+                                   mach_vm_address_t address,
+                                   vm_offset_t data,
+                                   mach_msg_type_number_t dataCnt);
+extern kern_return_t mach_vm_region(vm_map_t target_task,
+                                    mach_vm_address_t *address,
+                                    mach_vm_size_t *size,
+                                    vm_region_flavor_t flavor,
+                                    vm_region_info_t info,
+                                    mach_msg_type_number_t *infoCnt,
+                                    mach_port_t *object_name);
 #ifndef CS_OPS_STATUS
 #define CS_OPS_STATUS 0          // 查询进程代码签名状态
 #endif
