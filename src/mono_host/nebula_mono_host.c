@@ -1036,6 +1036,23 @@ static int nebula_jit_smoke(void)
 #endif
 }
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+/* [Nebula iOS] 探测 allow-jit 是否真生效：尝试一次 MAP_JIT mmap。
+   官方文档：allow-jit 仅放行带 MAP_JIT 标志的 mmap；无它则 MAP_JIT mmap 报 EPERM。
+   iOS 免费证书签的 provisioning profile 不授权该 entitlement → 系统忽略 → 仍 EPERM。
+   探测成功 => entitlement 真生效，主逻辑应改走 MAP_JIT；失败 => 证书/签名问题，plain hack 救不了。*/
+static void nebula_probe_map_jit(void) {
+    void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                   MAP_JIT | MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p != MAP_FAILED) {
+        hlog("[host][probe] MAP_JIT mmap OK addr=%p —— allow-jit 已生效，应走 MAP_JIT 路径", p);
+        munmap(p, 4096);
+    } else {
+        hlog("[host][probe] MAP_JIT mmap FAILED errno=%d —— allow-jit 未生效(免费证书/未嵌对)；plain R-X 在 iOS 硬件 APRR 下也不能执行", errno);
+    }
+}
+#endif
+
 static void *boot_thread(void *arg) {
     (void)arg;
     hlog("[host] boot thread started");
@@ -1052,6 +1069,10 @@ static void *boot_thread(void *arg) {
         log_try("/var/mobile/nebula_host.log");
         hlog("[host] === boot start ===");
     }
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    nebula_probe_map_jit();   // 尽早确认 allow-jit 是否真生效，决定后续 JIT 路径
+#endif
 
     start_watchdog();   // 尽早启动内存看门狗，覆盖 mono_jit_init 全程（含其内存高峰）
 
