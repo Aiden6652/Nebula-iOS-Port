@@ -335,6 +335,7 @@ static long rss_mb(void) {
 
 static volatile int watchdog_run = 1;
 static volatile int g_mono_ready = 0;   // mono_jit_init 成功后才置 1，看门狗据此决定能否 GC
+static FILE     *g_logfp   = NULL;      // 日志文件句柄（前移：供前置的 watchdog_thread 使用）
 
 static void *watchdog_thread(void *arg) {
     (void)arg;
@@ -560,7 +561,6 @@ const void *GlobalizationResolveDllImport(const char *name)
    同时把原文存进 g_last_buf，崩点信号处理器能读出“最后执行到哪一步”。 */
 #include <stdarg.h>
 static os_log_t g_neb_log = NULL;
-static FILE     *g_logfp   = NULL;
 static char      g_last_buf[1024];
 static const char *g_last_step = "(尚未执行任何步骤)";
 
