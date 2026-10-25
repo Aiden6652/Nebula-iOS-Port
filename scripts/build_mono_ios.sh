@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-10}"
+CACHE_VERSION="${CACHE_VERSION:-11}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -329,6 +329,31 @@ else:
     if _cnt[0] == 0:
         print("    !! mono-mmap.c 未匹配到 |= MAP_JIT（mono 结构变化，需人工适配）", file=sys.stderr)
         sys.exit(1)
+    # (b2-b) 调试态 mmap 后补 mprotect RWX（真机 2026-10-25 .ips 铁证）：
+    #   崩溃页 vmRegion 实测 "rw-/rwx" —— iOS 18.6 内核对匿名 mmap（即使显式请求
+    #   PROT_EXEC）会在映射瞬间把「当前」PROT_EXEC 剥掉，只保留在 max_prot；
+    #   结果是：写入 OK（rw- 可写）、执行 SIGBUS KERN_PROTECTION_FAILURE（不可执行）。
+    #   max_prot=rwx 证明 mprotect 补 PROT_EXEC 被内核允许——这正是调试态 JIT 的
+    #   正确姿势：mmap → mprotect RWX → 写/执行。mono_valloc 是代码页分配主入口
+    #   （codeman reserve / mono_valloc_aligned 都汇聚到它），在这一处补即可全覆盖。
+    if 'nebula_ios_mprotect_rwx' not in _s2:
+        _anchor = "\tEND_CRITICAL_SECTION;\n\n\tif (ptr == MAP_FAILED)\n\t\treturn NULL;"
+        _mprot = ("\tEND_CRITICAL_SECTION;\n\n"
+                  "#if defined(TARGET_IOS) && TARGET_IOS\n"
+                  "\t/* [Nebula iOS] 内核在 mmap 时剥离当前 PROT_EXEC（真机 vmRegion 实测 rw-/rwx），\n"
+                  "\t   调试态（CS_DEBUGGED）max_prot=rwx，mprotect 可把页补成 RWX。 */\n"
+                  "\tif (ptr != MAP_FAILED && nebula_ios_debugged ()) /* nebula_ios_mprotect_rwx */\n"
+                  "\t\tmprotect (ptr, length, PROT_READ | PROT_WRITE | PROT_EXEC);\n"
+                  "#endif\n\n"
+                  "\tif (ptr == MAP_FAILED)\n"
+                  "\t\treturn NULL;")
+        if _anchor in _s2:
+            _s2 = _s2.replace(_anchor, _mprot, 1)
+            print("    mono-mmap.c: mono_valloc 调试态 mprotect RWX 已注入")
+        else:
+            print("    !! mono-mmap.c 未找到 mono_valloc END_CRITICAL_SECTION 锚点（mono 结构变化，需人工适配）",
+                  file=sys.stderr)
+            sys.exit(1)
     open(mm, 'w', encoding='utf-8').write(_s2)
     print("    mono-mmap.c: 调试态剥 MAP_JIT 守卫已注入（%d 处）" % _cnt[0])
 

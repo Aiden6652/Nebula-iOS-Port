@@ -656,7 +656,16 @@ static int nebula_jit_smoke(void)
             hlog("[host] !! 冒烟失败: plain RWX mmap 被拒 errno=%d（进程无 JIT 能力）", errno);
             return 0;
         }
-        hlog("[host] 冒烟: plain RWX mmap OK %p, 试写入 ret ...", p);
+        hlog("[host] 冒烟: plain RWX mmap OK %p, 试 mprotect RWX ...", p);
+        // 真机 2026-10-25 .ips 铁证：iOS 内核对匿名 mmap 在映射瞬间剥离「当前」
+        // PROT_EXEC（vmRegion 显示 rw-/rwx）→ 写入 OK 但执行 SIGBUS。
+        // max_prot=rwx 证明调试态下 mprotect 补回 EXEC 被允许 —— 必须显式补。
+        if (mprotect(p, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            hlog("[host] !! 冒烟失败: mprotect RWX 被拒 errno=%d（调试态也无执行权限，检查 StikDebug 是否真正附加）", errno);
+            munmap(p, 4096);
+            return 0;
+        }
+        hlog("[host] 冒烟: mprotect RWX OK, 试写入 ret ...");
         *(unsigned int *)p = ret_insn;
         hlog("[host] 冒烟: 写入 OK, 试执行 ...");
         ((void (*)(void))p)();
