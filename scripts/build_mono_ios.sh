@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-13}"
+CACHE_VERSION="${CACHE_VERSION:-14}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -301,6 +301,7 @@ if mm:
         '/* [Nebula iOS] W^X 翻转表：登记 mono 的 JIT 页，mprotect 全局翻 RW/R-X。\n'
         '   真机 2026-10-25 冒烟路线 F 实测：RW 写入 → mprotect R-X → 执行 OK\n'
         '   （CS_DEBUGGED 态，CS_KILL/CS_HARD 已关，无效页允许执行）。 */\n'
+        '#include <sys/mman.h>\n'
         '#include <pthread.h>\n'
         '#include <libkern/OSCacheControl.h>\n'
         '\n'
@@ -355,7 +356,11 @@ if mm:
         '}\n'
         '#endif /* TARGET_IOS */\n'
         '\n')
-    s2 = s.replace(_old_guard, wx_block + _new_guard, 1)
+    # 守卫只做短路改写（iOS 不编译 MAP_JIT 块）；wx_block（函数定义+全局变量）
+    # 单独置于文件顶层最前，绝不能塞进 mono_valloc 函数体（否则函数定义嵌套报错 +
+    # 内部调用的 register/unregister 对外不可见）。
+    s2 = s.replace(_old_guard, _new_guard, 1)
+    s2 = wx_block + s2
 
     # mono_valloc 成功 → 登记（含 EXEC 请求的才登记；内核对 RWX 实际只给 rw-，
     # mono 随后的写入天然可行，执行交给 disable_write 翻 RX）
