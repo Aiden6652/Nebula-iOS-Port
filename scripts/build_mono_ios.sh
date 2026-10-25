@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-9}"
+CACHE_VERSION="${CACHE_VERSION:-10}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -270,6 +270,67 @@ if os.path.exists(cm):
         print("    !! mono-codeman.c 未匹配到翻转函数（mono 版本可能已改结构）", file=sys.stderr)
 else:
     print("    !! 找不到 mono-codeman.c", file=sys.stderr)
+
+# (b2) [Nebula iOS] 调试态剥 MAP_JIT、走 plain RWX（真机 2026-10-25 实测定案）：
+#      上版 (b-code) 保留 MAP_JIT + dlsym 探测翻转，但真机两次实证该路走不通：
+#        · 第一次（.ips，pc=0）：pthread_jit_write_protect_np 运行时懒绑定解析失败
+#          → 直接调用跳零；说明真机运行时该符号不可解析，dlsym 同样为 NULL；
+#        · 第二次（2026-10-25，无 .ips）：dlsym=NULL → 永远跳过翻转 → 写 MAP_JIT 页
+#          （默认可执行不可写）被内核 Invalid Page SIGKILL，且不生成崩溃报告。
+#      修正：iOS 上 csops(CS_DEBUGGED) 置位（StikDebug/调试器附加）时剥掉 MAP_JIT，
+#      mono_valloc 走 plain mmap RWX（94f5693 实测成功之路）；非调试态（官方
+#      allow-jit 直签）保留 MAP_JIT，由 (c) 的 dlsym 探测翻转。
+#      补丁未命中（mono 结构变化）直接 exit 1 让 CI 变红，杜绝静默失败。
+mm = os.path.join(mono, 'mono', 'utils', 'mono-mmap.c')
+if not os.path.exists(mm):
+    print("    !! 找不到 mono/utils/mono-mmap.c", file=sys.stderr); sys.exit(1)
+_s = open(mm, encoding='utf-8', errors='replace').read()
+if 'nebula_ios_debugged' in _s:
+    print("    mono-mmap.c: 已注入过，跳过")
+else:
+    helper = (
+        "/* [Nebula iOS] 调试态判定：CS_DEBUGGED（StikDebug/调试器附加）时内核对普通匿名\n"
+        "   mmap 直接给 RWX（94f5693 实测），而 MAP_JIT 页在无 allow-jit entitlement 的\n"
+        "   进程上无法用 pthread_jit_write_protect_np 翻转（真机 .ips 实证该符号运行时\n"
+        "   解析不到，dlsym 亦为 NULL）——写 trampoline 必被内核 Invalid Page SIGKILL\n"
+        "   （且无 .ips）。因此调试态必须剥掉 MAP_JIT 走 plain RWX；\n"
+        "   非调试态（官方 allow-jit 直签）保留 MAP_JIT，配合 codeman 的 dlsym 探测翻转。 */\n"
+        "#if defined(TARGET_IOS) && TARGET_IOS\n"
+        "#include <dlfcn.h>\n"
+        "#include <unistd.h>\n"
+        "#include <sys/types.h>\n"
+        "extern int csops (int pid, unsigned int ops, void *useraddr, unsigned long usersize);\n"
+        "#ifndef NEBULA_CS_OPS_STATUS\n"
+        "#define NEBULA_CS_OPS_STATUS 0\n"
+        "#endif\n"
+        "#ifndef NEBULA_CS_DEBUGGED\n"
+        "#define NEBULA_CS_DEBUGGED 0x10000000\n"
+        "#endif\n"
+        "static int\n"
+        "nebula_ios_debugged (void)\n"
+        "{\n"
+        "\tstatic int cached = -1;\n"
+        "\tif (cached < 0) {\n"
+        "\t\tint f = 0;\n"
+        "\t\tcached = (csops (getpid (), NEBULA_CS_OPS_STATUS, &f, sizeof (f)) == 0 &&\n"
+        "\t\t\t  (f & NEBULA_CS_DEBUGGED)) ? 1 : 0;\n"
+        "\t}\n"
+        "\treturn cached;\n"
+        "}\n"
+        "#else\n"
+        "__attribute__((unused)) static int nebula_ios_debugged (void) { return 0; }\n"
+        "#endif\n")
+    _s2 = helper + _s
+    _cnt = [0]
+    def _guard(m):
+        _cnt[0] += 1
+        return "%sif (!nebula_ios_debugged ()) %s|= MAP_JIT;" % (m.group(1), m.group(2))
+    _s2 = re.sub(r'(?m)^([ \t]*)([A-Za-z_][A-Za-z0-9_]*[ \t]*)\|= MAP_JIT;', _guard, _s2)
+    if _cnt[0] == 0:
+        print("    !! mono-mmap.c 未匹配到 |= MAP_JIT（mono 结构变化，需人工适配）", file=sys.stderr)
+        sys.exit(1)
+    open(mm, 'w', encoding='utf-8').write(_s2)
+    print("    mono-mmap.c: 调试态剥 MAP_JIT 守卫已注入（%d 处）" % _cnt[0])
 
 # (d) iOS 链接：pthread_jit_write_protect_np 在 iOS SDK 的 libpthread.tbd 不导出该符号，
 #     链接器报 undefined symbol。weak_import 声明只解决编译期；链接期必须显式

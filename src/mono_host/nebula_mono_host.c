@@ -55,6 +55,10 @@ extern void mono_setmmapjit (int flag);
 #include <os/log.h>
 #include <signal.h>
 #include <dispatch/dispatch.h>     // 启动占位文本的延时/主线程销毁
+#include <sys/mman.h>              // mmap / MAP_JIT（JIT 冒烟测试）
+#include <errno.h>
+#include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
+#include <unistd.h>                // getpid
 // sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
 // 故手动声明 csops 及其常量。csops 是 libSystem 真实导出的符号，运行/链接均可用。
 extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersize);
@@ -65,11 +69,13 @@ extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersi
 #define CS_DEBUGGED 0x10000000   // 进程被调试器附加 → 内核授予 JIT 能力
 #endif
 
-// [Nebula iOS] 始终强制 MAP_JIT——让 mono 的 trampoline 内存走 MAP_JIT 分配。
-// 翻转（pthread_jit_write_protect_np）的 NULL 安全由 mono 侧 dlsym 探测处理
-// （build_mono_ios.sh (c)）：真机官方 JIT 能解析到 → 走 W^X 翻转；
-// StikDebug 调试态解析不到 → 跳过翻转，内核已给 RWX 页，直接写即可。
-// macOS / iOS 统一调用 mono_setmmapjit(1)。
+// [Nebula iOS] JIT 内存路线（真机 2026-10-25 实测定案）：
+//  · StikDebug 调试态（csops CS_DEBUGGED）：内核对普通匿名 mmap 直接给 RWX；
+//    mono-mmap.c 已由 build_mono_ios.sh (b2) 注入守卫——调试态剥掉 MAP_JIT。
+//  · 非调试态（官方 allow-jit 直签）：保留 MAP_JIT，由 mono 侧 dlsym 探测翻转。
+// 真机两次实证 pthread_jit_write_protect_np 运行时解析不到（懒绑定 pc=0 /
+// dlsym 亦 NULL），MAP_JIT 页永远无法翻成可写——调试态绝不能再走 MAP_JIT。
+// mono_setmmapjit(1) 保留，iOS 调试态下由 (b2) 守卫统一剥除。
 #else
 #include <signal.h>
 typedef void *os_log_t;
@@ -624,6 +630,69 @@ static int nebula_wait_for_jit(void) {
     return 0;
 }
 
+// —— JIT 冒烟测试（仅 iOS）：mono_jit_init 之前真实预演「分配 → 写入 → 执行」 ——
+// 内核对无 JIT 权限的写/执行是 SIGKILL（CODESIGNING / Invalid Page），不可捕获、
+// 往往不生成 .ips（2026-10-25 真机实测：mono_jit_init 内被杀，无任何报告）。
+// 只能靠 nebula_host.log 的最后一行定位死亡步骤：
+//   · 停在「试写入」 = 页不可写（MAP_JIT 未翻转 / 无 RWX 权限）
+//   · 停在「试执行」 = 页不可执行
+//   · 分配即失败     = 进程根本无 JIT 能力
+// 冒烟不过就优雅退出，绝不进 mono_jit_init 黑盒硬崩。
+// 写入的是 arm64 ret（0xD65F03C0）而非 nop：跳入后立即返回，
+// 不会落到页内后续零字节（udf #0 → SIGILL）。
+static int nebula_jit_smoke(void)
+{
+#if TARGET_OS_IPHONE
+    const unsigned int ret_insn = 0xD65F03C0u;   // arm64 ret
+    int flags = 0;
+    int debugged = (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) == 0 &&
+                    (flags & CS_DEBUGGED)) ? 1 : 0;
+
+    if (debugged) {
+        hlog("[host] 冒烟: 路线=plain-RWX（CS_DEBUGGED 调试态）");
+        void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) {
+            hlog("[host] !! 冒烟失败: plain RWX mmap 被拒 errno=%d（进程无 JIT 能力）", errno);
+            return 0;
+        }
+        hlog("[host] 冒烟: plain RWX mmap OK %p, 试写入 ret ...", p);
+        *(unsigned int *)p = ret_insn;
+        hlog("[host] 冒烟: 写入 OK, 试执行 ...");
+        ((void (*)(void))p)();
+        hlog("[host] 冒烟: 执行 OK —— JIT 链路畅通, 放行 mono_jit_init");
+        munmap(p, 4096);
+        return 1;
+    }
+
+    // 非调试态：官方 allow-jit 直签路，依赖翻转符号
+    void *wp = dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
+    if (!wp) {
+        hlog("[host] !! 冒烟失败: 非调试态且 pthread_jit_write_protect_np 不可解析"
+             " → MAP_JIT 无法翻成可写, 放弃 mono 初始化（保游戏可玩）");
+        return 0;
+    }
+    hlog("[host] 冒烟: 路线=MAP_JIT+W^X翻转（检测到翻转符号）");
+    void *p = mmap(NULL, 4096, PROT_READ | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    if (p == MAP_FAILED) {
+        hlog("[host] !! 冒烟失败: MAP_JIT mmap 被拒 errno=%d", errno);
+        return 0;
+    }
+    ((void (*)(int))wp)(0);
+    hlog("[host] 冒烟: 已翻可写, 试写入 ret ...");
+    *(unsigned int *)p = ret_insn;
+    ((void (*)(int))wp)(1);
+    hlog("[host] 冒烟: 已翻回可执行, 试执行 ...");
+    ((void (*)(void))p)();
+    hlog("[host] 冒烟: 执行 OK —— JIT 链路畅通, 放行 mono_jit_init");
+    munmap(p, 4096);
+    return 1;
+#else
+    return 1;   // 桌面/macOS：JIT 天然可用，无需冒烟
+#endif
+}
+
 static void *boot_thread(void *arg) {
     (void)arg;
     hlog("[host] boot thread started");
@@ -699,6 +768,14 @@ static void *boot_thread(void *arg) {
     if (!nebula_wait_for_jit()) {
         hlog("[host] step: 跳过 mono_jit_init（无 JIT 能力）。游戏本体不受影响，仅模组功能不可用。");
         nebula_hide_boot_overlay();   // 无 JIT：销毁占位文字，让原版游戏正常可玩
+        free(dir);
+        return NULL;
+    }
+
+    hlog("[host] step: jit_smoke");
+    if (!nebula_jit_smoke()) {
+        hlog("[host] step: 跳过 mono 初始化（JIT 冒烟未通过）。游戏本体不受影响，仅模组功能不可用。");
+        nebula_hide_boot_overlay();
         free(dir);
         return NULL;
     }
