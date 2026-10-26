@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-20}"
+CACHE_VERSION="${CACHE_VERSION:-21}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -326,6 +326,7 @@ if mm:
         '#include <time.h>\n'
         '#include <stdarg.h>\n'
         '#include <errno.h>\n'
+        '#include <stdint.h>\n'
         '#include <unistd.h>\n'
         '#include <dlfcn.h>\n'
         'extern int csops (int pid, unsigned int ops, void *useraddr, unsigned long usersize);\n'
@@ -359,7 +360,7 @@ if mm:
         '\tif (fp) {\n'
         '\t\tstruct timespec ts;\n'
         '\t\tclock_gettime (CLOCK_MONOTONIC, &ts);\n'
-        '\t\tfprintf (fp, "[%ld.%03ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000000);\n'
+        '\t\tfprintf (fp, "[%ld.%03ld] [t%llx] ", (long)ts.tv_sec, ts.tv_nsec / 1000000, (unsigned long long)(uintptr_t)pthread_self ());\n'
         '\t\tva_list ap; va_start (ap, fmt);\n'
         '\t\tvfprintf (fp, fmt, ap);\n'
         '\t\tva_end (ap);\n'
@@ -461,6 +462,14 @@ if mm:
         '\tneb_wx_log ("set_write(%d) done", writable);\n'
         '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
         '}\n'
+        '\n'
+        '/* [Nebula iOS] 给其它翻译单元留的日志口（如 mono-threads-posix.c 的屏障退化）：\n'
+        '   一行备注落进 nebula_mono_mem.log，死前最后操作序列里能看到它。 */\n'
+        'void\n'
+        'nebula_memnote (const char *msg)\n'
+        '{\n'
+        '\tneb_wx_log ("%s", msg);\n'
+        '}\n'
         '#endif /* __APPLE__ */\n'
         '\n')
     # 守卫只做短路改写（iOS 不编译 MAP_JIT 块）；wx_block（函数定义+全局变量）
@@ -520,6 +529,45 @@ if mm:
     print("    mono-mmap.c: MAP_JIT 短路 + 翻转表 + mprotect W^X 已注入")
 else:
     print("    !! 找不到 mono-mmap.c", file=sys.stderr)
+    sys.exit(1)
+
+# (b4) [Nebula iOS] mono_memory_barrier_process_wide 退化——真机 2026-10-26 四轮
+#      定案：mono_jit_init 首次 GC (sgen stop-the-world) 调用本函数，Apple 平台
+#      原版 IPI 技巧（posix_memalign 助手页 → mprotect RW → 原子写脏 → mprotect
+#      NONE）在此内核触发 codesigning monitor SIGKILL：
+#      nebula_mono_mem.log 四轮恒定终于 "mprotect addr len=16384 flags_in=3
+#      prot_out=3 ret=0"（iOS 16K 大页 = mono_pagesize()，正是本函数第一条
+#      mprotect；第二条 mprotect NONE 从未出现；写脏页的原子写之前进程已被杀）。
+#      host 冒烟路线 F 畅通证明 JIT 页翻转无罪，嫌疑只剩这条非 JIT 页保护游戏。
+#      处理：iOS 上跳过页保护游戏，退化为 __sync_synchronize 全屏障。
+#      代价：失去全核 IPI/TLB 冲刷（Apple 多核线程挂起顺序性 hack），若后续出现
+#      GC 挂起竞态再评估。nebula_memnote 落日志便于确认走到了这里。
+#      CACHE_VERSION 联动升版。
+tp = os.path.join(mono, 'mono', 'utils', 'mono-threads-posix.c')
+if os.path.exists(tp):
+    s = open(tp, encoding='utf-8', errors='replace').read()
+    _bw_anchor = 'mono_memory_barrier_process_wide (void)\n{\n\tint status;\n'
+    if s.count(_bw_anchor) != 1:
+        print("    !! mono-threads-posix.c: barrier 锚点未唯一命中 (%d)" % s.count(_bw_anchor), file=sys.stderr)
+        sys.exit(1)
+    _bw_new = (_bw_anchor +
+        '#if defined(TARGET_IOS) || (defined(__APPLE__) && !defined(TARGET_OSX))\n'
+        '\t/* [Nebula iOS] 真机 2026-10-26 定案：本函数的 Apple IPI 技巧（助手页\n'
+        '\t   mprotect RW→写脏→NONE）在此内核被 codesigning monitor SIGKILL（四轮\n'
+        '\t   复现，无 .ips，死点恒定在两条 mprotect 之间）。iOS 跳过页保护游戏，\n'
+        '\t   退化为全屏障。详见 scripts/build_mono_ios.sh (b4)。 */\n'
+        '\t{\n'
+        '\t\textern void nebula_memnote (const char *msg);\n'
+        '\t\tnebula_memnote ("barrier: iOS fallback, page-trick skipped, sync only");\n'
+        '\t\t__sync_synchronize ();\n'
+        '\t\treturn;\n'
+        '\t}\n'
+        '#endif\n')
+    s = s.replace(_bw_anchor, _bw_new, 1)
+    open(tp, 'w', encoding='utf-8').write(s)
+    print("    mono-threads-posix.c: iOS 屏障退化已注入 (page-trick skipped)")
+else:
+    print("    !! 找不到 mono-threads-posix.c", file=sys.stderr)
     sys.exit(1)
 
 # (d) iOS 链接：pthread_jit_write_protect_np 在 iOS SDK 的 libpthread.tbd 不导出该符号，
