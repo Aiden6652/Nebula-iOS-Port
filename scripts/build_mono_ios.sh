@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-21}"
+CACHE_VERSION="${CACHE_VERSION:-22}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -515,11 +515,15 @@ if mm:
         sys.exit(1)
     _mp_new = ('\tint _r = mprotect (addr, length, prot);\n'
                '#if defined(__APPLE__)\n'
+               '\t/* 调用方偏移：返回地址映射回 libmono 内偏移，离线符号化可钉死调用者 */\n'
+               '\tunsigned long _coff = 0;\n'
+               '\t{ Dl_info _di; void *_ra = __builtin_return_address (0);\n'
+               '\t  if (_ra && dladdr (_ra, &_di)) _coff = (unsigned long)((char *)_ra - (char *)_di.dli_fbase); }\n'
                '\tif (prot & PROT_EXEC) {\n'
                '\t\tint was = nebula_wx_ensure (addr, length);\n'
-               '\t\tneb_wx_log ("mprotect-EXEC %p len=%zu prot_out=%d ret=%d errno=%d registered_before=%d", addr, length, prot, _r, _r ? errno : 0, was);\n'
+               '\t\tneb_wx_log ("mprotect-EXEC %p len=%zu prot_out=%d ret=%d errno=%d registered_before=%d caller_off=0x%lx", addr, length, prot, _r, _r ? errno : 0, was, _coff);\n'
                '\t} else {\n'
-               '\t\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d", addr, length, flags, prot, _r, _r ? errno : 0);\n'
+               '\t\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d caller_off=0x%lx", addr, length, flags, prot, _r, _r ? errno : 0, _coff);\n'
                '\t}\n'
                '#endif\n'
                '\treturn _r;\n}')
@@ -551,18 +555,19 @@ if os.path.exists(tp):
         print("    !! mono-threads-posix.c: barrier 锚点未唯一命中 (%d)" % s.count(_bw_anchor), file=sys.stderr)
         sys.exit(1)
     _bw_new = (_bw_anchor +
-        '#if defined(TARGET_IOS) || (defined(__APPLE__) && !defined(TARGET_OSX))\n'
         '\t/* [Nebula iOS] 真机 2026-10-26 定案：本函数的 Apple IPI 技巧（助手页\n'
-        '\t   mprotect RW→写脏→NONE）在此内核被 codesigning monitor SIGKILL（四轮\n'
+        '\t   mprotect RW→写脏→NONE）在此内核被 codesigning monitor SIGKILL（五轮\n'
         '\t   复现，无 .ips，死点恒定在两条 mprotect 之间）。iOS 跳过页保护游戏，\n'
-        '\t   退化为全屏障。详见 scripts/build_mono_ios.sh (b4)。 */\n'
+        '\t   退化为全屏障。详见 scripts/build_mono_ios.sh (b4)。\n'
+        '\t   注意：本脚本只服务 iOS 交叉构建，此处【无条件】注入，不加宏守卫——\n'
+        '\t   上一版用 TARGET_IOS/TARGET_OSX 守卫被证明整段编译剔除（真机无 barrier\n'
+        '\t   日志、死点不变），mono 宏体系在自定义交叉构建下的定义不可靠。 */\n'
         '\t{\n'
         '\t\textern void nebula_memnote (const char *msg);\n'
         '\t\tnebula_memnote ("barrier: iOS fallback, page-trick skipped, sync only");\n'
         '\t\t__sync_synchronize ();\n'
         '\t\treturn;\n'
-        '\t}\n'
-        '#endif\n')
+        '\t}\n')
     s = s.replace(_bw_anchor, _bw_new, 1)
     open(tp, 'w', encoding='utf-8').write(s)
     print("    mono-threads-posix.c: iOS 屏障退化已注入 (page-trick skipped)")
