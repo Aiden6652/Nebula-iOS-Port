@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-19}"
+CACHE_VERSION="${CACHE_VERSION:-20}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -298,13 +298,13 @@ if mm:
         sys.exit(1)
     wx_block = (
         '#if defined(__APPLE__)\n'
-        '/* [Nebula iOS] W^X 翻转表 + 调试态全局 APRR 控制。\n'
-        '   根因：Apple Silicon 的 W^X 由全局 APRR 状态(pthread_jit_write_protect_np)强制，\n'
-        '   每页 mprotect 在 ASi 上不可靠——mono 持续翻转时与全局模式打架，执行即 SIGKILL。\n'
-        '   策略(三级)：1) 调试态(CS_DEBUGGED)且能 dlsym 到 pthread_jit_write_protect_np →\n'
-        '   用它翻全局 W^X(ASi 唯一可靠方式)，不再每页 mprotect；2) 调试态但无该函数 →\n'
-        '   RWX 页在调试器下可直接执行，跳过翻转只刷 icache；3) 无调试器(allow-jit/MAP_JIT\n'
-        '   路径)→ 每页 mprotect 翻转(兜底)。wx-init 日志暴露走哪条。 */\n'
+        '/* [Nebula iOS] W^X 翻转表（真机 2026-10-26 实测定案）。\n'
+        '   host 冒烟实证：plain(RW) mmap → 写入 → mprotect R-X + icache → 执行 OK，\n'
+        '   循环反复翻转也 OK（路线 F 畅通）；而执行 rw- 页被 codesigning monitor 秒杀\n'
+        '   （SIGKILL 无 .ips——此前 jit_toggle=no 的 no-flip 分支即死于这个）。\n'
+        '   故唯一策略：全线每页 mprotect 翻转（可写↔可执行），执行前必须 R-X。\n'
+        '   pthread_jit_write_protect_np 解析与否仅记录日志（dlopen libsystem_pthread\n'
+        '   回退兜住 RTLD_DEFAULT 搜不到的情况），不再依赖全局 APRR 翻转。 */\n'
         '#include <sys/mman.h>\n'
         '#include <pthread.h>\n'
         '#include <libkern/OSCacheControl.h>\n'
@@ -374,8 +374,13 @@ if mm:
         '\tstatic int done = 0;\n'
         '\tif (done) return;\n'
         '\tdone = 1;\n'
-        '\t/* iOS 调试态下 pthread_jit_write_protect_np 可用，控制全局 APRR W^X 状态 */\n'
+        '\t/* iOS 真机实证：host 直调 pthread_jit_write_protect_np 成功(返回0)，但\n'
+        '\t   RTLD_DEFAULT 搜不到该导出——dlopen 具体 dylib 再试一次 */\n'
         '\tneb_jit_toggle = (neb_jit_toggle_fn) dlsym (RTLD_DEFAULT, "pthread_jit_write_protect_np");\n'
+        '\tif (!neb_jit_toggle) {\n'
+        '\t\tvoid *h = dlopen ("/usr/lib/system/libsystem_pthread.dylib", RTLD_NOW);\n'
+        '\t\tif (h) neb_jit_toggle = (neb_jit_toggle_fn) dlsym (h, "pthread_jit_write_protect_np");\n'
+        '\t}\n'
         '\tint _flags = 0;\n'
         '\tneb_wx_debugger = (csops (getpid (), CS_OPS_STATUS, &_flags, sizeof (_flags)) == 0 && (_flags & CS_DEBUGGED)) ? 1 : 0;\n'
         '\tneb_wx_log ("wx-init jit_toggle=%s dbg=%d", neb_jit_toggle ? "yes" : "no", neb_wx_debugger);\n'
@@ -432,8 +437,7 @@ if mm:
         '\tpthread_mutex_unlock (&neb_wx_mutex);\n'
         '}\n'
         '\n'
-        '/* [Nebula iOS] 全局 W^X 翻转（pthread_jit_write_protect_np 的 mprotect 替身，\n'
-        '   由 mono-codeman.c 的 enable/disable_write 调用）：\n'
+        '/* [Nebula iOS] W^X 翻转（由 mono-codeman.c 的 enable/disable_write 调用）：\n'
         '   writable=1 → 全部登记区翻 RW（mono 写代码）；\n'
         '   writable=0 → 全部登记区翻 R-X + 刷 icache（mono 执行代码）。 */\n'
         'void\n'
@@ -442,33 +446,10 @@ if mm:
         '\tneb_wx_init ();\n'
         '\tpthread_mutex_lock (&neb_wx_mutex);\n'
         '\tneb_wx_log ("set_write(%d) enter, n=%d dbg=%d toggle=%s", writable, neb_wx_nregions, neb_wx_debugger, neb_jit_toggle ? "y" : "n");\n'
-        '\tif (neb_wx_debugger && neb_jit_toggle) {\n'
-        '\t\t/* 调试态 + 全局 APRR 翻转可用：用 pthread_jit_write_protect_np 控制全局 W^X\n'
-        '\t\t   （ASi 唯一可靠翻转方式），无需每页 mprotect。 */\n'
-        '\t\tneb_jit_toggle (writable ? 0 : 1);  /* 0=可写(写代码) 1=可执行(执行代码) */\n'
-        '\t\tif (!writable) {\n'
-        '\t\t\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
-        '\t\t\t\tif (!neb_wx_regions [i].active) continue;\n'
-        '\t\t\t\tsys_icache_invalidate (neb_wx_regions [i].addr, neb_wx_regions [i].len);\n'
-        '\t\t\t}\n'
-        '\t\t}\n'
-        '\t\tneb_wx_log ("set_write(%d) done (global-APRR toggle)", writable);\n'
-        '\t\tpthread_mutex_unlock (&neb_wx_mutex);\n'
-        '\t\treturn;\n'
-        '\t}\n'
-        '\tif (neb_wx_debugger && !neb_jit_toggle) {\n'
-        '\t\t/* 调试态但无全局翻转：RWX 页在调试器下可执行，跳过 mprotect 翻转，仅刷 icache。 */\n'
-        '\t\tif (!writable) {\n'
-        '\t\t\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
-        '\t\t\t\tif (!neb_wx_regions [i].active) continue;\n'
-        '\t\t\t\tsys_icache_invalidate (neb_wx_regions [i].addr, neb_wx_regions [i].len);\n'
-        '\t\t\t}\n'
-        '\t\t}\n'
-        '\t\tneb_wx_log ("set_write(%d) done (debugger RWX, no flip)", writable);\n'
-        '\t\tpthread_mutex_unlock (&neb_wx_mutex);\n'
-        '\t\treturn;\n'
-        '\t}\n'
-        '\t/* 无调试器（allow-jit/MAP_JIT 路径兜底）：每页 mprotect 翻转。 */\n'
+        '\t/* [真机 2026-10-26 定案] 废除 no-flip 分支：执行 rw- 页 = codesigning monitor\n'
+        '\t   秒杀（16 轮 set_write 只是写代码没真执行，真正执行即崩）。host 冒烟已实证\n'
+        '\t   路线 F（mprotect R-X + icache 后执行 OK，循环折磨 OK），故不再区分调试态，\n'
+        '\t   全线每页 mprotect 翻转。 */\n'
         '\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
         '\t\tif (!neb_wx_regions [i].active) continue;\n'
         '\t\tint prot = writable ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);\n'
@@ -566,7 +547,7 @@ if os.path.exists(mini_cmake):
 else:
     print("    !! 找不到 mono/mini/CMakeLists.txt", file=sys.stderr)
 PY
-  echo "    [JIT] DISABLE_JIT 已放出 + iOS plain-RWX（无 MAP_JIT/无翻转，翻转 no-op 防跳零）"
+  echo "    [JIT] DISABLE_JIT 已放出 + W^X 走路线 F（每页 mprotect 翻转，host 冒烟实证畅通）"
 else
   echo "    MONO_IOS_JIT 未开启，保留标准 DISABLE_JIT 构建（standard 安全）"
 fi
