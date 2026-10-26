@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-22}"
+CACHE_VERSION="${CACHE_VERSION:-23}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -197,19 +197,17 @@ for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
 #           解析不到 → 跳过翻转，内核已把 MAP_JIT 页当 RWX 给，可直接写。
 #     翻转的 NULL 安全由 (c) 的 dlsym 探测保证，本 (.b) 块不再改 mono-mmap.c。
 
-# (c) [Nebula iOS] NULL 安全 W^X 翻转（替代 mono 官方的 __builtin_available 直接调用）：
-#     iOS（含 StikDebug）SDK 的 libpthread.tbd 不导出 pthread_jit_write_protect_np，
-#     -Wl,-U 只骗过链接器；运行时懒绑定解析失败 → 符号桩 = 0 → 直接调用跳零
-#     SIGSEGV pc=0（真机 .ips 实证 lr=mono_arch_create_generic_trampoline+88）。
-#     改法：enable_write/disable_write 开头用 nebula_ios_jit_toggle() 一次性探测：
-#        · 解析到（真机官方 JIT / entitlement / StikDebug 调试态）→ 走官方 W^X 翻转
-#          （(0)可写 / (1)可执行）；
-#        · 解析不到 → 跳过翻转，避免 pc=0 跳零。
-#     多源解析：先 RTLD_DEFAULT，解析不到再 dlopen /usr/lib/system/libsystem_pthread.dylib
-#     （RTLD_DEFAULT 在某些命名空间/镜像下解析不到该符号，必须回退到具体 dylib）。
-#     这样跳零点彻底消灭，且两条 JIT 路径都正确。macOS 分支（TARGET_IOS=0）不受影响。
-#     注意：#if defined(TARGET_IOS) 守卫已被 CI 实证真实编译（run 40098995257），
-#     守卫内 return 后原调用变死代码（仍需 extern 声明以通过 -Werror=implicit-decl）。
+# (c) [Nebula iOS] W^X 双保险翻转（恢复 mono 官方 pthread_jit_write_protect_np 全局
+#     APRR 翻转 + 每页 mprotect 兜底，与 .NET/Pojav 在 iOS 的做法一致）：
+#     真机 2026-10-26~27 六轮复盘：上传的 fb188cb dylib 经符号化确认【根本不引用】
+#     pthread_jit_write_protect_np——此前本块用 nebula_mono_wx_set_write + return
+#     把 enable/disable_write 整个短路，旁路了上游这套全局翻转，JIT 页在 Apple Silicon
+#     上无法正确切换可执行态 → 执行即 SIGKILL 无 .ips。
+#     修复：去掉 return，恢复上游 __builtin_available(macOS 11, iOS 14) 守卫下的
+#     pthread_jit_write_protect_np((0)可写/(1)可执行) 直连调用（dyld 经 -Wl,-U 从
+#     libSystem 绑定，iOS 14+ 导出，配 StikDebug/CS_DEBUGGED 可用）；同时保留
+#     nebula_mono_wx_set_write 每页 mprotect 兜底（非 MAP_JIT 普通页靠它，真机路线 F
+#     已验证）。两条路径双保险，且都不再 return 短路。macOS 分支行为不变。
 import re as _re
 cm = os.path.join(mono, 'mono', 'utils', 'mono-codeman.c')
 if os.path.exists(cm):
@@ -220,14 +218,16 @@ if os.path.exists(cm):
     # [Nebula iOS] mprotect W^X 翻转：真机路线 F 已验证（RW 写 → mprotect R-X → 执行 OK）。
     # enable_write → 翻 RW；disable_write → 翻 R-X + icache（实现见 mono-mmap.c (b3)）。
     probe = ('#if defined(__APPLE__)\n'
-             '\t/* [Nebula iOS] 翻成可写：登记区全局 mprotect RW（真机路线 F 已验证） */\n'
+             '\t/* [Nebula iOS] 双保险 W^X（.NET/Pojav 同款）：① 每页 mprotect 翻 RW\n'
+             '\t   （路线 F，真机已验证；非 MAP_JIT 普通页靠它）；② 下游原始\n'
+             '\t   pthread_jit_write_protect_np 全局 APRR 翻转（HAVE_... 守卫，iOS 14+\n'
+             '\t   直连，dyld 从 libSystem 绑定）——不再 return 短路，恢复上游翻转。 */\n'
              '\tnebula_mono_wx_set_write (1);\n'
-             '\treturn;\n'
              '#endif\n')
     probe_off = ('#if defined(__APPLE__)\n'
-                '\t/* [Nebula iOS] 翻回可执行：登记区全局 mprotect R-X + 刷 icache */\n'
+                '\t/* [Nebula iOS] 双保险：① 每页 mprotect 翻 R-X + 刷 icache；\n'
+                '\t   ② 下游原始 pthread_jit_write_protect_np 全局翻转（不再短路）。 */\n'
                 '\tnebula_mono_wx_set_write (0);\n'
-                '\treturn;\n'
                 '#endif\n')
     n1 = _re.sub(r'(mono_codeman_enable_write \(void\)\s*\{\n)',
                  lambda m: m.group(1) + probe, s2, count=1)
@@ -316,6 +316,7 @@ if mm:
         'static int neb_wx_debugger = -1;        /* -1 未探测, 0 否, 1 是(CS_DEBUGGED 调试态) */\n'
         'typedef void (*neb_jit_toggle_fn) (int);\n'
         'static neb_jit_toggle_fn neb_jit_toggle = NULL;  /* pthread_jit_write_protect_np */\n'
+        'static int neb_wx_level = 0;             /* 嵌套层级（镜像上游 write_level_tls_id） */\n'
         '\n'
         '/* [Nebula iOS] 内存操作追踪：mono 侧 JIT 页 mmap/mprotect/翻转全部落盘，\n'
         '   进程被 SIGKILL（无 .ips 无 signal handler 输出）时，本文件最后一行即死前\n'
@@ -515,15 +516,15 @@ if mm:
         sys.exit(1)
     _mp_new = ('\tint _r = mprotect (addr, length, prot);\n'
                '#if defined(__APPLE__)\n'
-               '\t/* 调用方偏移：返回地址映射回 libmono 内偏移，离线符号化可钉死调用者 */\n'
-               '\tunsigned long _coff = 0;\n'
+               '\t/* 调用方：返回地址经 dladdr 映射回 libmono 内偏移 + 函数名，无需离线符号化即可钉死调用者 */\n'
+               '\tunsigned long _coff = 0; const char *_cfn = "?";\n'
                '\t{ Dl_info _di; void *_ra = __builtin_return_address (0);\n'
-               '\t  if (_ra && dladdr (_ra, &_di)) _coff = (unsigned long)((char *)_ra - (char *)_di.dli_fbase); }\n'
+               '\t  if (_ra && dladdr (_ra, &_di)) { _coff = (unsigned long)((char *)_ra - (char *)_di.dli_fbase); if (_di.dli_sname) _cfn = _di.dli_sname; } }\n'
                '\tif (prot & PROT_EXEC) {\n'
                '\t\tint was = nebula_wx_ensure (addr, length);\n'
-               '\t\tneb_wx_log ("mprotect-EXEC %p len=%zu prot_out=%d ret=%d errno=%d registered_before=%d caller_off=0x%lx", addr, length, prot, _r, _r ? errno : 0, was, _coff);\n'
+               '\t\tneb_wx_log ("mprotect-EXEC %p len=%zu prot_out=%d ret=%d errno=%d registered_before=%d caller=%s+0x%lx", addr, length, prot, _r, _r ? errno : 0, was, _cfn, _coff);\n'
                '\t} else {\n'
-               '\t\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d caller_off=0x%lx", addr, length, flags, prot, _r, _r ? errno : 0, _coff);\n'
+               '\t\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d caller=%s+0x%lx", addr, length, flags, prot, _r, _r ? errno : 0, _cfn, _coff);\n'
                '\t}\n'
                '#endif\n'
                '\treturn _r;\n}')
