@@ -147,18 +147,17 @@ if os.path.exists(cfg):
 cfg = os.path.join(mono, 'cmake', 'config.h.in')
 if os.path.exists(cfg):
     s = open(cfg, encoding='utf-8', errors='replace').read()
-    if '#cmakedefine HAVE_PTHREAD_JIT_WRITE_PROTECT_NP' in s:
-        s2 = s.replace('#cmakedefine HAVE_PTHREAD_JIT_WRITE_PROTECT_NP',
-                       '/* #undef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP  [Nebula iOS] 真机实锤：pjwp 符号桩直调 SIGSEGV，强制剔除（见 build_mono_ios.sh (a3)） */')
+    # 用整行正则替换：.in 原始行形如「#cmakedefine HAVE_... 1」（行尾带残值），
+    # 若只 replace 子串会把行尾「 1」残留在注释 /* */ 之外 → config.h 生成
+    # 「... */ 1」→ clang 报 expected identifier or '('（真机 40503382253 即死于此）。
+    # 整行吃尽，彻底消除该宏（defined() 与 #if 下均不可见）。
+    _re_pat = _re.compile(r'^#(?:cmakedefine|define)\s+HAVE_PTHREAD_JIT_WRITE_PROTECT_NP\b.*$', _re.M)
+    if _re_pat.search(s):
+        s2 = _re_pat.sub(
+            '/* #undef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP  [Nebula iOS] 第八轮强制剔除 pjwp 直调，见 build_mono_ios.sh (a3) */',
+            s)
         open(cfg, 'w', encoding='utf-8').write(s2)
-        print("    config.h.in: HAVE_PTHREAD_JIT_WRITE_PROTECT_NP → 强制 #undef（iOS 第八轮反转定案）")
-    elif '#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP' in s:
-        s2 = s.replace('#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 1',
-                       '/* #undef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP  [Nebula iOS] 强制剔除 */')
-        s2 = s2.replace('#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP',
-                        '/* #undef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP  [Nebula iOS] 强制剔除 */')
-        open(cfg, 'w', encoding='utf-8').write(s2)
-        print("    config.h.in: 已存在的 HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 定义 → 强制剔除")
+        print("    config.h.in: HAVE_PTHREAD_JIT_WRITE_PROTECT_NP → 整行 #undef（吃掉行尾残值）")
     else:
         print("    config.h.in: 无 HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 残留，跳过")
 
