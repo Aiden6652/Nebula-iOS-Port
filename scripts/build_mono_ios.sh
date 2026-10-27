@@ -151,7 +151,7 @@ if os.path.exists(cfg):
     # 若只 replace 子串会把行尾「 1」残留在注释 /* */ 之外 → config.h 生成
     # 「... */ 1」→ clang 报 expected identifier or '('（真机 40503382253 即死于此）。
     # 整行吃尽，彻底消除该宏（defined() 与 #if 下均不可见）。
-    _re_pat = _re.compile(r'^#(?:cmakedefine|define)\s+HAVE_PTHREAD_JIT_WRITE_PROTECT_NP\b.*$', _re.M)
+    _re_pat = re.compile(r'^#(?:cmakedefine|define)\s+HAVE_PTHREAD_JIT_WRITE_PROTECT_NP\b.*$', re.M)
     if _re_pat.search(s):
         s2 = _re_pat.sub(
             '/* #undef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP  [Nebula iOS] 第八轮强制剔除 pjwp 直调，见 build_mono_ios.sh (a3) */',
