@@ -305,12 +305,19 @@ static void load_cfg(const char *dir) {
 
 // 必须在 mono_jit_init 之前调用才生效
 static void apply_gc_env(void) {
-    if (CFG.gc_nursery_mb > 0) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "nursery-size=%dm", CFG.gc_nursery_mb);
-        setenv("MONO_GC_PARAMS", buf, 1);
-        printf("[host] MONO_GC_PARAMS=%s\n", buf);
-    }
+    // [Nebula iOS 第十轮] 强制串行（非并发）major GC：
+    // 默认 marksweep-conc 在并发标记阶段会把老年代页 mprotect 成只读，依赖
+    // SIGSEGV 写屏障（managed 代码写 RO 页 → SIGSEGV → mono 处理器记录 card）。
+    // 但 StikDebug 的 ptrace 会先抢走 SIGSEGV，mono 处理器收不到 → RO 页写入
+    // 持续 fault → SIGKILL（无 .ips）。实锤死点 _sgen_los_pin_objects 正是
+    // finish_concurrent_mode 并发收尾路径。major=marksweep 用纯串行回收，无
+    // 并发标记、无 RO 页保护、无 SIGSEGV 写屏障，彻底规避调试器冲突。
+    char buf[128];
+    int off = snprintf(buf, sizeof(buf), "major=marksweep");
+    if (CFG.gc_nursery_mb > 0)
+        off += snprintf(buf + off, sizeof(buf) - off, ",nursery-size=%dm", CFG.gc_nursery_mb);
+    setenv("MONO_GC_PARAMS", buf, 1);
+    printf("[host] MONO_GC_PARAMS=%s\n", buf);
     // 单一编译器（JIT）版：不再有解释器分支，统一走 JIT（见下方 mono_setmmapjit）。
     // [Nebula iOS 第九轮] 全协作挂起：mono 默认 full preemptive 挂起靠线程信号
     // （pthread_kill suspend signal），StikDebug 的 ptrace 会先抢走信号 → 挂起
