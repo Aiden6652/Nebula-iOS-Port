@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-24}"
+CACHE_VERSION="${CACHE_VERSION:-25}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -498,6 +498,55 @@ if mm:
     # 内部调用的 register/unregister 对外不可见）。
     s2 = s.replace(_old_guard, _new_guard, 1)
     s2 = wx_block + s2
+
+    # (b5) [Nebula iOS 第九轮] mmap 剥 EXEC——真机 b103e3a 定案：
+    #      mmap 直接带 EXEC 的匿名页执行即被 codesigning monitor 秒杀（SIGKILL 无
+    #      .ips，死点=mono_runtime_init 首次 mono_object_new 调 JIT trampoline）；
+    #      而 mmap RW 起步 + mprotect 加 EXEC 的页执行 OK（host 冒烟路线 F 双循环
+    #      实证）。两者走内核不同校验路径：mprotect-EXEC 走调试态豁免，mmap-EXEC
+    #      被当静态代码段走签名校验。故 iOS 上 EXEC 一律剥离，mmap 成功后 mprotect
+    #      加回。macOS 分支原样保留。
+    _mmap_old = ('\tptr = mmap (addr, length, prot, mflags, -1, 0);\n'
+                 '\tif (ptr == MAP_FAILED) {\n'
+                 '\t\tint fd = open ("/dev/zero", O_RDONLY);\n'
+                 '\t\tif (fd != -1) {\n'
+                 '\t\t\tptr = mmap (addr, length, prot, mflags, fd, 0);\n'
+                 '\t\t\tclose (fd);\n'
+                 '\t\t}\n'
+                 '\t}\n')
+    _mmap_new = (
+        '#if defined(TARGET_IOS)\n'
+        '\t/* [Nebula iOS 第九轮] mmap 不直接带 EXEC：mmap-EXEC 匿名页执行即被\n'
+        '\t   codesigning monitor 秒杀；mprotect 加 EXEC 走调试态豁免路径（冒烟\n'
+        '\t   路线 F 实证可执行）。EXEC 剥离后 mmap，成功再 mprotect 加回。 */\n'
+        '\t{\n'
+        '\t\tint _neb_prot_noexec = prot & ~PROT_EXEC;\n'
+        '\t\tptr = mmap (addr, length, _neb_prot_noexec, mflags, -1, 0);\n'
+        '\t\tif (ptr == MAP_FAILED) {\n'
+        '\t\t\tint fd = open ("/dev/zero", O_RDONLY);\n'
+        '\t\t\tif (fd != -1) {\n'
+        '\t\t\t\tptr = mmap (addr, length, _neb_prot_noexec, mflags, fd, 0);\n'
+        '\t\t\t\tclose (fd);\n'
+        '\t\t\t}\n'
+        '\t\t}\n'
+        '\t\tif (ptr != MAP_FAILED && (prot & PROT_EXEC)) {\n'
+        '\t\t\tif (mprotect (ptr, length, prot) == 0) {\n'
+        '\t\t\t\tneb_wx_log ("valloc EXEC re-add OK %p len=%zu prot=%d", ptr, length, prot);\n'
+        '\t\t\t} else {\n'
+        '\t\t\t\tneb_wx_log ("valloc EXEC re-add FAILED %p len=%zu errno=%d", ptr, length, errno);\n'
+        '\t\t\t\tmunmap (ptr, length);\n'
+        '\t\t\t\tptr = MAP_FAILED;\n'
+        '\t\t\t}\n'
+        '\t\t}\n'
+        '\t}\n'
+        '#else\n'
+        + _mmap_old +
+        '#endif\n')
+    if s2.count(_mmap_old) != 1:
+        print("    !! mono-mmap.c: mono_valloc mmap 锚点未唯一命中 (%d)" % s2.count(_mmap_old), file=sys.stderr)
+        sys.exit(1)
+    s2 = s2.replace(_mmap_old, _mmap_new, 1)
+    print("    mono_valloc: iOS mmap 剥 EXEC + mprotect 加回（第九轮）")
 
     # mono_valloc 成功 → 登记（含 EXEC 请求的才登记；内核对 RWX 实际只给 rw-，
     # mono 随后的写入天然可行，执行交给 disable_write 翻 RX）

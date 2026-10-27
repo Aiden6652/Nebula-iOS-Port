@@ -312,6 +312,11 @@ static void apply_gc_env(void) {
         printf("[host] MONO_GC_PARAMS=%s\n", buf);
     }
     // 单一编译器（JIT）版：不再有解释器分支，统一走 JIT（见下方 mono_setmmapjit）。
+    // [Nebula iOS 第九轮] 全协作挂起：mono 默认 full preemptive 挂起靠线程信号
+    // （pthread_kill suspend signal），StikDebug 的 ptrace 会先抢走信号 → 挂起
+    // 机制废 → 死锁/KILL。coop 模式纯靠 safepoint 自挂，无信号依赖。
+    setenv("MONO_THREADS_SUSPEND", "coop", 1);
+    printf("[host] MONO_THREADS_SUSPEND=coop（全协作挂起，规避 ptrace 信号抢占）\n");
 }
 
 // ---------------------------------------------------------------- RSS + 看门狗
