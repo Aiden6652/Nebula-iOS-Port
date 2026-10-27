@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-23}"
+CACHE_VERSION="${CACHE_VERSION:-24}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -134,26 +134,33 @@ if os.path.exists(cfg):
     else:
         print("    !! config.h.in 未匹配到 #cmakedefine DISABLE_JIT", file=sys.stderr)
 
-# (a3) iOS 强制定义 HAVE_PTHREAD_JIT_WRITE_PROTECT_NP：
-#      cross-compile 下 cmake 的 check_symbol_exists 默认 no，导致 mono-codeman.c 的
-#      W^X 翻转守卫（#if HAVE_... && TARGET_OSX）不编译 → iOS 上写 MAP_JIT 内存
-#      从不翻转写保护，mono_jit_init 生成 trampoline 即 SIGSEGV（standard/pro 同崩）。
-#      iOS 14+ 的 libsystem_pthread 已导出该符号（配 StikDebug 的 CS_DEBUGGED JIT 能力可用）。
+# (a3) [Nebula iOS 第八轮 2026-10-27 反转定案] 强制【不定义】HAVE_PTHREAD_JIT_WRITE_PROTECT_NP：
+#      真机 5faa94b 轮实锤：强制 #define 后 mono-codeman.c 上游函数体的
+#      pthread_jit_write_protect_np 直调被编译进去，而本机 dlsym 解析不到该符号
+#      （wx-init toggle=n 实证）→ supported_np 实测返回 1 → 上游必然调 pjwp(0)
+#      → 符号桩 br 0 → SIGSEGV (signal 11 @ mono_jit_init，死点紧跟 set_write(1)
+#      done，被 host signal handler 抓到——与此前 SIGKILL 无 .ips 表现互斥，定性吻合)。
+#      全局 APRR 翻转路线整体废除，W^X 统一走 nebula 每页 mprotect（fb188cb 真机
+#      16 轮 set_write(1/0) 翻转全程稳 + host 冒烟路线 F 执行 OK，双重实证）。
+#      cross-compile 下 cmake check_symbol_exists 本来就是 no，这里把 cmakedefine
+#      显式改写为 #undef 注释，防止任何构建路径把它带回来。
 cfg = os.path.join(mono, 'cmake', 'config.h.in')
 if os.path.exists(cfg):
     s = open(cfg, encoding='utf-8', errors='replace').read()
     if '#cmakedefine HAVE_PTHREAD_JIT_WRITE_PROTECT_NP' in s:
         s2 = s.replace('#cmakedefine HAVE_PTHREAD_JIT_WRITE_PROTECT_NP',
-                       '#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 1 /* [Nebula iOS] iOS 14+ 已导出，配 StikDebug 可用 */')
+                       '/* #undef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP  [Nebula iOS] 真机实锤：pjwp 符号桩直调 SIGSEGV，强制剔除（见 build_mono_ios.sh (a3)） */')
         open(cfg, 'w', encoding='utf-8').write(s2)
-        print("    config.h.in: HAVE_PTHREAD_JIT_WRITE_PROTECT_NP → 强制 #define（iOS）")
-    elif 'HAVE_PTHREAD_JIT_WRITE_PROTECT_NP' not in s:
-        s += "\n/* [Nebula iOS] 强制定义：iOS 14+ libsystem_pthread 已导出，配 StikDebug JIT 能力可用 */\n"
-        s += "#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 1\n"
-        open(cfg, 'w', encoding='utf-8').write(s)
-        print("    config.h.in: 末尾追加 HAVE_PTHREAD_JIT_WRITE_PROTECT_NP=1（iOS）")
+        print("    config.h.in: HAVE_PTHREAD_JIT_WRITE_PROTECT_NP → 强制 #undef（iOS 第八轮反转定案）")
+    elif '#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP' in s:
+        s2 = s.replace('#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 1',
+                       '/* #undef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP  [Nebula iOS] 强制剔除 */')
+        s2 = s2.replace('#define HAVE_PTHREAD_JIT_WRITE_PROTECT_NP',
+                        '/* #undef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP  [Nebula iOS] 强制剔除 */')
+        open(cfg, 'w', encoding='utf-8').write(s2)
+        print("    config.h.in: 已存在的 HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 定义 → 强制剔除")
     else:
-        print("    config.h.in: HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 已存在，跳过")
+        print("    config.h.in: 无 HAVE_PTHREAD_JIT_WRITE_PROTECT_NP 残留，跳过")
 
 # (a2) 兜底：中和构建系统里可能存在的 -DDISABLE_JIT / add_compile_definitions(DISABLE_JIT) / add_definitions(...DISABLE_JIT...)
 for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
@@ -197,17 +204,18 @@ for root, dirs, files in os.walk(os.path.join(mono, 'mono')):
 #           解析不到 → 跳过翻转，内核已把 MAP_JIT 页当 RWX 给，可直接写。
 #     翻转的 NULL 安全由 (c) 的 dlsym 探测保证，本 (.b) 块不再改 mono-mmap.c。
 
-# (c) [Nebula iOS] W^X 双保险翻转（恢复 mono 官方 pthread_jit_write_protect_np 全局
-#     APRR 翻转 + 每页 mprotect 兜底，与 .NET/Pojav 在 iOS 的做法一致）：
-#     真机 2026-10-26~27 六轮复盘：上传的 fb188cb dylib 经符号化确认【根本不引用】
-#     pthread_jit_write_protect_np——此前本块用 nebula_mono_wx_set_write + return
-#     把 enable/disable_write 整个短路，旁路了上游这套全局翻转，JIT 页在 Apple Silicon
-#     上无法正确切换可执行态 → 执行即 SIGKILL 无 .ips。
-#     修复：去掉 return，恢复上游 __builtin_available(macOS 11, iOS 14) 守卫下的
-#     pthread_jit_write_protect_np((0)可写/(1)可执行) 直连调用（dyld 经 -Wl,-U 从
-#     libSystem 绑定，iOS 14+ 导出，配 StikDebug/CS_DEBUGGED 可用）；同时保留
-#     nebula_mono_wx_set_write 每页 mprotect 兜底（非 MAP_JIT 普通页靠它，真机路线 F
-#     已验证）。两条路径双保险，且都不再 return 短路。macOS 分支行为不变。
+# (c) [Nebula iOS 第八轮 2026-10-27 定案] W^X 单线路：nebula 每页 mprotect 翻转。
+#     真机 5faa94b 轮实锤：全局 APRR 翻转（pthread_jit_write_protect_np 直连）在
+#     本机不可用——dlsym 解析不到（wx-init toggle=n），supported_np 却返回 1，
+#     上游 if(supported) pjwp(0) 必进死桩 → SIGSEGV (signal 11 @ mono_jit_init)。
+#     修复三板斧：
+#       1) (a3) config.h.in 强制 #undef，上游 HAVE_... 守卫的 pjwp 调用编译剔除；
+#       2) 本 TU 顶部宏废除 pthread_jit_write_protect_np / supported_np（防其它
+#          守卫组合漏网；supported_np 真机实测返回 1，必须一并废除）；
+#       3) mono-mmap.c wx_block 提供 pjwp no-op 强符号兜底（防其它 TU 残留引用，
+#          dyld 两级命名空间下优先解析到同 dylib 的强符号，永不踩桩）。
+#     W^X 全线 = nebula_mono_wx_set_write 每页 mprotect（fb188cb 真机 16 轮翻转
+#     全程稳 + host 冒烟路线 F RW 写→R-X 执行 OK 反复折磨通过，双重实证）。
 import re as _re
 cm = os.path.join(mono, 'mono', 'utils', 'mono-codeman.c')
 if os.path.exists(cm):
@@ -233,15 +241,21 @@ if os.path.exists(cm):
                  lambda m: m.group(1) + probe, s2, count=1)
     n2 = _re.sub(r'(mono_codeman_disable_write \(void\)\s*\{\n)',
                  lambda m: m.group(1) + probe_off, n1, count=1)
-    # 补齐声明：return 后原调用是死代码，但编译期仍需声明，否则
-    # -Werror=implicit-function-declaration 报错（实测 run 40098995257）。
+    # 声明 + 本 TU 宏废除 pjwp：supported_np 真机实测返回 1（host 冒烟实锤），
+    # 上游 if (supported) pjwp(0) 会放行进死桩，两个符号必须一起废。
     decl = ('\n'
             '#if defined(__APPLE__)\n'
             '/* [Nebula iOS] mprotect W^X 翻转（实现在 mono-mmap.c (b3)：登记的 JIT 区全局\n'
-            '   mprotect 翻 RW/R-X，真机 2026-10-25 路线 F 已验证） */\n'
+            '   mprotect 翻 RW/R-X，真机 fb188cb 16 轮 set_write 翻转 + 路线 F 执行实证） */\n'
             'extern void nebula_mono_wx_set_write (int writable);\n'
-            '/* 死代码声明补齐：return 之后的原翻转调用仍会编译 */\n'
-            'extern void pthread_jit_write_protect_np(int enabled);\n'
+            '/* [Nebula iOS 第八轮 2026-10-27 定案] 本机 dlsym 解析不到\n'
+            '   pthread_jit_write_protect_np（wx-init toggle=n 实证），supported_np 却返回 1，\n'
+            '   上游直调 pjwp 即符号桩 SIGSEGV（signal 11 @ mono_jit_init，死点紧跟\n'
+            '   set_write(1) done）。全局 APRR 翻转整体废除，本 TU 全部调用点宏废除；\n'
+            '   其它 TU 残留引用由 mono-mmap.c wx_block 的 no-op 强符号兜底。 */\n'
+            'static inline void nebula_pjwp_disabled (int enabled) { (void)enabled; }\n'
+            '#define pthread_jit_write_protect_np(...) nebula_pjwp_disabled (__VA_ARGS__)\n'
+            '#define pthread_jit_write_protect_supported_np() 0\n'
             '#endif\n')
     _incs = list(_re.finditer(r'(?m)^#\s*include\b.*$', n2))
     if _incs:
@@ -471,6 +485,13 @@ if mm:
         '{\n'
         '\tneb_wx_log ("%s", msg);\n'
         '}\n'
+        '\n'
+        '/* [Nebula iOS 第八轮] pjwp no-op 强符号兜底：真机实锤本机 dlsym 解析不到\n'
+        '   pthread_jit_write_protect_np（wx-init toggle=n），任何 TU 残留引用一旦\n'
+        '   走到 dyld 绑定即踩符号桩 SIGSEGV（signal 11 @ mono_jit_init 实锤）。\n'
+        '   本 dylib 内定义强符号后，两级命名空间下所有引用优先绑定到此 no-op，\n'
+        '   永不踩桩。codeman 主调用点已宏废除，此定义纯为链接兜底。 */\n'
+        'void pthread_jit_write_protect_np (int enabled) { (void)enabled; }\n'
         '#endif /* __APPLE__ */\n'
         '\n')
     # 守卫只做短路改写（iOS 不编译 MAP_JIT 块）；wx_block（函数定义+全局变量）
