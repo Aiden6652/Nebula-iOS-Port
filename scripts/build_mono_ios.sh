@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-25}"
+CACHE_VERSION="${CACHE_VERSION:-26}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -516,16 +516,19 @@ if mm:
                  '\t}\n')
     _mmap_new = (
         '#if defined(TARGET_IOS)\n'
-        '\t/* [Nebula iOS 第九轮] mmap 不直接带 EXEC：mmap-EXEC 匿名页执行即被\n'
-        '\t   codesigning monitor 秒杀；mprotect 加 EXEC 走调试态豁免路径（冒烟\n'
-        '\t   路线 F 实证可执行）。EXEC 剥离后 mmap，成功再 mprotect 加回。 */\n'
+        '\t/* [Nebula iOS 第九/十一轮] mmap 剥 EXEC + 剥 MAP_JIT：\n'
+        '\t   - mmap-EXEC 匿名页执行即被 codesigning monitor 秒杀（第九轮定案），\n'
+        '\t     EXEC 剥离后 mmap，成功再 mprotect 加回（冒烟路线 F 实证可执行）；\n'
+        '\t   - MAP_JIT 剥除（第十一轮）：真机冒烟实证 MAP_JIT mmap 必 EPERM\n'
+        '\t     （无 JIT entitlement），带着只会 MAP_FAILED；防御上游任意块注入。 */\n'
         '\t{\n'
         '\t\tint _neb_prot_noexec = prot & ~PROT_EXEC;\n'
-        '\t\tptr = mmap (addr, length, _neb_prot_noexec, mflags, -1, 0);\n'
+        '\t\tunsigned _neb_flags = mflags & ~MAP_JIT;\n'
+        '\t\tptr = mmap (addr, length, _neb_prot_noexec, _neb_flags, -1, 0);\n'
         '\t\tif (ptr == MAP_FAILED) {\n'
         '\t\t\tint fd = open ("/dev/zero", O_RDONLY);\n'
         '\t\t\tif (fd != -1) {\n'
-        '\t\t\t\tptr = mmap (addr, length, _neb_prot_noexec, mflags, fd, 0);\n'
+        '\t\t\t\tptr = mmap (addr, length, _neb_prot_noexec, _neb_flags, fd, 0);\n'
         '\t\t\t\tclose (fd);\n'
         '\t\t\t}\n'
         '\t\t}\n'
@@ -594,6 +597,14 @@ if mm:
                '\t\tneb_wx_log ("mprotect-EXEC %p len=%zu prot_out=%d ret=%d errno=%d registered_before=%d caller=%s+0x%lx", addr, length, prot, _r, _r ? errno : 0, was, _cfn, _coff);\n'
                '\t} else {\n'
                '\t\tneb_wx_log ("mprotect %p len=%zu flags_in=%d prot_out=%d ret=%d errno=%d caller=%s+0x%lx", addr, length, flags, prot, _r, _r ? errno : 0, _cfn, _coff);\n'
+               '\t\t/* [Nebula iOS 第十一轮] 写读探针：RW 翻转 ret=0 后立即实测可写性。\n'
+               '\t   若下轮真机日志无 probeRW 行 → 死在这写页一步（mprotect 假成功/内核延迟效应）；\n'
+               '\t   若 probeRW OK 出现 → 写页没问题，死点在之后（mono_jit_init 首次执行 JIT 代码）。 */\n'
+               '\t\tif (_r == 0 && (prot & PROT_WRITE) && (prot & PROT_READ) && length <= 65536) {\n'
+               '\t\t\tvolatile int *_pp = (volatile int *) addr;\n'
+               '\t\t\tint _oldv = *_pp; *_pp = 0x4E45425A; int _rb = *_pp; *_pp = _oldv;\n'
+               '\t\t\tneb_wx_log ("probeRW %p len=%zu OK rb=%d", addr, length, _rb == 0x4E45425A);\n'
+               '\t\t}\n'
                '\t}\n'
                '#endif\n'
                '\treturn _r;\n}')

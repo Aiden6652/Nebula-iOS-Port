@@ -900,6 +900,43 @@ static int nebula_jit_smoke(void)
         if (!ok && p) { munmap(p, 4096); p = NULL; }
     }
 
+    // ── 路线 G（纯诊断，不影响 ok 放行逻辑）：复刻 mono_valloc 真实序列 ──
+    // mono JIT 区 = mmap(剥EXEC) → mprotect(RWX)（第九轮 re-add 同款 prot=7）
+    //             → set_write 翻 RW 写 trampoline → 翻 RX 执行。
+    // 若 G 执行死（SIGKILL 无日志）→ "RWX 起步页执行被杀"实锤，re-add 策略要改；
+    // 若 G 执行 OK → mono 同款序列在真机畅通，死因在 mono 侧其他路径。
+    {
+        void *g = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (g == MAP_FAILED) {
+            hlog("[host] 冒烟: 路线G mmap 被拒 errno=%d", errno);
+        } else if (mprotect(g, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            hlog("[host] 冒烟: 路线G mprotect RWX 被拒 errno=%d", errno);
+            munmap(g, 4096);
+        } else {
+            hlog("[host] 冒烟: 路线G re-add RWX OK %p (mono 同款), 翻 RW 写 ...", g);
+            if (mprotect(g, 4096, PROT_READ | PROT_WRITE) != 0) {
+                hlog("[host] 冒烟: 路线G 翻 RW 被拒 errno=%d", errno);
+            } else {
+                *(unsigned int *)g = ret_insn;
+                if (mprotect(g, 4096, PROT_READ | PROT_EXEC) != 0) {
+                    hlog("[host] 冒烟: 路线G 翻 RX 被拒 errno=%d", errno);
+                } else {
+                    sys_icache_invalidate(g, 4096);
+                    hlog("[host] 冒烟: 路线G 翻 RX OK, 试执行（若死在这=RWX起步页执行被杀）...");
+                    if (sigsetjmp(g_smoke_jmp, 1) == 0) {
+                        ((void (*)(void))g)();
+                        hlog("[host] 冒烟: 路线G 执行 OK —— mono 同款序列(RWX起步)畅通!");
+                    } else {
+                        hlog("[host] 冒烟: 路线G 执行段错误 signal=%d fault=%p",
+                             g_smoke_sig, g_smoke_fault);
+                    }
+                }
+            }
+            munmap(g, 4096);
+        }
+    }
+
     // ── 路线 A：MAP_JIT mmap(R-X) + mach_vm_write 自写（调试态首选）──
     // debugserver 给被调试进程写内存就用 mach_vm_write；本进程 CS_DEBUGGED=1，
     // 同款原语对自家 MAP_JIT 页写入，绕开 mprotect 被压死的 W^X 检查。
