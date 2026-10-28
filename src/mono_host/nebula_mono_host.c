@@ -49,6 +49,7 @@ extern void mono_setmmapjit (int flag);
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/task_info.h>
+#include <mach/exception.h>        // EXC_BAD_ACCESS / MACH_EXCEPTION_CODES（第十五轮 mach 取证）
 #include <setjmp.h>                // sigsetjmp/siglongjmp（冒烟段错误兜底）
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
@@ -676,6 +677,95 @@ static void neb_install_trap(void)
         sigaction(sigs[i], &sa, NULL);
 }
 
+/* —— [第十五轮] thread 级 mach 异常端口：先于 BSD signal 抓取真实 fault 地址 ——
+ * 背景：mono 在 mono_jit_init 内部装了自家的 SIGSEGV handler，覆盖了我们第十二轮的
+ * SA_SIGINFO trap，导致 si_addr（真实故障地址）抓不到。BSD signal 改不了这个顺序，
+ * 但 mach 异常端口在 BSD signal 之前投递，且我们只在【当前 boot 线程】上装
+ * thread-level 端口（不碰 StikDebug 的 task-level 端口，JIT 放行不受影响）。
+ * 收到 EXC_BAD_ACCESS 后打印 fault_addr / fault_pc 再回复 KERN_FAILURE，让内核
+ * 把信号照常投递给 mono 的 handler（mono 的崩溃报告照常生成）。 */
+static mach_port_t g_neb_exc_port = MACH_PORT_NULL;
+
+typedef struct {
+    mach_msg_header_t         head;
+    mach_msg_body_t           body;
+    mach_msg_port_descriptor_t thread;
+    mach_msg_port_descriptor_t task;
+    NDR_record_t              ndr;
+    exception_type_t          exc;
+    mach_msg_type_number_t    code_count;
+    int64_t                   code[2];
+} neb_exc_msg_t;
+
+static void *neb_exc_loop(void *arg)
+{
+    mach_port_t port = (mach_port_t)(uintptr_t)arg;
+    for (;;) {
+        neb_exc_msg_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.head.msgh_size = sizeof(msg);
+        kern_return_t kr = mach_msg(&msg.head, MACH_RCV_MSG, 0, sizeof(msg), port,
+                                    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        if (kr != KERN_SUCCESS) continue;
+        uintptr_t fa = 0, fp = 0;
+        if (msg.exc == EXC_BAD_ACCESS && msg.code_count >= 2) {
+            fa = (uintptr_t)msg.code[1];   // EXC_BAD_ACCESS: code[1] = 故障虚拟地址
+            fp = (uintptr_t)msg.code[0];
+        } else if (msg.code_count >= 1) {
+            fp = (uintptr_t)msg.code[0];
+        }
+        if (g_logfp) {
+            char fdesc[256], pdesc[256];
+            snprintf(fdesc, sizeof(fdesc), "%s", fa ? "(未映射/无效地址)" : "(无)");
+            snprintf(pdesc, sizeof(pdesc), "%s", fp ? "(符号化失败)" : "(无)");
+            Dl_info di;
+            if (fp && dladdr((void *)fp, &di) && di.dli_fbase) {
+                const char *fn = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
+                snprintf(pdesc, sizeof(pdesc), "%s!%s+0x%lx", fn,
+                         di.dli_sname ? di.dli_sname : "?",
+                         (unsigned long)(fp - (uintptr_t)di.dli_fbase));
+            } else if (fp) {
+                snprintf(pdesc, sizeof(pdesc), "0x%lx 无模块归属(可能=JIT生成代码地址)", (unsigned long)fp);
+            }
+            fprintf(g_logfp,
+                    "!! [mach-exc] type=%d fault_addr=0x%lx(%s) fault_pc=0x%lx %s\n"
+                    "   最后步骤: %s   RSS=%ldMB\n",
+                    (int)msg.exc, (unsigned long)fa, fdesc,
+                    (unsigned long)fp, pdesc,
+                    g_last_step ? g_last_step : "(null)", rss_mb());
+            fflush(g_logfp);
+        }
+        if (g_neb_log)
+            os_log(g_neb_log, "!! mach-exc type=%d fault_addr=0x%lx", (int)msg.exc, (unsigned long)fa);
+        /* 回复 KERN_FAILURE：内核把异常照常转为 signal，mono 的 handler 仍能捕获并打印报告 */
+        struct { mach_msg_header_t head; NDR_record_t ndr; kern_return_t ret; } rep;
+        memset(&rep, 0, sizeof(rep));
+        rep.head.msgh_size = sizeof(rep);
+        rep.head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(msg.head.msgh_bits), 0);
+        rep.head.msgh_remote_port = msg.head.msgh_remote_port;
+        rep.head.msgh_id = msg.head.msgh_id + 100;
+        rep.ndr = msg.ndr;
+        rep.ret = KERN_FAILURE;
+        mach_msg(&rep.head, MACH_SEND_MSG, sizeof(rep), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    }
+}
+
+static void neb_install_mach_trap(void)
+{
+    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_neb_exc_port);
+    if (kr != KERN_SUCCESS) { g_neb_exc_port = MACH_PORT_NULL; return; }
+    kr = mach_port_insert_right(mach_task_self(), g_neb_exc_port, g_neb_exc_port, MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) { g_neb_exc_port = MACH_PORT_NULL; return; }
+    /* 只在本线程（boot 线程，崩点所在）装 thread 级端口，避免覆盖 StikDebug 的 task 端口 */
+    kr = thread_set_exception_ports(mach_thread_self(),
+                                    EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION,
+                                    g_neb_exc_port, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, 0);
+    if (kr != KERN_SUCCESS) { g_neb_exc_port = MACH_PORT_NULL; return; }
+    pthread_t t;
+    if (pthread_create(&t, NULL, neb_exc_loop, (void *)(uintptr_t)g_neb_exc_port) == 0)
+        pthread_detach(t);
+}
+
 /* —— [第十二轮] stderr/stdout 捕获：mono 的遗言第一次进日志 —— */
 static int g_stdio_pipe[2] = { -1, -1 };
 
@@ -1258,6 +1348,7 @@ static void *boot_thread(void *arg) {
     neb_install_trap();
     neb_capture_stdio();
     hlog("[host] step: trap+stdio 捕获已装（mono 遗言将现形）");
+    neb_install_mach_trap();   // [第十五轮] thread 级 mach 端口：先于 BSD signal 抓真实 fault 地址
 #endif
 
     // 启动占位文本：Mono + BepInEx 初始化期间显示在屏幕正中，防黑屏误判死机。
