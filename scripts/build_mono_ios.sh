@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-29}"
+CACHE_VERSION="${CACHE_VERSION:-30}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -467,7 +467,15 @@ if mm:
         '\t   全线每页 mprotect 翻转。 */\n'
         '\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
         '\t\tif (!neb_wx_regions [i].active) continue;\n'
-        '\t\tint prot = PROT_READ | PROT_WRITE | PROT_EXEC  /* [Nebula iOS 第十四轮] 始终 RWX：对齐 mono iOS 假设（代码页逻辑 RWX，mono_codegen 直接写、执行前不翻 RX）；原翻 R-X 导致 mono_codegen 写 RX 页 SIGSEGV（实锤）。CS_DEBUGGED 调试态下 mprotect-EXEC 已验证可执行，RWX 同理 */;\n'
+        '\t\t/* [Nebula iOS 第十八轮 2026-10-29] 按 writable 真翻 APRR 世界（W^X 还原）：\n'
+        '\t\t   writable=1 -> RW(prot=3)：页在可写世界，mono_codegen 写代码不崩；\n'
+        '\t\t   writable=0 -> R-X(prot=5)：翻到可执行世界+刷 icache，执行不崩。\n'
+        '\t\t   第十四轮"始终 RWX(prot=7)"在 Apple Silicon APRR 下不可靠翻世界——\n'
+        '\t\t   MAP_JIT 页硬件任一时刻只能处于可写/可执之一，prot=7 不触发内核\n'
+        '\t\t   翻世界，执行瞬间仍处可写世界 -> 首条 stp x29,x30,[sp,#-0x70]! 不可\n'
+        '\t\t   执行 SIGSEGV（本机实锤 @ mono_jit_runtime_invoke）。真机冒烟路线 G\n'
+        '\t\t   (mprotect R-X 后执行 OK) 实证 prot=5 可翻到可执行世界。 */\n'
+        '\t\tint prot = writable ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);\n'
         '\t\tint mr = mprotect (neb_wx_regions [i].addr, neb_wx_regions [i].len, prot);\n'
         '\t\tneb_wx_log ("  mprotect %p len=%zu prot=%d ret=%d errno=%d", neb_wx_regions [i].addr, neb_wx_regions [i].len, prot, mr, mr ? errno : 0);\n'
         '\t\tif (mr == 0)\n'
