@@ -61,7 +61,6 @@ extern void mono_setmmapjit (int flag);
 #include <errno.h>
 #include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
 #include <unistd.h>                // getpid
-#include <ucontext.h>              // 崩溃现场 PC/LR/SP（第十二轮 trap）
 // sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
 // 故手动声明 csops 及其常量。csops 是 libSystem 真实导出的符号，运行/链接均可用。
 extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersize);
@@ -624,20 +623,12 @@ static void neb_crash(int sig)
 
 static void neb_jit_trap(int sig, siginfo_t *si, void *ucv)
 {
-    uintptr_t pc = 0, lr = 0, sp = 0;
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-    ucontext_t *uc = (ucontext_t *)ucv;
-    if (uc && uc->uc_mcontext) {
-        pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
-        lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
-        sp = (uintptr_t)uc->uc_mcontext->__ss.__sp;
-    }
-#else
     (void)ucv;
-#endif
-    char pdesc[256], ldesc[256];
+    // Darwin 上 SIGSEGV/SIGBUS/SIGILL 的 si_addr 即故障指令 PC（够定位），
+    // 无需 ucontext.h（iOS SDK 要求 _XOPEN_SOURCE，会带崩编译）。
+    uintptr_t pc = (uintptr_t)(si ? si->si_addr : NULL);
+    char pdesc[256];
     snprintf(pdesc, sizeof(pdesc), "%s", pc ? "(符号化失败)" : "(无)");
-    snprintf(ldesc, sizeof(ldesc), "%s", lr ? "(符号化失败)" : "(无)");
     Dl_info di;
     if (pc && dladdr((void *)pc, &di) && di.dli_fbase) {
         const char *fn = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
@@ -647,27 +638,17 @@ static void neb_jit_trap(int sig, siginfo_t *si, void *ucv)
     } else if (pc) {
         snprintf(pdesc, sizeof(pdesc), "0x%lx 无模块归属 → JIT 生成代码区", (unsigned long)pc);
     }
-    if (lr && dladdr((void *)lr, &di) && di.dli_fbase) {
-        const char *fn = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
-        snprintf(ldesc, sizeof(ldesc), "%s!%s+0x%lx", fn,
-                 di.dli_sname ? di.dli_sname : "?",
-                 (unsigned long)(lr - (uintptr_t)di.dli_fbase));
-    } else if (lr) {
-        snprintf(ldesc, sizeof(ldesc), "0x%lx 无模块归属 → JIT 生成代码区", (unsigned long)lr);
-    }
     if (g_logfp) {
         fprintf(g_logfp,
                 "!! [trap] signal=%d si_code=%d si_addr=%p\n"
-                "   pc=0x%lx %s\n   lr=0x%lx %s\n   sp=0x%lx\n"
-                "   最后步骤: %s\n   RSS=%ldMB\n",
+                "   故障PC=0x%lx %s\n   最后步骤: %s\n   RSS=%ldMB\n",
                 sig, si ? si->si_code : 0, si ? si->si_addr : NULL,
-                (unsigned long)pc, pdesc, (unsigned long)lr, ldesc,
-                (unsigned long)sp,
+                (unsigned long)pc, pdesc,
                 g_last_step ? g_last_step : "(null)", rss_mb());
         fflush(g_logfp);
     }
     if (g_neb_log)
-        os_log(g_neb_log, "!! trap sig=%d pc=%s lr=%s", sig, pdesc, ldesc);
+        os_log(g_neb_log, "!! trap sig=%d pc=%s", sig, pdesc);
     /* 还原默认处置再重发：让系统照常生成崩溃报告（若它还愿意生成的话） */
     struct sigaction d;
     memset(&d, 0, sizeof(d));
