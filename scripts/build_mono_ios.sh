@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-26}"
+CACHE_VERSION="${CACHE_VERSION:-27}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -467,10 +467,10 @@ if mm:
         '\t   全线每页 mprotect 翻转。 */\n'
         '\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
         '\t\tif (!neb_wx_regions [i].active) continue;\n'
-        '\t\tint prot = writable ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);\n'
+        '\t\tint prot = PROT_READ | PROT_WRITE | PROT_EXEC  /* [Nebula iOS 第十四轮] 始终 RWX：对齐 mono iOS 假设（代码页逻辑 RWX，mono_codegen 直接写、执行前不翻 RX）；原翻 R-X 导致 mono_codegen 写 RX 页 SIGSEGV（实锤）。CS_DEBUGGED 调试态下 mprotect-EXEC 已验证可执行，RWX 同理 */;\n'
         '\t\tint mr = mprotect (neb_wx_regions [i].addr, neb_wx_regions [i].len, prot);\n'
         '\t\tneb_wx_log ("  mprotect %p len=%zu prot=%d ret=%d errno=%d", neb_wx_regions [i].addr, neb_wx_regions [i].len, prot, mr, mr ? errno : 0);\n'
-        '\t\tif (mr == 0 && !writable)\n'
+        '\t\tif (mr == 0)\n'
         '\t\t\tsys_icache_invalidate (neb_wx_regions [i].addr, neb_wx_regions [i].len);\n'
         '\t}\n'
         '\tneb_wx_log ("set_write(%d) done", writable);\n'
