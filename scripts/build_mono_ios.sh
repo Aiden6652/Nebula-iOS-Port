@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-27}"
+CACHE_VERSION="${CACHE_VERSION:-28}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -663,6 +663,21 @@ else:
 #     注意：add_library(monosgen-shared SHARED) 在文件里出现两次（Windows 分支 + iOS/macOS 分支），
 #     find() 会命中第一个（Windows）导致加错目标。改用 iOS 分支里已生效的
 #     add_linker_flag(-Wl,-hidden-licudata) 作为锚点（ICU flags 已证明该分支的 add_linker_flag 进链接命令）。
+
+# (a4) [Nebula iOS 第十六轮 2026-10-28] 强制纯 JIT：mono_aot_only=0。
+#   根因：iOS 构建默认 mono_aot_only=1，使虚表/接口分派等引用走 AOT 重定基——
+#   生成代码里 emit 的是「rva 偏移」（如 0x63FDA90），运行时需 AOT runtime 加回
+#   镜像基址(含 ASLR slide)。但本工程未加载任何 AOT 镜像、纯 JIT 运行，于是
+#   这些引用只 emit 了 rva 偏移、缺运行时基址 → ldr x17,[0x63FDA90] 读未映射区 →
+#   SIGSEGV（实锤于 runtime_invoke trampoline，Native Crash Reporting 反汇编解码）。
+#   修复：用 -include 在所有 mono/mini TU 顶部强制 #define mono_aot_only 0，
+#   走非 AOT 分支——mini-arm64.c 的 IMT/虚表发射改用全指针
+#   emit_imm64((guint64)&(vtable->vtable[slot]))，不再依赖 rva+基址重定基。
+#   注意：mono_aot_only 由 cmake 以 -D 注入，故用 #undef 再 #define 覆盖（无重定义错误）。
+_force_h = os.path.join(mono, 'mono', 'mini', 'nebula_force_jit.h')
+with open(_force_h, 'w', encoding='utf-8') as _fh:
+    _fh.write('#undef mono_aot_only\n#define mono_aot_only 0\n')
+print("    创建强制 JIT 头:", os.path.relpath(_force_h, mono))
 mini_cmake = os.path.join(mono, 'mono', 'mini', 'CMakeLists.txt')
 if os.path.exists(mini_cmake):
     s = open(mini_cmake, encoding='utf-8', errors='replace').read()
@@ -678,6 +693,14 @@ if os.path.exists(mini_cmake):
         print("    mono/mini/CMakeLists.txt: iOS 分支加 add_linker_flag(-Wl,-U,_pthread_jit_write_protect_np)")
     else:
         print("    !! 找不到 add_linker_flag(-Wl,-hidden-licudata) 锚点（iOS 分支可能已改结构）", file=sys.stderr)
+    # (a4) 强制纯 JIT：独立于锚点注入。所有 mono/mini TU 顶部 -include 覆盖头（mono_aot_only=0）
+    if 'nebula_force_jit.h' not in s:
+        _inc = 'add_compile_options(-include %s)\n' % _force_h
+        s = _inc + s
+        open(mini_cmake, 'w', encoding='utf-8').write(s)
+        print("    mono/mini/CMakeLists.txt: 注入 -include nebula_force_jit.h（强制 mono_aot_only=0 纯 JIT）")
+    else:
+        print("    mono/mini/CMakeLists.txt: nebula_force_jit.h 已注入，跳过")
 else:
     print("    !! 找不到 mono/mini/CMakeLists.txt", file=sys.stderr)
 PY
