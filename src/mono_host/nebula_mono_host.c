@@ -1276,6 +1276,15 @@ static void *boot_thread(void *arg) {
     hlog("[host] step: blob_load");
     blob_load();
     hlog("[host] step: blob ok, assemblies=%d", g_n);
+
+    // [第十三轮关键修复] 预加载钩子必须在 mono_jit_init【之前】装好！
+    // mono 在 mono_init 阶段就要通过预加载钩子加载 corlib（System.Private.CoreLib），
+    // 此前钩子装在 mono_jit_init 之后，导致 corlib 无从加载 →
+    // mono_assembly_load_corlib 触发 g_assert_not_reached → SIGABRT（崩点已实锤）。
+    // 现在提前装，mono 初始化加载 corlib 时即可从 __nebulabcl 内存命中。
+    if (g_n > 0) mono_install_assembly_preload_hook(nebula_preload, NULL);
+    hlog("[host] step: 预加载钩子已装（%d 个程序集可被 mono 内存命中）", g_n);
+
     hlog("[host] step: setup_mono_path");
     setup_mono_path(dir, root);
 
@@ -1326,9 +1335,6 @@ static void *boot_thread(void *arg) {
     if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
     g_mono_ready = 1;   // 看门狗自此起可安全 GC
     hlog("[host] step: mono_jit_init OK, RSS=%ldMB", rss_mb());
-
-    // 注册预加载钩子：程序集依赖优先从 blob 内存加载（BCL/BepInEx.core 已内嵌）
-    if (g_n > 0) mono_install_assembly_preload_hook(nebula_preload, NULL);
 
     hlog("[host] step: Mono 就绪, RSS=%ldMB", rss_mb());
     start_watchdog();
