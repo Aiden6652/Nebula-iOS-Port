@@ -694,9 +694,17 @@ if os.path.exists(mini_cmake):
     else:
         print("    !! 找不到 add_linker_flag(-Wl,-hidden-licudata) 锚点（iOS 分支可能已改结构）", file=sys.stderr)
     # (a4) 强制纯 JIT：独立于锚点注入。所有 mono/mini TU 顶部 -include 覆盖头（mono_aot_only=0）
+    #   注意：-include 必须插在 project() 之后。add_compile_options 需要 project 已定义，
+    #   若 prepend 到 CMakeLists.txt 文件头（cmake_minimum_required/project 之前），cmake configure
+    #   会直接报错（Attempt to add compile option with no project set），交叉编译整体失败。
     if 'nebula_force_jit.h' not in s:
         _inc = 'add_compile_options(-include %s)\n' % _force_h
-        s = _inc + s
+        pm = s.find('project(')   # 找到首个 project( 行，在其后插入（避开文件头）
+        if pm >= 0:
+            nl = s.find('\n', pm)
+            s = s[:nl+1] + _inc + s[nl+1:]
+        else:
+            s = _inc + s   # 兜底：极少数文件无 project() 时才 prepend
         open(mini_cmake, 'w', encoding='utf-8').write(s)
         print("    mono/mini/CMakeLists.txt: 注入 -include nebula_force_jit.h（强制 mono_aot_only=0 纯 JIT）")
     else:
