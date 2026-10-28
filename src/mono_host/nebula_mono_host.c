@@ -61,6 +61,7 @@ extern void mono_setmmapjit (int flag);
 #include <errno.h>
 #include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
 #include <unistd.h>                // getpid
+#include <ucontext.h>              // 崩溃现场 PC/LR/SP（第十二轮 trap）
 // sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
 // 故手动声明 csops 及其常量。csops 是 libSystem 真实导出的符号，运行/链接均可用。
 extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersize);
@@ -604,9 +605,138 @@ static void neb_crash(int sig)
     raise(sig);
 }
 
-/* 依次尝试若干可写位置建日志；游戏目录未必可写，不能只试一个 */
-static int log_try(const char *p)
+/* —— [Nebula iOS 第十二轮] 死点取证 ——
+ * 现状：mono_jit_init 内部死亡、无 .ips、日志只到注入钩子的最后一行。
+ * 两大盲区：
+ *   1) mono 内部的致命输出（g_error 断言 "* Assertion at mini-*.c:xx"、
+ *      "Cannot find assembly" 等）全走 stderr —— stderr 从未进过日志文件，
+ *      mono 临死说的话我们一句都没听到。
+ *   2) 旧 neb_crash 在 mono_jit_init【之后】才装，jit_init 内部崩溃时
+ *      根本没有处理器，且无 PC/LR 现场信息。
+ * 对策：
+ *   A. stderr/stdout 重定向进管道，专职线程逐行回写 nebula_host.log（fflush），
+ *      mono 的遗言（断言消息）第一次可见；
+ *   B. SA_SIGINFO 崩溃处理器（在 mono_jit_init 之前安装）：打出 信号号/si_addr/
+ *      PC/LR/SP + dladdr 符号化；PC 无模块归属即 JIT 生成代码，直接实锤
+ *      "死在执行 JIT 产物" 还是 "死在 mono 运行时自身代码"。
+ * SIGKILL 依然不可捕获（内核 codesigning monitor），届时日志无 trap 行 +
+ * mono 无遗言 = 内核击杀实锤，转攻签名/内核侧。 */
+
+static void neb_jit_trap(int sig, siginfo_t *si, void *ucv)
 {
+    uintptr_t pc = 0, lr = 0, sp = 0;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    ucontext_t *uc = (ucontext_t *)ucv;
+    if (uc && uc->uc_mcontext) {
+        pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+        lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
+        sp = (uintptr_t)uc->uc_mcontext->__ss.__sp;
+    }
+#else
+    (void)ucv;
+#endif
+    char pdesc[256], ldesc[256];
+    snprintf(pdesc, sizeof(pdesc), "%s", pc ? "(符号化失败)" : "(无)");
+    snprintf(ldesc, sizeof(ldesc), "%s", lr ? "(符号化失败)" : "(无)");
+    Dl_info di;
+    if (pc && dladdr((void *)pc, &di) && di.dli_fbase) {
+        const char *fn = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
+        snprintf(pdesc, sizeof(pdesc), "%s!%s+0x%lx", fn,
+                 di.dli_sname ? di.dli_sname : "?",
+                 (unsigned long)(pc - (uintptr_t)di.dli_fbase));
+    } else if (pc) {
+        snprintf(pdesc, sizeof(pdesc), "0x%lx 无模块归属 → JIT 生成代码区", (unsigned long)pc);
+    }
+    if (lr && dladdr((void *)lr, &di) && di.dli_fbase) {
+        const char *fn = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
+        snprintf(ldesc, sizeof(ldesc), "%s!%s+0x%lx", fn,
+                 di.dli_sname ? di.dli_sname : "?",
+                 (unsigned long)(lr - (uintptr_t)di.dli_fbase));
+    } else if (lr) {
+        snprintf(ldesc, sizeof(ldesc), "0x%lx 无模块归属 → JIT 生成代码区", (unsigned long)lr);
+    }
+    if (g_logfp) {
+        fprintf(g_logfp,
+                "!! [trap] signal=%d si_code=%d si_addr=%p\n"
+                "   pc=0x%lx %s\n   lr=0x%lx %s\n   sp=0x%lx\n"
+                "   最后步骤: %s\n   RSS=%ldMB\n",
+                sig, si ? si->si_code : 0, si ? si->si_addr : NULL,
+                (unsigned long)pc, pdesc, (unsigned long)lr, ldesc,
+                (unsigned long)sp,
+                g_last_step ? g_last_step : "(null)", rss_mb());
+        fflush(g_logfp);
+    }
+    if (g_neb_log)
+        os_log(g_neb_log, "!! trap sig=%d pc=%s lr=%s", sig, pdesc, ldesc);
+    /* 还原默认处置再重发：让系统照常生成崩溃报告（若它还愿意生成的话） */
+    struct sigaction d;
+    memset(&d, 0, sizeof(d));
+    d.sa_handler = SIG_DFL;
+    sigaction(sig, &d, NULL);
+    raise(sig);
+}
+
+static void neb_install_trap(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = neb_jit_trap;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT,
+#ifdef SIGEMT
+                   SIGEMT,
+#endif
+#ifdef SIGSYS
+                   SIGSYS,
+#endif
+    };
+    for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+        sigaction(sigs[i], &sa, NULL);
+}
+
+/* —— [第十二轮] stderr/stdout 捕获：mono 的遗言第一次进日志 —— */
+static int g_stdio_pipe[2] = { -1, -1 };
+
+static void *neb_stdio_reader(void *arg)
+{
+    (void)arg;
+    static char line[4096];
+    size_t len = 0;
+    ssize_t n;
+    char buf[4096];
+    while ((n = read(g_stdio_pipe[0], buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\n' || len >= sizeof(line) - 2) {
+                line[len] = 0;
+                if (len > 0 && g_logfp) {
+                    fprintf(g_logfp, "[mono-out] %s\n", line);
+                    fflush(g_logfp);
+                }
+                len = 0;
+            } else {
+                line[len++] = c;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void neb_capture_stdio(void)
+{
+    if (g_stdio_pipe[0] != -1) return;
+    if (pipe(g_stdio_pipe) != 0) return;
+    fflush(stdout);
+    fflush(stderr);
+    dup2(g_stdio_pipe[1], STDOUT_FILENO);
+    dup2(g_stdio_pipe[1], STDERR_FILENO);
+    pthread_t t;
+    if (pthread_create(&t, NULL, neb_stdio_reader, NULL) == 0) pthread_detach(t);
+}
+
+/* 依次尝试若干可写位置建日志；游戏目录未必可写，不能只试一个 */
+static int log_try(const char *p){
     if (!p || !*p || g_logfp) return 0;
     FILE *f = fopen(p, "w");
     if (!f) return 0;
@@ -1140,6 +1270,15 @@ static void *boot_thread(void *arg) {
     }
     if (!g_logfp) hlog("[host] !! 日志无法创建：所有候选路径都不可写");
 
+    // [第十二轮] 尽早装死点取证：崩溃 trap（含 PC/LR 符号化）+ stderr/stdout 捕获。
+    // 必须在 JIT 冒烟之前 —— 冒烟会暂存并还原信号处理器，trap 装在前，
+    // 冒烟结束后自动恢复回来，mono_jit_init 全程都有现场取证。
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    neb_install_trap();
+    neb_capture_stdio();
+    hlog("[host] step: trap+stdio 捕获已装（mono 遗言将现形）");
+#endif
+
     // 启动占位文本：Mono + BepInEx 初始化期间显示在屏幕正中，防黑屏误判死机。
     // 窗口可能还没起来，内部带重试；Nebula.dll + Harmony 就绪后由托管侧
     // nebula_signal_ready() 销毁，或此处兜底延时/安全超时销毁。
@@ -1196,6 +1335,12 @@ static void *boot_thread(void *arg) {
     }
 
     hlog("[host] step: mono_jit_init 进入, RSS=%ldMB", rss_mb());
+    {   // [第十二轮] 进 init 前最后一次确认调试态：若 StikDebug 已分离导致
+        // CS_DEBUGGED 掉位，匿名可执行页的执行权会随之消失（冒烟通过≠init 时仍有效）
+        int f2 = 0;
+        if (csops(getpid(), CS_OPS_STATUS, &f2, sizeof(f2)) == 0)
+            hlog("[host] init 前 csflags=0x%x CS_DEBUGGED=%d", f2, (f2 & CS_DEBUGGED) ? 1 : 0);
+    }
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
     g_mono_ready = 1;   // 看门狗自此起可安全 GC
