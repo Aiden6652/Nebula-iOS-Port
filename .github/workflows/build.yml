@@ -9,10 +9,11 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
-# 新推送立即取消正在排队/运行的旧任务，避免堆积等待
-concurrency:
-  group: nebula-ios-build
-  cancel-in-progress: true
+# 注意：不要把本 workflow 放进 concurrency 组。
+# build-ios.yml（出 iOS 真机 dylib 的交叉编译 workflow）同样在 push 时触发，
+# 若这里声明同名 group + cancel-in-progress，会在同一次 push 中把 build-ios.yml
+# 正在跑的「从源码编译 mono iOS」job 取消，导致真机 dylib 产物拿不到。
+# 两个 workflow 各跑各的、互不阻塞；build-ios.yml 自身无 heavy 队列问题。
 
 jobs:
   build-mono-host:

@@ -9,6 +9,12 @@ on:
       - 'src/mono_host/**'
       - '.github/workflows/build-ios.yml'
 
+# 独有并发组（与 build.yml 不重名），避免同一 commit 重复跑 15 分钟 mono 重编；
+# 同时绝不与 build.yml 共享组，从而不会被 build.yml 取消。
+concurrency:
+  group: nebula-ios-cross
+  cancel-in-progress: true
+
 jobs:
   mono-ios:
     name: '1/2 从源码编译 mono iOS arm64（修 sdb trampoline）'
