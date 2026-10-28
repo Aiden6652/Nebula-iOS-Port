@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-28}"
+CACHE_VERSION="${CACHE_VERSION:-29}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -664,20 +664,19 @@ else:
 #     find() 会命中第一个（Windows）导致加错目标。改用 iOS 分支里已生效的
 #     add_linker_flag(-Wl,-hidden-licudata) 作为锚点（ICU flags 已证明该分支的 add_linker_flag 进链接命令）。
 
-# (a4) [Nebula iOS 第十六轮 2026-10-28] 强制纯 JIT：mono_aot_only=0。
-#   根因：iOS 构建默认 mono_aot_only=1，使虚表/接口分派等引用走 AOT 重定基——
-#   生成代码里 emit 的是「rva 偏移」（如 0x63FDA90），运行时需 AOT runtime 加回
-#   镜像基址(含 ASLR slide)。但本工程未加载任何 AOT 镜像、纯 JIT 运行，于是
-#   这些引用只 emit 了 rva 偏移、缺运行时基址 → ldr x17,[0x63FDA90] 读未映射区 →
-#   SIGSEGV（实锤于 runtime_invoke trampoline，Native Crash Reporting 反汇编解码）。
-#   修复：用 -include 在所有 mono/mini TU 顶部强制 #define mono_aot_only 0，
-#   走非 AOT 分支——mini-arm64.c 的 IMT/虚表发射改用全指针
-#   emit_imm64((guint64)&(vtable->vtable[slot]))，不再依赖 rva+基址重定基。
-#   注意：mono_aot_only 由 cmake 以 -D 注入，故用 #undef 再 #define 覆盖（无重定义错误）。
-_force_h = os.path.join(mono, 'mono', 'mini', 'nebula_force_jit.h')
-with open(_force_h, 'w', encoding='utf-8') as _fh:
-    _fh.write('#undef mono_aot_only\n#define mono_aot_only 0\n')
-print("    创建强制 JIT 头:", os.path.relpath(_force_h, mono))
+# (a4) [Nebula iOS 第十七轮 2026-10-28] 修正第十六轮的错误方案。
+#   第十六轮误以为 mono_aot_only 是编译期宏（由 cmake -D 注入），用 -include 头
+#   #define mono_aot_only 0 想切换编译期分支。实测：
+#   1) mono_aot_only 是【运行时变量】（extern gboolean mono_aot_only;，无 #ifdef 保护），
+#      #define 会把它变成 extern gboolean 0; → 编译报 "expected identifier" 直接挂；
+#   2) 源码里 mono_aot_only 从未出现在任何 #if 中，根本不存在可切换的编译期分支。
+#   真正的 rva 崩根因：iOS AOT 包（microsoft.netcore.app.runtime.mono.ios-arm64）把
+#   System.Private.CoreLib 等程序集做成 AOT 预编译镜像，调用其方法时发射 rva 立即数，
+#   PIE dylib + ASLR 下 dyld 无法对指令内立即数重定位 → ldr x17,[rva] 读未映射区 SIGSEGV。
+#   正确修法（见下方 step[6/6] 与 host）：BCL 改用纯 IL 包（osx-arm64，零 AOT 模块），
+#   运行时在 mono_jit_init 前 mono_jit_set_aot_only(0) 放行 JIT，让所有程序集由 JIT 从
+#   IL 编译、走全指针引用（已为 ASLR 打过补丁），从根上消除 rva 问题。
+#   本段只保留 iOS 必需的链接修复：允许 _pthread_jit_write_protect_np 运行时解析。
 mini_cmake = os.path.join(mono, 'mono', 'mini', 'CMakeLists.txt')
 if os.path.exists(mini_cmake):
     s = open(mini_cmake, encoding='utf-8', errors='replace').read()
@@ -693,22 +692,6 @@ if os.path.exists(mini_cmake):
         print("    mono/mini/CMakeLists.txt: iOS 分支加 add_linker_flag(-Wl,-U,_pthread_jit_write_protect_np)")
     else:
         print("    !! 找不到 add_linker_flag(-Wl,-hidden-licudata) 锚点（iOS 分支可能已改结构）", file=sys.stderr)
-    # (a4) 强制纯 JIT：独立于锚点注入。所有 mono/mini TU 顶部 -include 覆盖头（mono_aot_only=0）
-    #   注意：-include 必须插在 project() 之后。add_compile_options 需要 project 已定义，
-    #   若 prepend 到 CMakeLists.txt 文件头（cmake_minimum_required/project 之前），cmake configure
-    #   会直接报错（Attempt to add compile option with no project set），交叉编译整体失败。
-    if 'nebula_force_jit.h' not in s:
-        _inc = 'add_compile_options(-include %s)\n' % _force_h
-        pm = s.find('project(')   # 找到首个 project( 行，在其后插入（避开文件头）
-        if pm >= 0:
-            nl = s.find('\n', pm)
-            s = s[:nl+1] + _inc + s[nl+1:]
-        else:
-            s = _inc + s   # 兜底：极少数文件无 project() 时才 prepend
-        open(mini_cmake, 'w', encoding='utf-8').write(s)
-        print("    mono/mini/CMakeLists.txt: 注入 -include nebula_force_jit.h（强制 mono_aot_only=0 纯 JIT）")
-    else:
-        print("    mono/mini/CMakeLists.txt: nebula_force_jit.h 已注入，跳过")
 else:
     print("    !! 找不到 mono/mini/CMakeLists.txt", file=sys.stderr)
 PY
@@ -775,9 +758,14 @@ if [ "$OK" != "1" ]; then
   ls "$INSTALL/lib" >&2 || true
 fi
 
-echo "=== [6/6] 取 .NET 8 BCL（托管程序集，不自己编）==="
+echo "=== [6/6] 取 .NET 8 BCL（托管程序集，纯 IL，不自己编）==="
+echo "    [Nebula iOS 第十七轮] 改用 microsoft.netcore.app.runtime.mono.osx-arm64："
+echo "    该包零 AOT 模块（验证过 native/System.Private.CoreLib.dll 不含 MONO_AOT_MODULE/#AOT 标记，"
+echo "    是纯 IL），避免 iOS AOT 包把 CoreLib 做成 AOT 预编译镜像、调用时发射 rva 立即数、"
+echo "    在 PIE+ASLR dylib 下无法重定基导致的 SIGSEGV。配合 host 的 mono_jit_set_aot_only(0)，"
+echo "    所有程序集（含 CoreLib）由 JIT 从 IL 编译、走全指针引用。"
 mkdir -p "$INSTALL/lib/net8.0"
-PKG="microsoft.netcore.app.runtime.mono.ios-arm64"
+PKG="microsoft.netcore.app.runtime.mono.osx-arm64"
 URL="https://api.nuget.org/v3-flatcontainer/$PKG/$MONOVM_VERSION/$PKG.$MONOVM_VERSION.nupkg"
 curl -sL --max-time 300 -o "$WORK/monoios.nupkg" "$URL"
 python3 - "$WORK/monoios.nupkg" "$INSTALL" <<'PY'
@@ -786,14 +774,16 @@ z = zipfile.ZipFile(sys.argv[1]); inst = sys.argv[2]
 n = 0
 for i in z.infolist():
     if i.is_dir(): continue
-    if i.filename.startswith('runtimes/ios-arm64/lib/net8.0/'):
-        rel = i.filename[len('runtimes/ios-arm64/lib/net8.0/'):]
+    # 纯 IL 托管程序集（167 个，零 AOT）
+    if i.filename.startswith('runtimes/osx-arm64/lib/net8.0/'):
+        rel = i.filename[len('runtimes/osx-arm64/lib/net8.0/'):]
         out = os.path.join(inst, 'lib', 'net8.0', rel)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         open(out, 'wb').write(z.read(i)); n += 1
-    if i.filename.endswith('runtimes/ios-arm64/native/System.Private.CoreLib.dll'):
+    # System.Private.CoreLib：osx-arm64 包里只在 native/ 下、且是纯 IL（无 AOT），直接采用
+    if i.filename.endswith('runtimes/osx-arm64/native/System.Private.CoreLib.dll'):
         open(os.path.join(inst, 'lib', 'net8.0', 'System.Private.CoreLib.dll'), 'wb').write(z.read(i)); n += 1
-print("    BCL 提取 %d 个文件" % n)
+print("    BCL 提取 %d 个文件（纯 IL，零 AOT 模块）" % n)
 PY
 
 {

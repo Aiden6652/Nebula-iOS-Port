@@ -1396,6 +1396,15 @@ static void *boot_thread(void *arg) {
     mono_setmmapjit(1);
     hlog("[host] 编译器(JIT)模式：强制 MAP_JIT 分配（trampoline 生成需可执行内存）");
 
+    // [Nebula iOS 第十七轮] 强制纯 JIT、关闭 AOT：本工程 BCL 已改用纯 IL 包
+    // （microsoft.netcore.app.runtime.mono.osx-arm64，零 AOT 模块），不打包任何 AOT
+    // 预编译镜像。iOS 构建可能把 mono_aot_only 默认置 1（仅 AOT），会拒绝 JIT 并报
+    // "method not AOT-compiled"。这里在 mono_jit_init 前显式置 0，放行 JIT，让所有
+    // 程序集（含 System.Private.CoreLib）由 JIT 从 IL 编译、走全指针引用（已为 ASLR
+    // 打过补丁），从根上消除 AOT rva 重定基缺失导致的 SIGSEGV。
+    mono_jit_set_aot_only(0);
+    hlog("[host] 强制 mono_aot_only=0（纯 JIT，关闭 AOT；BCL 为纯 IL 零 AOT 模块）");
+
     hlog("[host] step: mono_jit_init ...");
 
     // 先做 JIT 能力闸门：没 JIT 必崩在 mono_jit_init（标准/pro 都一样）。

@@ -68,6 +68,13 @@ iOS 上的 .NET 用的就是这套 MonoVM，天然支持 net6/net8：
 
 收益：iOS 构建从"编译 15 分钟 + 一堆平台坑"变成"下载几十秒"。
 
+> **[第十七轮修正] BCL（托管程序集）实际改用 `Microsoft.NETCore.App.Runtime.Mono.osx-arm64`（8.0.32），**
+> 不再用 ios-arm64 包。原因：ios-arm64 包把 `System.Private.CoreLib` 等做成 **AOT 预编译镜像**，
+> 调用其方法时发射 rva 立即数，在 PIE+ASLR 的 dylib 下无法重定基 → `ldr x17,[rva]` SIGSEGV。
+> osx-arm64 包是**零 AOT 的纯 IL**（已验证 native/System.Private.CoreLib.dll 无 MONO_AOT_MODULE/#AOT 标记），
+> 配合宿主 `mono_jit_set_aot_only(0)`，所有程序集由 JIT 从 IL 编译、走全指针引用，从根上消除 rva 崩。
+> 静态库 `libmonosgen-2.0.a` / 头文件仍来自 ios-arm64 包（我们自己的 JIT 增强构建），仅 BCL 换成 osx-arm64 纯 IL。
+
 ## 3. 编译期踩到的坑（已修）
 
 .NET 8 的 Mono 头文件重排过，`object.h` 不再间接包含 `class.h`，
