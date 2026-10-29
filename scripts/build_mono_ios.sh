@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-31}"
+CACHE_VERSION="${CACHE_VERSION:-32}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -133,6 +133,24 @@ if os.path.exists(cfg):
         print("    config.h.in: 已移除 DISABLE_JIT 的 cmakedefine（iOS 放出完整 JIT）")
     else:
         print("    !! config.h.in 未匹配到 #cmakedefine DISABLE_JIT", file=sys.stderr)
+
+# (a1b) [Nebula iOS 第二十轮 2026-10-29] 中和 DISABLE_DLLMAP：
+#   dotnet/runtime 的 mono CMakeLists 顶层默认 set(DISABLE_DLLMAP 1)，使生成的 config.h
+#   #define DISABLE_DLLMAP 1。这会让 mono_dllmap_insert 直接 g_assert_not_reached()，且
+#   P/Invoke 解析链（native-library.c:1066）完全不查 dllmap。本工程需要在 mono_jit_init 前
+#   用 mono_dllmap_insert 把 CoreLib 的 libSystem.Native 等原生库名重映射到 iOS 版 shim 的
+#   磁盘绝对路径（.NET 8 CoreLib 的 getenv/文件IO/加密/压缩/TLS 全走这些 shim，缺则
+#   DllNotFoundException）。去掉 DISABLE_DLLMAP 定义以放出 dllmap 能力（与 (a1) 同机制）。
+cfg = os.path.join(mono, 'cmake', 'config.h.in')
+if os.path.exists(cfg):
+    s = open(cfg, encoding='utf-8', errors='replace').read()
+    if '#cmakedefine DISABLE_DLLMAP' in s:
+        s2 = s.replace('#cmakedefine DISABLE_DLLMAP 1',
+                       '/* [Nebula iOS] 不在 iOS 定义 DISABLE_DLLMAP，放出 dllmap 以重映射 libSystem.* 原生 shim */')
+        open(cfg, 'w', encoding='utf-8').write(s2)
+        print("    config.h.in: 已移除 DISABLE_DLLMAP 的 cmakedefine（放出 dllmap）")
+    else:
+        print("    !! config.h.in 未匹配到 #cmakedefine DISABLE_DLLMAP", file=sys.stderr)
 
 # (a3) [Nebula iOS 第八轮 2026-10-27 反转定案] 强制【不定义】HAVE_PTHREAD_JIT_WRITE_PROTECT_NP：
 #      真机 5faa94b 轮实锤：强制 #define 后 mono-codeman.c 上游函数体的
@@ -803,6 +821,32 @@ for i in z.infolist():
     if i.filename.endswith('runtimes/osx-arm64/native/System.Private.CoreLib.dll'):
         open(os.path.join(inst, 'lib', 'net8.0', 'System.Private.CoreLib.dll'), 'wb').write(z.read(i)); n += 1
 print("    BCL 提取 %d 个文件（纯 IL，零 AOT 模块）" % n)
+PY
+
+# [Nebula iOS 第二十轮 2026-10-29] 提取 iOS 版原生 interop shim（libSystem.*.dylib）。
+#   背景：.NET 8 CoreLib 的 P/Invoke 全走 libSystem.Native / libSystem.Globalization.Native
+#   等原生 shim（getenv/文件IO/加密/压缩/TLS），由 .NET 运行时提供。osx-arm64 的 shim
+#   为 macOS 链接、iOS 上 dlopen 可能缺框架；ios-arm64 包的 shim 是【为 iOS 链接
+#   libSystem.B.dylib 编的】，且它们是原生 C 代码（非 AOT 托管），与本工程避 AOT 的策略
+#   不冲突。宿主在 mono_jit_init 前用 mono_dllmap_insert 把这些名字重映射到磁盘绝对路径。
+#   注意：排除 libmonosgen-2.0.dylib（我们自编译 mono 已提供，同名会冲突）。
+mkdir -p "$INSTALL/lib/net8.0/native"
+PKG_IOS="microsoft.netcore.app.runtime.mono.ios-arm64"
+URL_IOS="https://api.nuget.org/v3-flatcontainer/$PKG_IOS/$MONOVM_VERSION/$PKG_IOS.$MONOVM_VERSION.nupkg"
+curl -sL --max-time 300 -o "$WORK/iosmono.nupkg" "$URL_IOS"
+python3 - "$WORK/iosmono.nupkg" "$INSTALL" <<'PY'
+import zipfile, sys, os
+z = zipfile.ZipFile(sys.argv[1]); inst = sys.argv[2]
+native_dir = os.path.join(inst, 'lib', 'net8.0', 'native')
+n = 0
+for i in z.infolist():
+    if i.is_dir(): continue
+    fn = os.path.basename(i.filename)
+    # 只取 iOS 原生 interop shim，排除自编译的 libmonosgen-2.0.dylib
+    if fn.startswith('libSystem.') and fn.endswith('.dylib'):
+        out = os.path.join(native_dir, fn)
+        open(out, 'wb').write(z.read(i)); n += 1
+print("    iOS 原生 shim 提取 %d 个 -> lib/net8.0/native/" % n)
 PY
 
 {

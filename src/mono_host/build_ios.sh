@@ -113,6 +113,24 @@ open(blob_path, "wb").write(buf)
 print("blob: %d 个程序集, %d bytes" % (len(entries), len(buf)))
 PY
 
+echo "=== 拷贝 iOS 原生 interop shim（libSystem.*.dylib）进产物目录 ==="
+# [Nebula iOS 第二十轮] .NET 8 CoreLib 的 P/Invoke 依赖这些原生 shim（getenv/文件IO/加密/
+# 压缩/TLS）。它们来自 ios-arm64 运行时包（为 iOS 链接），由宿主 mono_dllmap_insert 重映射。
+# 单独作为文件落进 app bundle（用户重签时一并签名），不走 BCL blob（那是托管程序集）。
+NATIVE_SRC="$MONO_ROOT/lib/net8.0/native"
+if [ -d "$NATIVE_SRC" ]; then
+  mkdir -p "$OUT/native"
+  cnt=0
+  for d in "$NATIVE_SRC"/libSystem.*.dylib; do
+    [ -f "$d" ] || continue
+    cp "$d" "$OUT/native/"
+    cnt=$((cnt+1))
+  done
+  echo "    原生 shim: $cnt 个 -> $OUT/native/"
+else
+  echo "    ⚠ 未找到 iOS 原生 shim 目录 $NATIVE_SRC（P/Invoke 将缺库，运行时 DllNotFound）" >&2
+fi
+
 echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 
 # 单一编译器（JIT）版：解释器已废除，standard / pro 合并为一份。

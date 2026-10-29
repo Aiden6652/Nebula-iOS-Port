@@ -75,6 +75,15 @@ iOS 上的 .NET 用的就是这套 MonoVM，天然支持 net6/net8：
 > 配合宿主 `mono_jit_set_aot_only(0)`，所有程序集由 JIT 从 IL 编译、走全指针引用，从根上消除 rva 崩。
 > 静态库 `libmonosgen-2.0.a` / 头文件仍来自 ios-arm64 包（我们自己的 JIT 增强构建），仅 BCL 换成 osx-arm64 纯 IL。
 
+> **[第二十轮修正] 原生 interop shim（`libSystem.*.dylib`）改从 ios-arm64 包提取，落进 app bundle。**
+> `.NET 8 CoreLib` 的 P/Invoke（getenv/文件IO/加密/压缩/TLS）全走 `libSystem.Native` 等原生 shim，
+> 由 .NET 运行时从 ios-arm64 包提供（为 iOS 链接 `libSystem.B.dylib` 编的，非 macOS 版）。
+> 构建会把它们抽到 artifact 的 `native/` 目录。部署时**必须**把这 5 个 `libSystem.*.dylib`
+> 放进 `AmongUs.app/`（app 根目录，与 `libnebula_standard.dylib` 同级，或 `native/` 子目录），
+> 随 app 一起**重新签名**（否则 dlopen 报代码签名错误）。宿主在 `mono_jit_init` 前用
+> `mono_dllmap_insert` 把这些库名重映射到磁盘绝对路径（dotnet/runtime 的 `mono_config_parse`
+> 是空函数、且 `DISABLE_DLLMAP` 默认开启，故在 config.h 里中和 DISABLE_DLLMAP 以放出 dllmap）。
+
 ## 3. 编译期踩到的坑（已修）
 
 .NET 8 的 Mono 头文件重排过，`object.h` 不再间接包含 `class.h`，

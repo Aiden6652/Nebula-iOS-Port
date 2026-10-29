@@ -1303,6 +1303,52 @@ static void nebula_probe_map_jit(void) {
 }
 #endif
 
+/* [Nebula iOS 第二十轮 2026-10-29] 用 mono_dllmap_insert 把 .NET 8 CoreLib 的 P/Invoke
+   原生库名（libSystem.Native 等）重映射到 iOS 版 shim 的磁盘绝对路径。
+   .NET 8 CoreLib 的所有原生调用（getenv/文件IO/加密/压缩/TLS）都走这些 shim，由 .NET
+   运行时从 ios-arm64 包提供。我们自编译的 mono 没有内置 dllmap config（dotnet/runtime
+   的 mono_config_parse 是空函数），故用程序化 mono_dllmap_insert 注入。
+   shim 文件由构建从 ios-arm64 运行时包提取，落进 app bundle 的 native/（用户重签时一并
+   签名）。必须在 mono_jit_init 之前调用：首条 getenv P/Invoke 发生在 runtime init 期。 */
+static void nebula_setup_native_dllmaps(const char *appdir)
+{
+    // mono_dllmap_insert 在 dotnet/runtime 的 mono/metadata/native-library.c 中定义，
+    // 文档注明"可在 runtime 初始化前调用"。assembly=NULL 表示全局映射。
+    extern void mono_dllmap_insert(void *assembly, const char *dll,
+                                  const char *func, const char *tdll, const char *tfunc);
+    static const char *shims[] = {
+        "libSystem.Native.dylib",
+        "libSystem.Globalization.Native.dylib",
+        "libSystem.IO.Compression.Native.dylib",
+        "libSystem.Net.Security.Native.dylib",
+        "libSystem.Security.Cryptography.Native.Apple.dylib",
+        NULL
+    };
+    char path[PATH_MAX];
+    for (int i = 0; shims[i]; i++) {
+        // 候选位置：<appdir>/native/<name> 与 <appdir>/<name>
+        snprintf(path, sizeof(path), "%s/native/%s", appdir, shims[i]);
+        if (access(path, R_OK) != 0)
+            snprintf(path, sizeof(path), "%s/%s", appdir, shims[i]);
+        if (access(path, R_OK) != 0) {
+            hlog("[host] native shim 未找到(跳过 dllmap): %s", shims[i]);
+            continue;
+        }
+        // dll 键用不带 .dylib 的库名，匹配 CoreLib 的 [LibraryImport("libSystem.Native")]
+        size_t L = strlen(shims[i]);
+        char name[256];
+        if (L > 6 && strcmp(shims[i] + L - 6, ".dylib") == 0) {
+            memcpy(name, shims[i], L - 6);
+            name[L - 6] = '\0';
+        } else {
+            strncpy(name, shims[i], sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
+        }
+        mono_dllmap_insert(NULL, name, NULL, path, NULL);
+        hlog("[host] dllmap: %s -> %s", name, path);
+    }
+}
+
 static void *boot_thread(void *arg) {
     (void)arg;
     hlog("[host] boot thread started");
@@ -1404,6 +1450,10 @@ static void *boot_thread(void *arg) {
     // 打过补丁），从根上消除 AOT rva 重定基缺失导致的 SIGSEGV。
     mono_jit_set_aot_only(0);
     hlog("[host] 强制 mono_aot_only=0（纯 JIT，关闭 AOT；BCL 为纯 IL 零 AOT 模块）");
+
+    // [Nebula iOS 第二十轮] 注入原生 shim dllmap：让 CoreLib 的 P/Invoke 找到 iOS 版
+    // libSystem.*.dylib（getenv/文件IO/加密/压缩/TLS），避免 DllNotFoundException。
+    nebula_setup_native_dllmaps(dir);
 
     hlog("[host] step: mono_jit_init ...");
 
