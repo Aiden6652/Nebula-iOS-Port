@@ -1312,10 +1312,11 @@ static void nebula_probe_map_jit(void) {
    签名）。必须在 mono_jit_init 之前调用：首条 getenv P/Invoke 发生在 runtime init 期。 */
 static void nebula_setup_native_dllmaps(const char *appdir)
 {
-    // mono_dllmap_insert 在 dotnet/runtime 的 mono/metadata/native-library.c 中定义，
-    // 文档注明"可在 runtime 初始化前调用"。assembly=NULL 表示全局映射。
-    extern void mono_dllmap_insert(void *assembly, const char *dll,
-                                  const char *func, const char *tdll, const char *tfunc);
+    // mono_dllmap_insert 正式声明在 mono-2.0 头 mono/metadata/details/loader-functions.h
+    // （MONO_API_FUNCTION，首参 MonoImage *assembly），本文件已包含该头。
+    // [第二十一轮教训] 勿在函数内再写本地 extern——void* 与 MonoImage* 冲突报
+    // "conflicting types for 'mono_dllmap_insert'"，CI host-dylib 编译失败。
+    // assembly=NULL 表示全局映射；文档注明可在 runtime 初始化前调用。
     static const char *shims[] = {
         "libSystem.Native.dylib",
         "libSystem.Globalization.Native.dylib",
