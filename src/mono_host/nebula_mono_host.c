@@ -429,6 +429,9 @@ static void setup_mono_path(const char *dir, const char *root) {
     printf("[host] MONO_PATH(文件兜底)=%s\n", mp);
 }
 
+// 前向声明：托管异常转可读文本（定义见下方 boot_bepinex 之后）
+static void nebula_log_exception(MonoObject *exc);
+
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
 static int boot_bepinex(MonoDomain *domain, const char *root) {
     MonoAssembly *as = NULL;
