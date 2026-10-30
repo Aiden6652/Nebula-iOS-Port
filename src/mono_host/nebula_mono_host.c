@@ -45,6 +45,9 @@ extern void mono_jit_set_aot_only (int aot_only);
 // 可执行内存非法；dotnet/runtime 的 mono 只在 macOS 接了 MAP_JIT（mono-mmap.c 里
 // TARGET_OSX 硬绑），iOS 必须我们显式打开。参考 OpenJDK/Pojav 的 W^X 处理。
 extern void mono_setmmapjit (int flag);
+// mono 公开 API：返回 domain 内已加载程序集数组。
+// 某些 iOS mono 构建的 appdomain.h 未导出该声明（函数本身存在于 mono 运行时），这里补声明。
+extern MonoAssembly **mono_domain_get_assemblies(MonoDomain *domain, int *n);
 
 #ifdef __APPLE__
 #include <mach/mach.h>
