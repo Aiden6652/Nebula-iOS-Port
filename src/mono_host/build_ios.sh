@@ -123,10 +123,13 @@ if [ -d "$NATIVE_SRC" ]; then
   cnt=0
   for d in "$NATIVE_SRC"/libSystem.*.dylib; do
     [ -f "$d" ] || continue
+    # 双份落盘：native/ 子目录（结构化）+ OUT 根（平铺），
+    # 宿主在两处都查，用户"整包平铺"或"native 子目录"两种部署都能命中。
     cp "$d" "$OUT/native/"
+    cp "$d" "$OUT/"
     cnt=$((cnt+1))
   done
-  echo "    原生 shim: $cnt 个 -> $OUT/native/"
+  echo "    原生 shim: $cnt 个 -> $OUT/native/ 与 $OUT/ (平铺)"
 else
   echo "    ⚠ 未找到 iOS 原生 shim 目录 $NATIVE_SRC（P/Invoke 将缺库，运行时 DllNotFound）" >&2
 fi

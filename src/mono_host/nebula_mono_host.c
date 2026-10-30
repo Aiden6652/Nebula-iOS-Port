@@ -1325,14 +1325,24 @@ static void nebula_setup_native_dllmaps(const char *appdir)
         "libSystem.Security.Cryptography.Native.Apple.dylib",
         NULL
     };
+    // 候选目录（按优先级）：app 根(平铺) / native/ 子目录 / Frameworks/ / Frameworks/native/
+    // 覆盖"整包平铺""native 子目录""iOS 惯例 Frameworks"等多种部署方式，
+    // 避免用户把 shim 放错位置导致 dllmap 整组跳过、再次 DllNotFoundException。
+    const char *dirs[] = { "", "native", "Frameworks", "Frameworks/native", NULL };
     char path[PATH_MAX];
     for (int i = 0; shims[i]; i++) {
-        // 候选位置：<appdir>/native/<name> 与 <appdir>/<name>
-        snprintf(path, sizeof(path), "%s/native/%s", appdir, shims[i]);
-        if (access(path, R_OK) != 0)
-            snprintf(path, sizeof(path), "%s/%s", appdir, shims[i]);
-        if (access(path, R_OK) != 0) {
+        int found = 0;
+        for (int d = 0; dirs[d]; d++) {
+            if (dirs[d][0])
+                snprintf(path, sizeof(path), "%s/%s/%s", appdir, dirs[d], shims[i]);
+            else
+                snprintf(path, sizeof(path), "%s/%s", appdir, shims[i]);
+            if (access(path, R_OK) == 0) { found = 1; break; }
+        }
+        if (!found) {
             hlog("[host] native shim 未找到(跳过 dllmap): %s", shims[i]);
+            hlog("[host]   已查: %s/%s | %s/native/%s | %s/Frameworks/%s | %s/Frameworks/native/%s",
+                 appdir, shims[i], appdir, shims[i], appdir, shims[i], appdir, shims[i]);
             continue;
         }
         // dll 键用不带 .dylib 的库名，匹配 CoreLib 的 [LibraryImport("libSystem.Native")]
