@@ -45,9 +45,6 @@ extern void mono_jit_set_aot_only (int aot_only);
 // 可执行内存非法；dotnet/runtime 的 mono 只在 macOS 接了 MAP_JIT（mono-mmap.c 里
 // TARGET_OSX 硬绑），iOS 必须我们显式打开。参考 OpenJDK/Pojav 的 W^X 处理。
 extern void mono_setmmapjit (int flag);
-// mono 公开 API：返回 domain 内已加载程序集数组。
-// 某些 iOS mono 构建的 appdomain.h 未导出该声明（函数本身存在于 mono 运行时），这里补声明。
-extern MonoAssembly **mono_domain_get_assemblies(MonoDomain *domain, int *n);
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -443,19 +440,16 @@ static void nebula_log_exception(MonoObject *exc);
 static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
     if (!domain || !root) return 0;
 
-    // 1) 在已加载程序集里找 BepInEx.Core（程序集简单名 "BepInEx.Core"，含 BepInEx.Paths）
+    // 1) 取 BepInEx.Core 的 image（含 BepInEx.Paths）。
+    //    注意：iOS 链接的 mono 静态库不导出 mono_domain_get_assemblies，无法遍历程序集；
+    //    改用项目自带的内存 blob 加载器从 BepInEx/core 直接取 Core 镜像。
     MonoImage *bepImg = NULL;
-    int n = 0;
-    MonoAssembly **asv = mono_domain_get_assemblies(domain, &n);
-    for (int i = 0; i < n; i++) {
-        MonoAssemblyName *an = mono_assembly_get_name(asv[i]);
-        const char *nm = an ? mono_assembly_name_get_name(an) : NULL;
-        if (nm && (strcmp(nm, "BepInEx.Core") == 0 || strcmp(nm, "BepInEx") == 0)) {
-            bepImg = mono_assembly_get_image(asv[i]);
-            break;
-        }
+    const blob_entry *core_e = blob_find("BepInEx.Core");
+    if (core_e) {
+        MonoAssembly *core_as = blob_load_assembly(core_e);
+        if (core_as) bepImg = mono_assembly_get_image(core_as);
     }
-    if (!bepImg) { fprintf(stderr, "[host] 找不到 BepInEx 程序集，无法设置 Paths\n"); return 0; }
+    if (!bepImg) { fprintf(stderr, "[host] 找不到 BepInEx.Core 镜像，无法设置 Paths\n"); return 0; }
 
     MonoClass *paths = mono_class_from_name(bepImg, "BepInEx", "Paths");
     if (!paths) { fprintf(stderr, "[host] 找不到 BepInEx.Paths\n"); return 0; }
