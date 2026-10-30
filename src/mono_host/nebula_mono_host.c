@@ -25,6 +25,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <sys/stat.h>    // mkdir（BepInEx 可写根目录）
 #include <strings.h>    // strcasecmp
 
 #include <mono/jit/jit.h>
@@ -456,8 +457,18 @@ static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
 
     char exepath[PATH_MAX], bepinroot[PATH_MAX], datapath[PATH_MAX];
     snprintf(exepath,   sizeof(exepath),   "%s/AmongUs", root);
-    snprintf(bepinroot, sizeof(bepinroot), "%s/BepInEx", root);
     snprintf(datapath,  sizeof(datapath),  "%s/Data", root);
+
+    // BepInEx 根目录必须落在【可写容器目录】：iOS 的 app bundle 是只读的，
+    // 把 BepInExRootPath 指向 bundle 内，会让 SetExecutablePath / 写日志抛
+    // UnauthorizedAccessException（实测崩溃点）。$HOME 即容器 Data 目录，
+    // Documents 可写且持久 → $HOME/Documents/BepInEx。
+    const char *home = getenv("HOME");
+    if (home && home[0]) snprintf(bepinroot, sizeof(bepinroot), "%s/Documents/BepInEx", home);
+    else                 snprintf(bepinroot, sizeof(bepinroot), "%s/BepInEx", root);
+    mkdir(bepinroot, 0755);   // 保证父目录存在（BepInEx 会在其下建 config/plugins/log 等）
+    printf("[host] BepInEx 根目录(可写)=%s (HOME=%s)\n", bepinroot, home ? home : "(null)");
+    fflush(NULL);
 
     // 保险：若 Doorstop.Entrypoint.Start() 内部用 DOORSTOP_PROCESS_PATH 自行初始化 Paths，
     // 这里给出真实可执行文件路径（非 MacOS 分支时即可算对 GameRootPath）。
@@ -544,20 +555,15 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
 }
 
 // 把托管异常转成可读文本打到 host 日志（避免只看得到"抛出异常"却不知原因）
+// 只走原生 API 打印异常类型：托管 ToString(mono_object_to_string) 在异常态下
+// 需要 JIT 编译，iOS 上实测会把进程带崩并丢掉最后几行日志（看不到异常内容），故弃用。
 static void nebula_log_exception(MonoObject *exc) {
     if (!exc) return;
-    MonoObject *sub = NULL;
-    MonoString *s = mono_object_to_string(exc, &sub);
-    if (s) {
-        char *msg = mono_string_to_utf8(s);
-        fprintf(stderr, "[host]   异常内容: %s\n", msg ? msg : "(null)");
-        if (msg) free(msg);
-    } else {
-        MonoClass *c = mono_object_get_class(exc);
-        const char *ns = mono_class_get_namespace(c);
-        const char *nm = mono_class_get_name(c);
-        fprintf(stderr, "[host]   异常类型: %s.%s\n", ns ? ns : "", nm ? nm : "?");
-    }
+    MonoClass *c = mono_object_get_class(exc);
+    const char *ns = c ? mono_class_get_namespace(c) : NULL;
+    const char *nm = c ? mono_class_get_name(c) : "?";
+    fprintf(stderr, "[host]   异常类型: %s.%s\n", ns ? ns : "", nm ? nm : "?");
+    fflush(NULL);
 }
 
 // 尝试调用某个静态无参方法，成功返回 1
