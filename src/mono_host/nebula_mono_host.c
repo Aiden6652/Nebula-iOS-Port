@@ -461,9 +461,26 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     printf("[host] 调用 Doorstop.Entrypoint.Start() —— 之后交给 BepInEx chainloader\n");
     MonoObject *exc = NULL;
     mono_runtime_invoke(start, NULL, NULL, &exc);
-    if (exc) { fprintf(stderr, "[host] !! Start() 抛出异常\n"); return 0; }
+    if (exc) { fprintf(stderr, "[host] !! Start() 抛出异常\n"); nebula_log_exception(exc); return 0; }
     printf("[host] Start() 已返回，RSS=%ldMB\n", rss_mb());
     return 1;
+}
+
+// 把托管异常转成可读文本打到 host 日志（避免只看得到"抛出异常"却不知原因）
+static void nebula_log_exception(MonoObject *exc) {
+    if (!exc) return;
+    MonoObject *sub = NULL;
+    MonoString *s = mono_object_to_string(exc, &sub);
+    if (s) {
+        char *msg = mono_string_to_utf8(s);
+        fprintf(stderr, "[host]   异常内容: %s\n", msg ? msg : "(null)");
+        if (msg) free(msg);
+    } else {
+        MonoClass *c = mono_object_get_class(exc);
+        const char *ns = mono_class_get_namespace(c);
+        const char *nm = mono_class_get_name(c);
+        fprintf(stderr, "[host]   异常类型: %s.%s\n", ns ? ns : "", nm ? nm : "?");
+    }
 }
 
 // 尝试调用某个静态无参方法，成功返回 1
@@ -475,7 +492,7 @@ static int try_invoke(MonoImage *img, const char *ns, const char *cls, const cha
     MonoObject *exc = NULL;
     printf("[host]   调用 %s%s%s.%s()\n", ns ? ns : "", ns && *ns ? "." : "", cls, method);
     mono_runtime_invoke(m, NULL, NULL, &exc);
-    if (exc) { fprintf(stderr, "[host]   !! 抛异常\n"); return 0; }
+    if (exc) { fprintf(stderr, "[host]   !! 抛异常\n"); nebula_log_exception(exc); return 0; }
     return 1;
 }
 
