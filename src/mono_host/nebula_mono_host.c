@@ -432,6 +432,79 @@ static void setup_mono_path(const char *dir, const char *root) {
 // 前向声明：托管异常转可读文本（定义见下方 boot_bepinex 之后）
 static void nebula_log_exception(MonoObject *exc);
 
+// 在调用 Doorstop.Entrypoint.Start() 之前，手动把 BepInEx.Paths 指向真实 app 目录。
+// 原因：我们绕过了原生 doorstop，BepInEx 不会自己初始化 Paths；
+// 否则预加载日志会写到 CWD(/) 被 iOS 沙盒拒绝（UnauthorizedAccessException: /preloader_*.log）。
+// 注意：iOS 被 BepInEx 当成 MacOS 处理，SetExecutablePath 的 MacOS 分支会往上跳 4 级目录，
+// 对 iOS 的 .app 扁平结构是错的，所以 GameRootPath / GameDataPath 必须显式覆盖回 AmongUs.app。
+static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
+    if (!domain || !root) return 0;
+
+    // 1) 在已加载程序集里找 BepInEx.Core（程序集简单名 "BepInEx.Core"，含 BepInEx.Paths）
+    MonoImage *bepImg = NULL;
+    int n = 0;
+    MonoAssembly **asv = mono_domain_get_assemblies(domain, &n);
+    for (int i = 0; i < n; i++) {
+        MonoAssemblyName *an = mono_assembly_get_name(asv[i]);
+        const char *nm = an ? mono_assembly_name_get_name(an) : NULL;
+        if (nm && (strcmp(nm, "BepInEx.Core") == 0 || strcmp(nm, "BepInEx") == 0)) {
+            bepImg = mono_assembly_get_image(asv[i]);
+            break;
+        }
+    }
+    if (!bepImg) { fprintf(stderr, "[host] 找不到 BepInEx 程序集，无法设置 Paths\n"); return 0; }
+
+    MonoClass *paths = mono_class_from_name(bepImg, "BepInEx", "Paths");
+    if (!paths) { fprintf(stderr, "[host] 找不到 BepInEx.Paths\n"); return 0; }
+
+    char exepath[PATH_MAX], bepinroot[PATH_MAX], datapath[PATH_MAX];
+    snprintf(exepath,   sizeof(exepath),   "%s/AmongUs", root);
+    snprintf(bepinroot, sizeof(bepinroot), "%s/BepInEx", root);
+    snprintf(datapath,  sizeof(datapath),  "%s/Data", root);
+
+    // 保险：若 Doorstop.Entrypoint.Start() 内部用 DOORSTOP_PROCESS_PATH 自行初始化 Paths，
+    // 这里给出真实可执行文件路径（非 MacOS 分支时即可算对 GameRootPath）。
+    setenv("DOORSTOP_PROCESS_PATH", exepath, 1);
+
+    // 2) Paths.SetExecutablePath(exe, bepinRoot, null, false, null)
+    //    bepinRoot 显式传入，确保 BepInExRootPath/PluginPath/ConfigPath 全部落在 app 内。
+    MonoMethod *sep = mono_class_get_method_from_name(paths, "SetExecutablePath", 5);
+    if (sep) {
+        MonoString *exe = mono_string_new(domain, exepath);
+        MonoString *bep = mono_string_new(domain, bepinroot);
+        MonoString *mgd = NULL;
+        int b = 0;
+        MonoObject *bobj = mono_value_box(domain, mono_get_boolean_class(), &b);
+        void *args[5] = { exe, bep, mgd, bobj, NULL };
+        MonoObject *exc = NULL;
+        mono_runtime_invoke(sep, NULL, args, &exc);
+        if (exc) { fprintf(stderr, "[host] SetExecutablePath 抛异常:\n"); nebula_log_exception(exc); }
+        else printf("[host] Paths.SetExecutablePath OK (exe=%s bepinRoot=%s)\n", exepath, bepinroot);
+    } else {
+        fprintf(stderr, "[host] 找不到 Paths.SetExecutablePath\n");
+    }
+
+    // 3) 覆盖 GameRootPath / GameDataPath（绕过 iOS 被误判 MacOS 的 4 级上跳）
+    MonoProperty *pGR = mono_class_get_property_from_name(paths, "GameRootPath");
+    MonoProperty *pGD = mono_class_get_property_from_name(paths, "GameDataPath");
+    MonoObject *exc = NULL;
+    if (pGR) {
+        MonoMethod *setGR = mono_property_get_set_method(pGR);
+        if (setGR) { MonoString *gr = mono_string_new(domain, root); void *a[1] = { gr };
+                     mono_runtime_invoke(setGR, NULL, a, &exc);
+                     if (exc) { fprintf(stderr, "[host] 设 GameRootPath 失败\n"); nebula_log_exception(exc); exc = NULL; } }
+    }
+    if (pGD) {
+        MonoMethod *setGD = mono_property_get_set_method(pGD);
+        if (setGD) { MonoString *gd = mono_string_new(domain, datapath); void *a[1] = { gd };
+                     mono_runtime_invoke(setGD, NULL, a, &exc);
+                     if (exc) { fprintf(stderr, "[host] 设 GameDataPath 失败\n"); nebula_log_exception(exc); exc = NULL; } }
+    }
+
+    printf("[host] Paths 初始化完成: GameRootPath=%s BepInExRootPath=%s\n", root, bepinroot);
+    return 1;
+}
+
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
 static int boot_bepinex(MonoDomain *domain, const char *root) {
     MonoAssembly *as = NULL;
@@ -460,6 +533,10 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
 
     MonoMethod *start = mono_class_get_method_from_name(klass, "Start", 0);
     if (!start) { fprintf(stderr, "[host] 找不到 Doorstop.Entrypoint.Start()\n"); return 0; }
+
+    // 切换 CWD 到 app 目录（兜底：任何相对路径写入都落在可写容器内），并手动初始化 BepInEx.Paths
+    chdir(root);
+    nebula_init_bepinex_paths(domain, root);
 
     printf("[host] 调用 Doorstop.Entrypoint.Start() —— 之后交给 BepInEx chainloader\n");
     MonoObject *exc = NULL;
