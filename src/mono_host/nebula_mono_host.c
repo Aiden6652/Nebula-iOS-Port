@@ -612,8 +612,13 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 切换 CWD 到 app 目录（兜底：任何相对路径写入都落在可写容器内），并手动初始化 BepInEx.Paths
     chdir(root);
     nebula_init_bepinex_paths(domain, root);
-    // 关键：强制 PlatformHelper.Current=iOS，绕过嵌入式 Mono 把 iOS 报成 MacOSX 导致
-    // SetExecutablePath 走 MacOS 分支上跳 4 级、GameRootPath 错位的坑。
+    // 关键：在 BepInEx 接管前注入 NEBULA_IOS=1，触发 vendored BepInEx 的 Patch A
+    // （Preloader.Core.PlatformUtils.SetPlatform 在 set_Current 前若检测到该 env=1，
+    //  强制 PlatformHelper.Current = iOS(0x249)），彻底绕过嵌入式 Mono 把 iOS 报成
+    //  MacOSX 导致 SetExecutablePath 走 MacOS 分支上跳 4 级、GameRootPath 错位的坑。
+    setenv("NEBULA_IOS", "1", 1);
+    // 残留冗余：Enum.Parse 覆写 Current 在真机已失效（找不到 Enum.Parse(Type,string)）
+    // 且会被 SetPlatform 重置；保留为无害兜底，主机制改为上面的 env 触发 Patch A。
     nebula_fix_platform(domain);
 
     printf("[host] 调用 Doorstop.Entrypoint.Start() —— 之后交给 BepInEx chainloader\n");
