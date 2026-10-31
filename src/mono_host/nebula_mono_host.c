@@ -433,83 +433,50 @@ static void setup_mono_path(const char *dir, const char *root) {
 // 前向声明：托管异常转可读文本（定义见下方 boot_bepinex 之后）
 static void nebula_log_exception(MonoObject *exc);
 
-// 在调用 Doorstop.Entrypoint.Start() 之前，手动把 BepInEx.Paths 指向真实 app 目录。
-// 原因：我们绕过了原生 doorstop，BepInEx 不会自己初始化 Paths；
-// 否则预加载日志会写到 CWD(/) 被 iOS 沙盒拒绝（UnauthorizedAccessException: /preloader_*.log）。
-// 注意：iOS 被 BepInEx 当成 MacOS 处理，SetExecutablePath 的 MacOS 分支会往上跳 4 级目录，
-// 对 iOS 的 .app 扁平结构是错的，所以 GameRootPath / GameDataPath 必须显式覆盖回 AmongUs.app。
+// 配置 BepInEx 启动所需的环境变量，让 PreloaderMain 内部的 Paths.SetExecutablePath
+// 自动算对（iOS 被 PlatformUtils.SetPlatform 识别为 Platform.iOS → 走非 MacOS 分支）。
+// 关键发现（读 BepInEx 6 源码确认）：
+//   - BepInExRootPath 由 DOORSTOP_INVOKE_DLL_PATH 经 Utility.ParentDirectory(.,2) 决定，必须落在
+//     【可写容器目录】，否则 iOS 只读 bundle 会让 BepInEx 写日志/配置失败；此前抛
+//     UnauthorizedAccessException，且被 Start() 的 catch 写日志再次掩盖真实错误。
+//   - GameRootPath 由 DOORSTOP_PROCESS_PATH 的所在目录决定（= root / AmongUs.app）。
+//   - Start() 的 catch 会把真实异常写到 BEPINEX_PRELOADER_LOG；设为绝对可写路径，避免它落到
+//     只读 bundle 抛 UnauthorizedAccessException 把真错误彻底掩盖。
+// 我们【不再】主动调用 SetExecutablePath（那会在 SetPlatform() 之前误中 MacOS 分支），而是把参数
+// 通过环境变量交给 PreloaderMain 内部，由它用正确的 iOS 分支计算 Paths。
 static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
-    if (!domain || !root) return 0;
+    (void)domain;
+    if (!root) return 0;
 
-    // 1) 取 BepInEx.Core 的 image（含 BepInEx.Paths）。
-    //    注意：iOS 链接的 mono 静态库不导出 mono_domain_get_assemblies，无法遍历程序集；
-    //    改用项目自带的内存 blob 加载器从 BepInEx/core 直接取 Core 镜像。
-    MonoImage *bepImg = NULL;
-    const blob_entry *core_e = blob_find("BepInEx.Core");
-    if (core_e) {
-        MonoAssembly *core_as = blob_load_assembly(core_e);
-        if (core_as) bepImg = mono_assembly_get_image(core_as);
-    }
-    if (!bepImg) { fprintf(stderr, "[host] 找不到 BepInEx.Core 镜像，无法设置 Paths\n"); return 0; }
-
-    MonoClass *paths = mono_class_from_name(bepImg, "BepInEx", "Paths");
-    if (!paths) { fprintf(stderr, "[host] 找不到 BepInEx.Paths\n"); return 0; }
-
-    char exepath[PATH_MAX], bepinroot[PATH_MAX], datapath[PATH_MAX];
-    snprintf(exepath,   sizeof(exepath),   "%s/AmongUs", root);
-    snprintf(datapath,  sizeof(datapath),  "%s/Data", root);
-
-    // BepInEx 根目录必须落在【可写容器目录】：iOS 的 app bundle 是只读的，
-    // 把 BepInExRootPath 指向 bundle 内，会让 SetExecutablePath / 写日志抛
-    // UnauthorizedAccessException（实测崩溃点）。$HOME 即容器 Data 目录，
-    // Documents 可写且持久 → $HOME/Documents/BepInEx。
     const char *home = getenv("HOME");
-    if (home && home[0]) snprintf(bepinroot, sizeof(bepinroot), "%s/Documents/BepInEx", home);
-    else                 snprintf(bepinroot, sizeof(bepinroot), "%s/BepInEx", root);
-    mkdir(bepinroot, 0755);   // 保证父目录存在（BepInEx 会在其下建 config/plugins/log 等）
-    printf("[host] BepInEx 根目录(可写)=%s (HOME=%s)\n", bepinroot, home ? home : "(null)");
-    fflush(NULL);
+    if (!home || !home[0]) home = root;   // 兜底：iOS 一定有 HOME
 
-    // 保险：若 Doorstop.Entrypoint.Start() 内部用 DOORSTOP_PROCESS_PATH 自行初始化 Paths，
-    // 这里给出真实可执行文件路径（非 MacOS 分支时即可算对 GameRootPath）。
+    char bepinroot[PATH_MAX], invoke[PATH_MAX], prelog[PATH_MAX], exepath[PATH_MAX];
+    snprintf(bepinroot, sizeof(bepinroot), "%s/Documents/BepInEx", home);
+    snprintf(invoke,    sizeof(invoke),    "%s/core/BepInEx.Preloader.dll", bepinroot);
+    snprintf(prelog,    sizeof(prelog),    "%s/Documents/preloader.log", home);
+    snprintf(exepath,   sizeof(exepath),   "%s/AmongUs", root);
+
+    // 创建可写 BepInEx 目录结构：BepInEx 会在其下写 config / plugins / log / cache 等
+    mkdir(bepinroot, 0755);
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s/core", bepinroot);     mkdir(tmp, 0755);
+    snprintf(tmp, sizeof(tmp), "%s/plugins", bepinroot);  mkdir(tmp, 0755);
+    snprintf(tmp, sizeof(tmp), "%s/config", bepinroot);   mkdir(tmp, 0755);
+    snprintf(tmp, sizeof(tmp), "%s/patchers", bepinroot); mkdir(tmp, 0755);
+    snprintf(tmp, sizeof(tmp), "%s/cache", bepinroot);    mkdir(tmp, 0755);
+
+    // 1) DOORSTOP_INVOKE_DLL_PATH → ParentDirectory(.,2) 即 BepInExRootPath（可写，绕过只读 bundle）
+    setenv("DOORSTOP_INVOKE_DLL_PATH", invoke, 1);
+    // 2) DOORSTOP_PROCESS_PATH → GameRootPath = 其所在目录 = root（AmongUs.app）
     setenv("DOORSTOP_PROCESS_PATH", exepath, 1);
+    // 3) BEPINEX_PRELOADER_LOG → 绝对可写路径：Start() 的 catch 把真实异常写到这里，
+    //    避免落到只读 bundle 抛 UnauthorizedAccessException 把真错误彻底掩盖
+    setenv("BEPINEX_PRELOADER_LOG", prelog, 1);
 
-    // 2) Paths.SetExecutablePath(exe, bepinRoot, null, false, null)
-    //    bepinRoot 显式传入，确保 BepInExRootPath/PluginPath/ConfigPath 全部落在 app 内。
-    MonoMethod *sep = mono_class_get_method_from_name(paths, "SetExecutablePath", 5);
-    if (sep) {
-        MonoString *exe = mono_string_new(domain, exepath);
-        MonoString *bep = mono_string_new(domain, bepinroot);
-        MonoString *mgd = NULL;
-        int b = 0;
-        MonoObject *bobj = mono_value_box(domain, mono_get_boolean_class(), &b);
-        void *args[5] = { exe, bep, mgd, bobj, NULL };
-        MonoObject *exc = NULL;
-        mono_runtime_invoke(sep, NULL, args, &exc);
-        if (exc) { fprintf(stderr, "[host] SetExecutablePath 抛异常:\n"); nebula_log_exception(exc); }
-        else printf("[host] Paths.SetExecutablePath OK (exe=%s bepinRoot=%s)\n", exepath, bepinroot);
-    } else {
-        fprintf(stderr, "[host] 找不到 Paths.SetExecutablePath\n");
-    }
-
-    // 3) 覆盖 GameRootPath / GameDataPath（绕过 iOS 被误判 MacOS 的 4 级上跳）
-    MonoProperty *pGR = mono_class_get_property_from_name(paths, "GameRootPath");
-    MonoProperty *pGD = mono_class_get_property_from_name(paths, "GameDataPath");
-    MonoObject *exc = NULL;
-    if (pGR) {
-        MonoMethod *setGR = mono_property_get_set_method(pGR);
-        if (setGR) { MonoString *gr = mono_string_new(domain, root); void *a[1] = { gr };
-                     mono_runtime_invoke(setGR, NULL, a, &exc);
-                     if (exc) { fprintf(stderr, "[host] 设 GameRootPath 失败\n"); nebula_log_exception(exc); exc = NULL; } }
-    }
-    if (pGD) {
-        MonoMethod *setGD = mono_property_get_set_method(pGD);
-        if (setGD) { MonoString *gd = mono_string_new(domain, datapath); void *a[1] = { gd };
-                     mono_runtime_invoke(setGD, NULL, a, &exc);
-                     if (exc) { fprintf(stderr, "[host] 设 GameDataPath 失败\n"); nebula_log_exception(exc); exc = NULL; } }
-    }
-
-    printf("[host] Paths 初始化完成: GameRootPath=%s BepInExRootPath=%s\n", root, bepinroot);
+    printf("[host] BepInEx 环境就绪: BepInExRootPath=%s  GameRootPath≈%s  prelog=%s\n",
+           bepinroot, root, prelog);
+    fflush(NULL);
     return 1;
 }
 
