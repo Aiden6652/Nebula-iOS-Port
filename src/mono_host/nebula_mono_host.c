@@ -1856,9 +1856,29 @@ static void *boot_thread(void *arg) {
 }
 
 static void boot(void) {
+    // 【阻塞式 boot】默认主线程在这里等到 boot_thread 全部结束才返回 ——
+    // 期间游戏保持占位黑屏，Unity / Innersloth / 游戏本体一律不得提前开跑。
+    //
+    // 背景（本 bug 的根因）：旧实现 pthread_detach 后主线程立刻放行，
+    // Unity 与 preloader 变成并行。于是 BepInEx 还在啃 UnityFramework 生成 interop 时，
+    // 游戏已经把 Unity 初始化、Coroutine、甚至 IAP 商品列表都跑完了；
+    // 等 interop 生成完毕，游戏早已加载完成，NOS 再也找不到插入时机 —— 表现就是"永远加载不了"。
+    // PC 上 Doorstop 是同步阻塞的（preloader 跑完才轮到 Unity），这里必须对齐同样的语义。
+    //
+    // NEBULA_BLOCK_BOOT=0 可退回旧的异步行为（仅供对照实验）。
+    const char *blk = getenv("NEBULA_BLOCK_BOOT");
+    int block = !(blk && strcmp(blk, "0") == 0);
+
     pthread_t t;
-    pthread_create(&t, NULL, boot_thread, NULL);
-    pthread_detach(t);
+    if (pthread_create(&t, NULL, boot_thread, NULL) != 0) return;
+
+    if (block) {
+        hlog("[host] boot 阻塞模式：主线程等待 BepInEx/interop 生成完成，期间保持占位黑屏");
+        pthread_join(t, NULL);
+        hlog("[host] boot 阻塞结束，放行 Unity 继续加载（游戏与 NOS 一同加载）");
+    } else {
+        pthread_detach(t);
+    }
 }
 
 #ifdef BUILD_AS_LIB
