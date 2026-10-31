@@ -625,6 +625,11 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     //  强制 PlatformHelper.Current = iOS(0x249)），彻底绕过嵌入式 Mono 把 iOS 报成
     //  MacOSX 导致 SetExecutablePath 走 MacOS 分支上跳 4 级、GameRootPath 错位的坑。
     setenv("NEBULA_IOS", "1", 1);
+    // 诊断（R35）：强制 BepInEx 全级别日志写文件 + 控制台，便于定位 NOS 初始化失败原因
+    setenv("BEPINEX_LOG_LEVEL", "All", 1);
+    setenv("BEPINEX_PRELOADER_LOG_WRITE", "true", 1);
+    setenv("BEPINEX_PRELOADER_LOG_CONSOLE", "true", 1);
+    setenv("DOORSTOP_LOG_LEVEL", "All", 1);
     // 残留冗余：Enum.Parse 覆写 Current 在真机已失效（找不到 Enum.Parse(Type,string)）
     // 且会被 SetPlatform 重置；保留为无害兜底，主机制改为上面的 env 触发 Patch A。
     nebula_fix_platform(domain);
@@ -633,6 +638,16 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     MonoObject *exc = NULL;
     mono_runtime_invoke(start, NULL, NULL, &exc);
     nebula_log_paths(domain);   // 诊断：打印 Paths 真实落点，判定平台/MacOS/Data 问题
+    // 诊断（R35）：枚举 BepInEx 目录，确认 Preloader/Chainloader 是否生成产物
+    // （preloader.log / LogOutput.log / plugins 缓存），定位 NOS 初始化失败原因
+    {
+        const char *home = getenv("HOME");
+        char bepdir[PATH_MAX];
+        snprintf(bepdir, sizeof(bepdir), "%s/Documents/BepInEx", home ? home : root);
+        printf("[host][diag] === BepInEx 目录枚举（Start 之后）===\n");
+        nebula_list_dir(bepdir, 0);
+        fflush(NULL);
+    }
     if (exc) { fprintf(stderr, "[host] !! Start() 抛出异常\n"); nebula_log_exception(exc); return 0; }
     printf("[host] Start() 已返回，RSS=%ldMB\n", rss_mb());
     return 1;
@@ -648,6 +663,31 @@ static void nebula_log_exception(MonoObject *exc) {
     const char *nm = c ? mono_class_get_name(c) : "?";
     fprintf(stderr, "[host]   异常类型: %s.%s\n", ns ? ns : "", nm ? nm : "?");
     fflush(NULL);
+}
+
+// 诊断（R35）：递归枚举目录打印到 host 日志，确认 BepInEx 运行后生成了哪些产物
+// （preloader.log / LogOutput.log / plugins 缓存 / NOS 自身写的错误日志），
+// 用于定位 NOS 初始化失败原因。深度限制 3 层，防符号链接环或超大目录爆炸。
+static void nebula_list_dir(const char *path, int depth) {
+    if (depth > 3) return;
+    DIR *d = opendir(path);
+    if (!d) { printf("[host][dir] 无法打开 %s\n", path); fflush(NULL); return; }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        char full[PATH_MAX];
+        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        struct stat st;
+        if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+            printf("[host][dir] D %s/\n", full);
+            fflush(NULL);
+            nebula_list_dir(full, depth + 1);
+        } else {
+            printf("[host][dir] F %s (%lld bytes)\n", full, (long long)(stat(full, &st) == 0 ? st.st_size : -1));
+            fflush(NULL);
+        }
+    }
+    closedir(d);
 }
 
 // 尝试调用某个静态无参方法，成功返回 1
