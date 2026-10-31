@@ -15,6 +15,12 @@ echo "[build] 2/2 编译原生宿主 ..."
 if pkg-config --exists mono-2 2>/dev/null; then
     # 注意：-lstdc++ 必须加，libmono-2.0 含 C++ 代码（EXE 链接需要解析 __cxa_* 等符号）。
     CFLAGS="$(pkg-config --cflags --libs mono-2) -lstdc++ -lpthread"
+    # Darwin 下必须显式链 CoreFoundation：宿主的 boot() 在阻塞等待 interop 生成时
+    # 会用 CFRunLoopRunInMode 泵浦主运行循环（只 include 头文件不链 framework，
+    # 会在链接期报 _CFRunLoopRunInMode / _kCFRunLoopDefaultMode undefined）。
+    if [ "$(uname -s)" = "Darwin" ]; then
+        CFLAGS="$CFLAGS -framework CoreFoundation"
+    fi
     # 所有宿主源文件：主宿主 + 大小写不敏感回退(case_insensitive_fs.c，定义 nebula_cifs_init)
     # + fishhook(rebind_symbols 实现，仅 Darwin 可用)。漏编任一都会链接期报 undefined symbol。
     SRC="$ROOT/nebula_mono_host.c $ROOT/case_insensitive_fs.c $ROOT/fishhook.c"
