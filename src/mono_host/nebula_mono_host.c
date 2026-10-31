@@ -432,8 +432,102 @@ static void setup_mono_path(const char *dir, const char *root) {
 
 // 前向声明：托管异常转可读文本（定义见下方 boot_bepinex 之后）
 static void nebula_log_exception(MonoObject *exc);
+static void nebula_fix_platform(MonoDomain *domain);
+static void nebula_log_paths(MonoDomain *domain);
 
-// 配置 BepInEx 启动所需的环境变量，让 PreloaderMain 内部的 Paths.SetExecutablePath
+// 强制把 MonoMod 的 PlatformHelper.Current 覆写为 iOS。
+// 根因（读 BepInEx / MonoMod 源码确认）：嵌入式 Mono 把 iOS 报成 MacOSX；
+// PlatformUtils.SetPlatform() 据此把 PlatformHelper.Current 设成 MacOS，而 iOS 检测分支
+// （要求 current 先为 Unix）被跳过。于是 Paths.SetExecutablePath 走 MacOS 分支的
+// ParentDirectory(exe,4) 上跳 4 级，GameRootPath 落到 /private/var/containers 之类，
+// AmongUs.app/Data 自然找不到 → 抛 DirectoryNotFoundException。直接覆写 Current=iOS，
+// 让 SetExecutablePath 走非 MacOS 分支（GameRootPath = exe 所在目录 = AmongUs.app）。
+//
+// 注：以下 mono API 在部分 iOS mono 构建的头里未导出声明，这里补 extern（函数本体在 libmono 中存在）。
+extern MonoType *mono_class_get_type(MonoClass *klass);
+extern MonoObject *mono_type_get_object(MonoDomain *domain, MonoType *type);
+extern MonoMethodDesc *mono_method_desc_new(const char *name, int include_namespace);
+extern MonoMethod *mono_method_desc_search_in_class(MonoMethodDesc *desc, MonoClass *klass);
+extern void mono_method_desc_free(MonoMethodDesc *desc);
+extern char *mono_string_to_utf8(MonoString *s);
+
+static void nebula_fix_platform(MonoDomain *domain) {
+    if (!domain) return;
+    const blob_entry *mm_e = blob_find("MonoMod.Utils");
+    if (!mm_e) { fprintf(stderr, "[host] 找不到 MonoMod.Utils blob，无法纠正平台\n"); return; }
+    MonoAssembly *mma = blob_load_assembly(mm_e);
+    if (!mma) { fprintf(stderr, "[host] 加载 MonoMod.Utils 失败\n"); return; }
+    MonoImage *mm = mono_assembly_get_image(mma);
+    MonoClass *ph = mono_class_from_name(mm, "MonoMod.Utils", "PlatformHelper");
+    if (!ph) { fprintf(stderr, "[host] 找不到 PlatformHelper\n"); return; }
+
+    // 取 Platform 枚举的 iOS 值：Enum.Parse(typeof(Platform), "iOS")
+    MonoClass *penum = mono_class_from_name(mm, "MonoMod.Utils", "Platform");
+    if (!penum) { fprintf(stderr, "[host] 找不到 Platform 枚举\n"); return; }
+    MonoClass *enumCls = mono_class_from_name(mono_get_corlib(), "System", "Enum");
+    if (!enumCls) { fprintf(stderr, "[host] 找不到 System.Enum\n"); return; }
+    MonoMethodDesc *desc = mono_method_desc_new("System.Enum:Parse(System.Type,System.String)", TRUE);
+    MonoMethod *parse = desc ? mono_method_desc_search_in_class(desc, enumCls) : NULL;
+    if (desc) mono_method_desc_free(desc);
+    if (!parse) { fprintf(stderr, "[host] 找不到 Enum.Parse(Type,string)\n"); return; }
+
+    MonoType *ptype = mono_class_get_type(penum);
+    MonoObject *rt = mono_type_get_object(domain, ptype);
+    MonoString *ios = mono_string_new(domain, "iOS");
+    void *pargs[2] = { rt, ios };
+    MonoObject *exc = NULL;
+    MonoObject *iosVal = mono_runtime_invoke(parse, NULL, pargs, &exc);
+    if (exc || !iosVal) {
+        nebula_log_exception(exc);
+        fprintf(stderr, "[host] Enum.Parse(Platform,iOS) 失败\n");
+        return;
+    }
+
+    // PlatformHelper.Current = iosVal（属性 setter，mono 不强制可见性）
+    MonoProperty *curP = mono_class_get_property_from_name(ph, "Current");
+    MonoMethod *setCur = curP ? mono_property_get_set_method(curP) : NULL;
+    if (!setCur) { fprintf(stderr, "[host] 找不到 PlatformHelper.Current setter\n"); return; }
+    void *sargs[1] = { iosVal };
+    mono_runtime_invoke(setCur, NULL, sargs, &exc);
+    if (exc) { nebula_log_exception(exc); fprintf(stderr, "[host] 设置 PlatformHelper.Current=iOS 失败\n"); }
+    else     { printf("[host] 已强制 PlatformHelper.Current=iOS（绕过 MacOS 误判）\n"); }
+    fflush(NULL);
+}
+
+// 诊断：读取并打印 BepInEx.Paths.GameRootPath / GameDataPath。
+// 用于判定 SetExecutablePath 之后 Paths 的真实落点：
+//   - GameRootPath 若变成 /private/var/containers 之类 → 说明仍中 MacOS 分支（平台覆盖被 SetPlatform 重置）
+//   - GameRootPath=AmongUs.app 但 GameDataPath=null → 说明 Data 在 .NET 下不可见（路径/沙盒问题）
+static void nebula_log_paths(MonoDomain *domain) {
+    if (!domain) return;
+    const blob_entry *core_e = blob_find("BepInEx.Core");
+    if (!core_e) return;
+    MonoAssembly *core_as = blob_load_assembly(core_e);
+    if (!core_as) return;
+    MonoImage *img = mono_assembly_get_image(core_as);
+    MonoClass *paths = mono_class_from_name(img, "BepInEx", "Paths");
+    if (!paths) return;
+
+    MonoProperty *pGR = mono_class_get_property_from_name(paths, "GameRootPath");
+    MonoProperty *pGD = mono_class_get_property_from_name(paths, "GameDataPath");
+    MonoMethod *gGR = pGR ? mono_property_get_get_method(pGR) : NULL;
+    MonoMethod *gGD = pGD ? mono_property_get_get_method(pGD) : NULL;
+    MonoObject *exc = NULL;
+    if (gGR) {
+        MonoObject *gr = mono_runtime_invoke(gGR, NULL, NULL, &exc);
+        if (gr) { char *c = mono_string_to_utf8((MonoString *)gr);
+                  printf("[host] Paths.GameRootPath = %s\n", c ? c : "(null)"); if (c) free(c); }
+        else fprintf(stderr, "[host] 读 GameRootPath 失败（未初始化？）\n");
+        exc = NULL;
+    }
+    if (gGD) {
+        MonoObject *gd = mono_runtime_invoke(gGD, NULL, NULL, &exc);
+        if (gd) { char *c = mono_string_to_utf8((MonoString *)gd);
+                  printf("[host] Paths.GameDataPath = %s\n", c ? c : "(null)"); if (c) free(c); }
+        else fprintf(stderr, "[host] 读 GameDataPath 失败（未初始化？）\n");
+    }
+    fflush(NULL);
+}
 // 自动算对（iOS 被 PlatformUtils.SetPlatform 识别为 Platform.iOS → 走非 MacOS 分支）。
 // 关键发现（读 BepInEx 6 源码确认）：
 //   - BepInExRootPath 由 DOORSTOP_INVOKE_DLL_PATH 经 Utility.ParentDirectory(.,2) 决定，必须落在
@@ -455,7 +549,7 @@ static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
     snprintf(bepinroot, sizeof(bepinroot), "%s/Documents/BepInEx", home);
     snprintf(invoke,    sizeof(invoke),    "%s/core/BepInEx.Preloader.dll", bepinroot);
     snprintf(prelog,    sizeof(prelog),    "%s/Documents/preloader.log", home);
-    snprintf(exepath,   sizeof(exepath),   "%s/AmongUs", root);
+    snprintf(exepath,   sizeof(exepath),   "%s/AmongUs", root);   // GameRootPath = root(AmongUs.app)
 
     // 创建可写 BepInEx 目录结构：BepInEx 会在其下写 config / plugins / log / cache 等
     mkdir(bepinroot, 0755);
@@ -468,13 +562,13 @@ static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
 
     // 1) DOORSTOP_INVOKE_DLL_PATH → ParentDirectory(.,2) 即 BepInExRootPath（可写，绕过只读 bundle）
     setenv("DOORSTOP_INVOKE_DLL_PATH", invoke, 1);
-    // 2) DOORSTOP_PROCESS_PATH → GameRootPath = 其所在目录 = root（AmongUs.app）
+    // 2) DOORSTOP_PROCESS_PATH → GameRootPath = 其所在目录 = root（AmongUs.app，Data 真实存在）
     setenv("DOORSTOP_PROCESS_PATH", exepath, 1);
     // 3) BEPINEX_PRELOADER_LOG → 绝对可写路径：Start() 的 catch 把真实异常写到这里，
     //    避免落到只读 bundle 抛 UnauthorizedAccessException 把真错误彻底掩盖
     setenv("BEPINEX_PRELOADER_LOG", prelog, 1);
 
-    printf("[host] BepInEx 环境就绪: BepInExRootPath=%s  GameRootPath≈%s  prelog=%s\n",
+    printf("[host] BepInEx 环境就绪: BepInExRootPath=%s  GameRootPath=%s  prelog=%s\n",
            bepinroot, root, prelog);
     fflush(NULL);
     return 1;
@@ -512,10 +606,14 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 切换 CWD 到 app 目录（兜底：任何相对路径写入都落在可写容器内），并手动初始化 BepInEx.Paths
     chdir(root);
     nebula_init_bepinex_paths(domain, root);
+    // 关键：强制 PlatformHelper.Current=iOS，绕过嵌入式 Mono 把 iOS 报成 MacOSX 导致
+    // SetExecutablePath 走 MacOS 分支上跳 4 级、GameRootPath 错位的坑。
+    nebula_fix_platform(domain);
 
     printf("[host] 调用 Doorstop.Entrypoint.Start() —— 之后交给 BepInEx chainloader\n");
     MonoObject *exc = NULL;
     mono_runtime_invoke(start, NULL, NULL, &exc);
+    nebula_log_paths(domain);   // 诊断：打印 Paths 真实落点，判定平台/MacOS/Data 问题
     if (exc) { fprintf(stderr, "[host] !! Start() 抛出异常\n"); nebula_log_exception(exc); return 0; }
     printf("[host] Start() 已返回，RSS=%ldMB\n", rss_mb());
     return 1;
