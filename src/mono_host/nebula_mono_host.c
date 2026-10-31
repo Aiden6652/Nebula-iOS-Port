@@ -588,6 +588,9 @@ static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
     return 1;
 }
 
+// 诊断（R35）：递归枚举目录，定义在文件下方，先前向声明
+static void nebula_list_dir(const char *path, int depth);
+
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
 static int boot_bepinex(MonoDomain *domain, const char *root) {
     MonoAssembly *as = NULL;
