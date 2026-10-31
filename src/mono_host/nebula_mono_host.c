@@ -588,6 +588,66 @@ static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
     return 1;
 }
 
+// 诊断（R37）：preloader 日志尾部监听线程。
+// 背景：Doorstop.Start() 在真机上不会同步返回（日志里从没出现过「Start() 已返回」），
+// 导致调用点之后那一整段诊断（含异常类型打印、BepInEx 目录枚举）永远执行不到；
+// 而 BepInEx 自己的日志只写文件，文件一旦没生成我们就彻底失明。
+// 做法：在调 Start() 之前把这个后台线程拉起来，周期性把 Documents/preloader.log 的
+// 增量内容原样转发进 host 日志 —— 这样不管 Start() 卡不卡、文件晚多久才出现，
+// BepInEx 的真实报错都能看得见。
+static volatile int g_prelog_tail_running = 0;
+
+static void *nebula_prelog_tail_thread(void *arg) {
+    (void)arg;
+    const char *home = getenv("HOME");
+    char path[PATH_MAX];
+    if (home) snprintf(path, sizeof(path), "%s/Documents/preloader.log", home);
+    else      snprintf(path, sizeof(path), "/var/mobile/Documents/preloader.log");
+
+    long last = 0;
+    int announced = 0;
+    // 监听 120 秒，足够覆盖 preloader 启动窗口（每 0.5s 轮询一次）
+    for (int i = 0; i < 240 && g_prelog_tail_running; i++) {
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            if (!announced) {
+                printf("[host][prelog] 等待日志文件出现: %s（暂未创建）\n", path);
+                fflush(NULL);
+                announced = 1;
+            }
+            usleep(500 * 1000);
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        if (sz > last) {
+            if (fseek(f, last, SEEK_SET) == 0) {
+                char buf[8192];
+                while (sz > last) {
+                    long want = sz - last;
+                    if (want > (long)sizeof(buf) - 1) want = (long)sizeof(buf) - 1;
+                    size_t n = fread(buf, 1, (size_t)want, f);
+                    if (n <= 0) break;
+                    buf[n] = '\0';
+                    char *p = buf;
+                    while (p && *p) {
+                        char *nl = strchr(p, '\n');
+                        if (nl) *nl = '\0';
+                        printf("[host][prelog] %s\n", p);
+                        if (!nl) break;
+                        p = nl + 1;
+                    }
+                    last += (long)n;
+                }
+                fflush(NULL);
+            }
+        }
+        fclose(f);
+        usleep(500 * 1000);
+    }
+    return NULL;
+}
+
 // 诊断（R35）：递归枚举目录，定义在文件下方，先前向声明
 static void nebula_list_dir(const char *path, int depth);
 
@@ -636,6 +696,14 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 残留冗余：Enum.Parse 覆写 Current 在真机已失效（找不到 Enum.Parse(Type,string)）
     // 且会被 SetPlatform 重置；保留为无害兜底，主机制改为上面的 env 触发 Patch A。
     nebula_fix_platform(domain);
+
+    // 诊断（R37）：先把 preloader 日志监听线程拉起来，再调 Start()
+    // （Start() 常年不返回，调用点之后的诊断永远到不了，必须提前起后台 tail）
+    g_prelog_tail_running = 1;
+    {
+        pthread_t tt;
+        if (pthread_create(&tt, NULL, nebula_prelog_tail_thread, NULL) == 0) pthread_detach(tt);
+    }
 
     printf("[host] 调用 Doorstop.Entrypoint.Start() —— 之后交给 BepInEx chainloader\n");
     MonoObject *exc = NULL;
