@@ -135,7 +135,7 @@ static void blob_load(void) {
     }
     if (!hdr) { printf("[host] 取自身 mach_header 失败，无嵌入式 blob\n"); return; }
     unsigned long sz = 0;
-    char *p = getsectiondata((const struct mach_header_64 *)hdr, "__DATA", "__nebulabcl", &sz);
+    char *p = (char *)getsectiondata((const struct mach_header_64 *)hdr, "__DATA", "__nebulabcl", &sz);
     if (!p || sz < 8) { printf("[host] 未找到 __nebulabcl 段（构建未嵌入 blob，走文件兜底）\n"); return; }
     const uint8_t *q = (const uint8_t *)p;
     uint32_t magic; memcpy(&magic, q, 4); q += 4;
@@ -444,8 +444,12 @@ static void nebula_log_paths(MonoDomain *domain);
 // 让 SetExecutablePath 走非 MacOS 分支（GameRootPath = exe 所在目录 = AmongUs.app）。
 //
 // 注：以下 mono API 在部分 iOS mono 构建的头里未导出声明，这里补 extern（函数本体在 libmono 中存在）。
+// MonoMethodDesc 是 mono/metadata/debug-helpers.h 里的内部结构体，此处仅用其指针，
+// 前向声明即可（不依赖 debug-helpers.h 是否可用，兼顾 iOS 交叉编译与 macOS 宿主两套头）。
+typedef struct _MonoMethodDesc MonoMethodDesc;
 extern MonoType *mono_class_get_type(MonoClass *klass);
-extern MonoObject *mono_type_get_object(MonoDomain *domain, MonoType *type);
+// 注意：mono_type_get_object 由 mono/metadata/reflection.h 声明（macOS mono 6.14.1 返回
+// MonoReflectionType*，旧版 iOS mono 返回 MonoObject*），此处不再重复 extern，调用处统一强转 MonoObject*。
 extern MonoMethodDesc *mono_method_desc_new(const char *name, int include_namespace);
 extern MonoMethod *mono_method_desc_search_in_class(MonoMethodDesc *desc, MonoClass *klass);
 extern void mono_method_desc_free(MonoMethodDesc *desc);
@@ -472,7 +476,7 @@ static void nebula_fix_platform(MonoDomain *domain) {
     if (!parse) { fprintf(stderr, "[host] 找不到 Enum.Parse(Type,string)\n"); return; }
 
     MonoType *ptype = mono_class_get_type(penum);
-    MonoObject *rt = mono_type_get_object(domain, ptype);
+    MonoObject *rt = (MonoObject *)mono_type_get_object(domain, ptype);
     MonoString *ios = mono_string_new(domain, "iOS");
     void *pargs[2] = { rt, ios };
     MonoObject *exc = NULL;
