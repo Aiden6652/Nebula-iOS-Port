@@ -444,12 +444,14 @@ static void nebula_log_paths(MonoDomain *domain);
 // 让 SetExecutablePath 走非 MacOS 分支（GameRootPath = exe 所在目录 = AmongUs.app）。
 //
 // 注：以下 mono API 在部分 iOS mono 构建的头里未导出声明，这里补 extern（函数本体在 libmono 中存在）。
-// MonoMethodDesc 是 mono/metadata/debug-helpers.h 里的内部结构体，此处仅用其指针，
-// 前向声明即可（不依赖 debug-helpers.h 是否可用，兼顾 iOS 交叉编译与 macOS 宿主两套头）。
+// 两套头（iOS 自定义 mono vs macOS mono 6.14.1）对内部结构体/原型的可见性不一致，这里统一用
+// 前向声明 + 与 macOS reflection.h 一致的原型，使其在两种编译环境下都不冲突、不隐式声明。
 typedef struct _MonoMethodDesc MonoMethodDesc;
+typedef struct _MonoReflectionType MonoReflectionType;
 extern MonoType *mono_class_get_type(MonoClass *klass);
-// 注意：mono_type_get_object 由 mono/metadata/reflection.h 声明（macOS mono 6.14.1 返回
-// MonoReflectionType*，旧版 iOS mono 返回 MonoObject*），此处不再重复 extern，调用处统一强转 MonoObject*。
+// mono_type_get_object：macOS reflection.h 声明返回 MonoReflectionType*；iOS 头里未声明。
+// 统一按 MonoReflectionType* 声明（与 macOS 一致，iOS 作为唯一声明），调用处再向上转型 MonoObject*。
+extern MonoReflectionType *mono_type_get_object(MonoDomain *domain, MonoType *type);
 extern MonoMethodDesc *mono_method_desc_new(const char *name, int include_namespace);
 extern MonoMethod *mono_method_desc_search_in_class(MonoMethodDesc *desc, MonoClass *klass);
 extern void mono_method_desc_free(MonoMethodDesc *desc);
@@ -476,9 +478,9 @@ static void nebula_fix_platform(MonoDomain *domain) {
     if (!parse) { fprintf(stderr, "[host] 找不到 Enum.Parse(Type,string)\n"); return; }
 
     MonoType *ptype = mono_class_get_type(penum);
-    MonoObject *rt = (MonoObject *)mono_type_get_object(domain, ptype);
+    MonoReflectionType *rt = mono_type_get_object(domain, ptype);
     MonoString *ios = mono_string_new(domain, "iOS");
-    void *pargs[2] = { rt, ios };
+    void *pargs[2] = { (MonoObject *)rt, ios };
     MonoObject *exc = NULL;
     MonoObject *iosVal = mono_runtime_invoke(parse, NULL, pargs, &exc);
     if (exc || !iosVal) {
