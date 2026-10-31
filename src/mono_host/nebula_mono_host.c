@@ -202,8 +202,8 @@ static MonoAssembly *nebula_preload(MonoAssemblyName *aname, char **assemblies_p
 typedef struct {
     char runtime_mode[16];      // jit（解释器已废除，统一编译器版）
     int  gc_nursery_mb;
-    int  gc_soft_limit_mb;      // 软顶：超过即常规 GC（默认 320MB）
-    int  gc_hard_limit_mb;      // 硬顶：超过即激进全量 GC + 告警（默认 500MB，见 #12）
+    int  gc_soft_limit_mb;      // 软顶：超过即常规 GC（默认 700MB）
+    int  gc_hard_limit_mb;      // 硬顶：超过即激进全量 GC + 告警（默认 900MB，见 #12）
     int  gc_watchdog_interval_ms;
     char addons_mode[16];       // all（职业在 addon 里，必须全加载）
     int  addons_texture_max_px;
@@ -218,8 +218,8 @@ typedef struct {
 static host_cfg CFG = {
     .runtime_mode = "jit",
     .gc_nursery_mb = 16,
-    .gc_soft_limit_mb = 320,
-    .gc_hard_limit_mb = 500,    // #12：RSS 超 500MB 强制激进 GC，防 jetsam 杀
+    .gc_soft_limit_mb = 700,
+    .gc_hard_limit_mb = 900,    // #12：RSS 超 900MB 强制激进 GC，防 jetsam 杀（软顶提到 700MB，日常不触发）
     .gc_watchdog_interval_ms = 500,
     .addons_mode = "all",
     .addons_texture_max_px = 512,
@@ -354,9 +354,17 @@ static struct timespec g_wd_t0;         // 看门狗启动时刻，心跳打相�
 
 static void *watchdog_thread(void *arg) {
     (void)arg;
+    // [R34] iOS 自定义 mono 头可能未声明这些 API，函数内 extern 前向声明避免隐式声明告警
+    extern void mono_thread_attach(MonoDomain *domain);
+    extern MonoDomain *mono_get_root_domain(void);
     clock_gettime(CLOCK_MONOTONIC, &g_wd_t0);
     while (watchdog_run) {
         long mb = rss_mb();
+        // [R34 修复] 本线程是裸 pthread，从未向 mono 注册。若直接调 mono_gc_collect，
+        // mono 在 GC 栈扫描（copy_stack_data）阶段拿不到本线程栈边界 → 读越界 SIGSEGV。
+        // 首次进入 GC 前 mono_thread_attach 注册本线程，使其栈可被 GC 正确枚举。
+        static int wd_attached = 0;
+        if (g_mono_ready && !wd_attached) { mono_thread_attach(mono_get_root_domain()); wd_attached = 1; }
         if (mb > 0 && g_logfp) {
             struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
             long el = (now.tv_sec - g_wd_t0.tv_sec) * 1000 + (now.tv_nsec - g_wd_t0.tv_nsec) / 1000000;
