@@ -26,9 +26,25 @@
 
 /* —— 全局状态（同一 dylib 内，宿主 .c 侧 extern 引用） —— */
 static UIView  *g_boot_label = nil;
+static UIView  *g_boot_bg    = nil;   /* 全屏黑色遮罩：生成 interop 期间必须挡住游戏画面 */
 static volatile int g_boot_want   = 0;   /* 是否应当显示（隐藏后置 0） */
 static volatile int g_boot_done   = 0;   /* 是否已销毁 */
 static dispatch_source_t g_boot_timer = NULL;
+
+/* —— 省略号动画（正在生成interop. → .. → ... 循环）——
+   目的：①让用户确信没死机；②定时器打在主队列上，主线程持续有事件在跑，
+   iOS 看门狗统计不到「无响应」，不会按卡死杀进程。 */
+static dispatch_source_t g_boot_dot_timer = NULL;
+static volatile int g_boot_dot_phase = 0;
+static NSString *g_boot_base_text = @"正在生成interop";
+
+static NSString *boot_dot_text(void)
+{
+    NSString *dots[] = { @".", @"..", @"..." };
+    /* 第二行写清预计耗时，避免用户以为卡死直接杀掉 App（interop 首次生成为一次性开销） */
+    return [NSString stringWithFormat:@"%@%@\n预计需要几分钟，请勿锁屏",
+            g_boot_base_text, dots[(g_boot_dot_phase % 3)]];
+}
 
 /* 前向声明（extern，非 static，否则会变成文件内局部符号、不导出）：
    下方 boot_arm_safety 在 nebula_hide_boot_overlay 定义前就调用它 */
@@ -52,18 +68,58 @@ static UIWindow *boot_find_window(void)
     return nil;
 }
 
+/* —— 省略号动画：定时器挂在主队列，每 450ms 推进一个点 —— */
+static void boot_stop_dot_animation(void)
+{
+    if (g_boot_dot_timer) {
+        dispatch_source_cancel(g_boot_dot_timer);
+        g_boot_dot_timer = NULL;
+    }
+}
+
+static void boot_start_dot_animation(void)
+{
+    if (g_boot_dot_timer || g_boot_done) return;
+    g_boot_dot_phase = 0;
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                 dispatch_get_main_queue());
+    if (!t) return;
+    g_boot_dot_timer = t;
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              450 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{
+        if (g_boot_done || !g_boot_want) { boot_stop_dot_animation(); return; }
+        g_boot_dot_phase++;
+        @try {
+            if (g_boot_label) ((UILabel *)g_boot_label).text = boot_dot_text();
+        } @catch (NSException *e) { (void)e; }
+    });
+    dispatch_resume(t);
+}
+
 /* 主线程执行：真正创建/刷新居中标签 */
 static void boot_install_label(void)
 {
     @try {
         UIWindow *win = boot_find_window();
         if (!win) return;   /* 窗口还没起来，等下次重试 */
+        /* 全屏黑色遮罩：interop 生成期间必须挡住底下画面（用户要求「黑屏」，
+           且底下此时是没打补丁的原版游戏，露出来会造成误导） */
+        if (!g_boot_bg) {
+            UIView *bg = [[UIView alloc] initWithFrame:win.bounds];
+            bg.backgroundColor = [UIColor blackColor];
+            bg.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                  UIViewAutoresizingFlexibleHeight;
+            [win addSubview:bg];
+            g_boot_bg = bg;
+        }
+        g_boot_bg.frame = win.bounds;
         if (!g_boot_label) {
             UILabel *lb = [[UILabel alloc] init];
-            lb.text = @"Nebula 核心正在初始化...";
+            lb.text = boot_dot_text();          /* 动态省略号 + 预计耗时提示 */
             lb.textColor = [UIColor whiteColor];
             lb.backgroundColor = [UIColor clearColor];
-            lb.font = [UIFont boldSystemFontOfSize:22];
+            lb.font = [UIFont boldSystemFontOfSize:20];
             lb.textAlignment = NSTextAlignmentCenter;
             lb.numberOfLines = 0;
             lb.lineBreakMode = NSLineBreakByWordWrapping;
@@ -72,12 +128,12 @@ static void boot_install_label(void)
                                  UIViewAutoresizingFlexibleTopMargin |
                                  UIViewAutoresizingFlexibleBottomMargin;
             [win addSubview:lb];
-            [win bringSubviewToFront:lb];   /* 压在最上层，盖住游戏画面 */
+            [win bringSubviewToFront:lb];   /* 压在最上层，盖在黑色遮罩之上 */
             g_boot_label = lb;
         }
         /* 始终重新居中（窗口尺寸/旋转变化时跟着动） */
         CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
-        g_boot_label.bounds = CGRectMake(0, 0, (W > 0 ? W : 320) * 0.92, 64);
+        g_boot_label.bounds = CGRectMake(0, 0, (W > 0 ? W : 320) * 0.92, 120);
         g_boot_label.center = CGPointMake(W / 2.0, H / 2.0);
     } @catch (NSException *e) {
         (void)e;
@@ -88,7 +144,9 @@ static void boot_install_label(void)
 static void boot_remove_label(void)
 {
     @try {
+        boot_stop_dot_animation();
         if (g_boot_label) { [g_boot_label removeFromSuperview]; g_boot_label = nil; }
+        if (g_boot_bg)    { [g_boot_bg removeFromSuperview];    g_boot_bg = nil; }
     } @catch (NSException *e) {
         (void)e;
     }
@@ -145,6 +203,7 @@ void nebula_show_boot_overlay(void)
     if ([NSThread isMainThread]) boot_install_label();
     else dispatch_async(dispatch_get_main_queue(), ^{ boot_install_label(); });
     boot_arm_retry();
+    boot_start_dot_animation();   /* 省略号循环：主线程持续有事件，规避看门狗误杀 */
     boot_arm_safety();
 }
 

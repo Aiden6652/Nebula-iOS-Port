@@ -58,6 +58,7 @@ extern void mono_setmmapjit (int flag);
 #include <os/log.h>
 #include <signal.h>
 #include <dispatch/dispatch.h>     // 启动占位文本的延时/主线程销毁
+#include <CoreFoundation/CoreFoundation.h>   // CFRunLoopRunInMode：boot 阻塞等待期泵浦主运行循环
 #include <sys/mman.h>              // mmap / MAP_JIT（JIT 冒烟测试）
 #include <libkern/OSCacheControl.h> // sys_icache_invalidate（指令缓存刷新）
 #include <errno.h>
@@ -1655,7 +1656,10 @@ static void nebula_setup_native_dllmaps(const char *appdir)
     }
 }
 
-static void *boot_thread(void *arg) {
+/* boot 是否已跑完（无论成功还是中途失败退出） */
+static volatile int g_boot_complete = 0;
+
+static void *boot_thread_impl(void *arg) {
     (void)arg;
     hlog("[host] boot thread started");
     // 全球化：默认 invariant 模式，避免 iOS 上缺 icudt.dat 崩溃（游戏模组走 UTF-8，不受影响）。
@@ -1706,7 +1710,34 @@ static void *boot_thread(void *arg) {
     // 启动占位文本：Mono + BepInEx 初始化期间显示在屏幕正中，防黑屏误判死机。
     // 窗口可能还没起来，内部带重试；Nebula.dll + Harmony 就绪后由托管侧
     // nebula_signal_ready() 销毁，或此处兜底延时/安全超时销毁。
-    nebula_show_boot_overlay();
+    // 占位文字只在「真的要生成 interop」时才出现。
+    // interop 生成是一次性分钟级重活，生成过之后本次启动应当秒过且完全不显示，
+    // 否则每次启动都闪一下「正在生成interop」是对用户的误导。
+    {
+        int has_interop = 0;
+        char idir[PATH_MAX];
+        const char *home = getenv("HOME");
+        /* interop 可能在 app 根下的 BepInEx/interop，也可能在 Documents 下，两处都查 */
+        for (int k = 0; k < 2 && !has_interop; k++) {
+            if (k == 0) snprintf(idir, sizeof(idir), "%s/BepInEx/interop", root);
+            else if (home) snprintf(idir, sizeof(idir), "%s/Documents/BepInEx/interop", home);
+            else continue;
+            DIR *d = opendir(idir);
+            if (!d) continue;
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                size_t L = strlen(de->d_name);
+                if (L > 4 && strcasecmp(de->d_name + L - 4, ".dll") == 0) { has_interop = 1; break; }
+            }
+            closedir(d);
+        }
+        if (has_interop) {
+            hlog("[host] interop 已存在，跳过占位文字（本次启动无需生成，应直接放行）");
+        } else {
+            hlog("[host] interop 未生成：显示占位文字（黑屏 + 省略号动画，预计数分钟）");
+            nebula_show_boot_overlay();
+        }
+    }
 
     // 大小写回退必须在知道游戏根目录后装（只对它生效），且默认关闭
     hlog("[host] step: cifs init");
@@ -1855,6 +1886,13 @@ static void *boot_thread(void *arg) {
     return NULL;
 }
 
+/* 包装层：不论 impl 从哪条 return 退出都置完成标志，避免逐条返回点去改 */
+static void *boot_thread(void *arg) {
+    void *r = boot_thread_impl(arg);
+    g_boot_complete = 1;
+    return r;
+}
+
 static void boot(void) {
     // 【阻塞式 boot】默认主线程在这里等到 boot_thread 全部结束才返回 ——
     // 期间游戏保持占位黑屏，Unity / Innersloth / 游戏本体一律不得提前开跑。
@@ -1873,7 +1911,16 @@ static void boot(void) {
     if (pthread_create(&t, NULL, boot_thread, NULL) != 0) return;
 
     if (block) {
-        hlog("[host] boot 阻塞模式：主线程等待 BepInEx/interop 生成完成，期间保持占位黑屏");
+        // 关键：绝不能用 pthread_join 纯死等 —— 主线程一卡死，主队列上的占位文字
+        // 与省略号动画统统得不到调度（用户看到黑屏无字），而且会被 iOS 看门狗
+        // 判定无响应（0x8badf00d）直接杀进程。
+        // 改为「等待期间持续泵浦主运行循环」：主线程始终是“正在处理事件”的健康态，
+        // 同时因为 boot 还没返回，Unity 依旧没法往下走 —— 两边要求同时满足。
+        hlog("[host] boot 阻塞模式：等待 BepInEx/interop 生成完成（期间泵浦主运行循环，占位动画持续刷新）");
+        while (!g_boot_complete) {
+            /* 每次最多跑 50ms 就让出，循环里刷新 CFRunLoop → GCD 主队列得以执行 */
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+        }
         pthread_join(t, NULL);
         hlog("[host] boot 阻塞结束，放行 Unity 继续加载（游戏与 NOS 一同加载）");
     } else {
