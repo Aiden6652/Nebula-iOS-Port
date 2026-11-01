@@ -1,0 +1,19 @@
+name: smoke (A/B 判定 CI 取消原因)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  t-linux:
+    name: 'A: ubuntu-latest 冒烟'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "linux runner OK"; uname -a
+
+  t-macos:
+    name: 'B: macos-14 冒烟'
+    runs-on: macos-14
+    steps:
+      - run: echo "macos runner OK"; uname -a; xcrun --sdk iphoneos --show-sdk-path || true
