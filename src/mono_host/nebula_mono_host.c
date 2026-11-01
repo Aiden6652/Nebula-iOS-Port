@@ -644,7 +644,8 @@ static void neb_cfg_set(const char *cfgpath, const char *sec, const char *key, c
             char *nl = strpbrk(v, "\r\n"); if (nl) *nl = 0;
             int bad = 1;
             if (!replace_if_bad) bad = 0;
-            else if (*v) bad = !neb_is_file(v);   // 非空且是真实存在的文件才算"好"
+            else if (*v && !strcasecmp(v, val)) bad = 0;   // 已经是目标值，无需再动
+            else if (*v) bad = !neb_is_file(v);            // 非空且是真实存在的文件才算"好"
             if (bad) replace = 1;
             else {
                 replace = 0;
@@ -862,6 +863,35 @@ static void nebula_fix_il2cpp_paths(const char *root) {
         // 关掉只损失 CallerCount 特性与"死方法"判定，类型/方法本体照样全生成。
         if (neb_mkdir_p(cfgd) != 0) continue;
         neb_cfg_set(cfgp, "IL2CPP", "ScanMethodRefs", "false", 1);
+
+        // 3d) [R51] interop 产物是否已存在 —— 决定要不要重新生成。
+        // 原始语义（R44 曾用"恒 true"压住，现已撤销）：
+        //   CheckIfGenerationRequired(): interop 目录不存在 → 生成；
+        //   assembly-hash.txt 不存在或哈希对不上 → 问 NeedGenerationOrSkip()；
+        //   NeedGenerationOrSkip(): UpdateInteropAssemblies 为 true 才生成，否则跳过。
+        // 所以：目录里有 dll 就设 false（直接用现成产物，哪怕哈希对不上 —— 例如
+        // 从别的机器/平台拷来的那一套，类型绑定是按名字在运行时查的，与生成机无关）；
+        // 目录为空就设 true（交给设备端现场生成）。这样两种路线自动二选一，不用手改配置。
+        {
+            char ip[PATH_MAX];
+            snprintf(ip, sizeof(ip), "%s/BepInEx/interop", bases[i]);
+            struct stat ist;
+            int nip = 0;
+            if (stat(ip, &ist) == 0 && S_ISDIR(ist.st_mode)) {
+                DIR *dd = opendir(ip);
+                if (dd) {
+                    struct dirent *e;
+                    while ((e = readdir(dd)) != NULL) {
+                        size_t L = strlen(e->d_name);
+                        if (L > 4 && !strcasecmp(e->d_name + L - 4, ".dll")) nip++;
+                    }
+                    closedir(dd);
+                }
+            }
+            printf("[host][r51] interop 产物: %s （dll=%d）\n", ip, nip);
+            if (neb_mkdir_p(cfgd) != 0) continue;
+            neb_cfg_set(cfgp, "IL2CPP", "UpdateInteropAssemblies", nip > 0 ? "false" : "true", 1);
+        }
     }
     fflush(NULL);
 }
