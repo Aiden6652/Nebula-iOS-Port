@@ -225,8 +225,11 @@ typedef struct {
 static host_cfg CFG = {
     .runtime_mode = "jit",
     .gc_nursery_mb = 16,
-    .gc_soft_limit_mb = 700,
-    .gc_hard_limit_mb = 900,    // #12：RSS 超 900MB 强制激进 GC，防 jetsam 杀（软顶提到 700MB，日常不触发）
+    .gc_soft_limit_mb = 1100,
+    .gc_hard_limit_mb = 1500,   // [R50] 原 700/900：interop 生成期 Cpp2IL 峰值轻松破 900MB，
+                              // 硬顶贴着峰值会让看门狗一直在触发激进全量 GC，表现为
+                              // 进程还活着、没被 iOS 杀，但看着像卡死。抬到 1100/1500
+                              // 给足空间（实测设备没有被 jetsam 杀，容器内存吃得住）。
     .gc_watchdog_interval_ms = 500,
     .addons_mode = "all",
     .addons_texture_max_px = 512,
@@ -852,6 +855,13 @@ static void nebula_fix_il2cpp_paths(const char *root) {
             neb_cfg_set(cfgp, "IL2CPP", "UnityBaseLibrariesSource", "", 1);
             printf("[host][r48]   unity-libs 已有 %d 个 dll -> 令 BepInEx 跳过联网下载/解压\n", ndll);
         }
+        // 3c) [R50] 关掉 Cpp2IL 的 xref 扫描 —— interop 生成最大的耗时大头。
+        // ScanMethodRefs 默认取 Environment.Is64BitProcess（真机恒 true）：开启后
+        // Cpp2IL 要对 96MB 的 UnityFramework 做全量方法交叉引用分析与 xref 图构建，
+        // 在 iPad 的 Mono JIT 下实测能把生成拖到 20 分钟以上、进程还活着却像卡死。
+        // 关掉只损失 CallerCount 特性与"死方法"判定，类型/方法本体照样全生成。
+        if (neb_mkdir_p(cfgd) != 0) continue;
+        neb_cfg_set(cfgp, "IL2CPP", "ScanMethodRefs", "false", 1);
     }
     fflush(NULL);
 }
