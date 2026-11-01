@@ -445,6 +445,8 @@ static void nebula_fix_platform(MonoDomain *domain);
 static void nebula_log_paths(MonoDomain *domain);
 // 前向声明（R43）：查证 Preloader 是否真的成功（Doorstop 会吞异常，见下方定义处注释）
 static int nebula_preloader_failed(const char *root);
+// 前向声明（R44）：把 LogOutput.log 里 interop 相关的行抓进 host 日志
+static void nebula_grep_file(const char *path, const char *const keys[], int nkeys, int maxHits);
 
 // 强制把 MonoMod 的 PlatformHelper.Current 覆写为 iOS。
 // 根因（读 BepInEx / MonoMod 源码确认）：嵌入式 Mono 把 iOS 报成 MacOSX；
@@ -722,6 +724,23 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
         nebula_list_dir(bepdir, 0);
         fflush(NULL);
     }
+    // [R44 诊断] LogOutput.log 是判断 interop 有没有真生成的唯一权威来源：
+    //   - 跳过生成时会留 "Interop assemblies are possibly out of date"
+    //   - 真生成时会有 Cpp2IL / Generator / "Regenerating" 等一长串
+    // 设备上的文件取回来成本高，这里把关键行直接抓进 host 日志。
+    {
+        char lglo[PATH_MAX];
+        const char *hom2 = getenv("HOME");
+        snprintf(lglo, sizeof(lglo), "%s/Documents/BepInEx/LogOutput.log", hom2 ? hom2 : root);
+        static const char *const keys[] = {
+            "Interop", "UpdateInteropAssemblies", "Regenerating", "GameAssembly",
+            "Cpp2IL", "Generating", "Generator", "possibly out of date",
+            "Failed", "Exception", "ERROR", "warn"
+        };
+        printf("[host][diag] === LogOutput.log 关键行 ===\n");
+        fflush(NULL);
+        nebula_grep_file(lglo, keys, (int)(sizeof(keys) / sizeof(keys[0])), 100);
+    }
     if (exc) { fprintf(stderr, "[host] !! Start() 抛出异常\n"); nebula_log_exception(exc); return 0; }
 
     // [R43 关键] Doorstop.Entrypoint.Start() 把 Preloader 的所有异常都 catch 住，
@@ -752,18 +771,49 @@ static void nebula_log_exception(MonoObject *exc) {
     fflush(NULL);
 }
 
+/* [R44 诊断] 打印文本日志里命中任一关键字的行。LogOutput.log 在设备上、取回来成本高，
+   而它是判断 interop 到底有没有生成的唯一权威来源（里面会有
+   "Interop assemblies are possibly out of date" / Cpp2IL / Generator 的行）。
+   maxHits 上限防止把 45KB 日志整个灌进来。 */
+static void nebula_grep_file(const char *path, const char *const keys[], int nkeys, int maxHits) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("[host][grep] 打不开 %s\n", path); fflush(NULL); return; }
+    char buf[8192];
+    int hits = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        int hit = 0;
+        for (int i = 0; i < nkeys && !hit; i++)
+            if (strstr(buf, keys[i]) != NULL) hit = 1;
+        if (!hit) continue;
+        size_t L = strlen(buf);
+        while (L > 0 && (buf[L - 1] == '\n' || buf[L - 1] == '\r')) buf[--L] = '\0';
+        printf("[host][grep] %s\n", buf);
+        fflush(NULL);
+        if (++hits >= maxHits) break;
+    }
+    fclose(f);
+}
+
 /* [R43] Doorstop 把 Preloader 的异常全吞了（catch 里只写 preloader_*.log 就正常返回），
    所以 mono_runtime_invoke 没抛异常根本不代表 BepInEx 起来了。
    只要 BepInEx 根目录里出现任何 preloader_*.log，就判定 Preloader 半路死掉。
    app 根与 Documents 两处都查（BepInEx 根目录在 iOS 上被重定向到可写容器）。 */
 static int nebula_preloader_failed(const char *root) {
     const char *home = getenv("HOME");
-    const char *dirs[2];
-    static char b0[PATH_MAX], b1[PATH_MAX];
+    const char *dirs[3];
+    static char b0[PATH_MAX], b1[PATH_MAX], b2[PATH_MAX];
     int n = 0;
     snprintf(b0, sizeof(b0), "%s/BepInEx", root);
     dirs[n++] = b0;
-    if (home) { snprintf(b1, sizeof(b1), "%s/Documents/BepInEx", home); dirs[n++] = b1; }
+    if (home) {
+        snprintf(b1, sizeof(b1), "%s/Documents/BepInEx", home);
+        dirs[n++] = b1;
+        // [R44 修正] preloader.log 真实落点在 Documents 根目录（BepInExRootPath 的
+        // 上一级），不是 Documents/BepInEx —— R43 漏了这个目录，于是明明 Preloader
+        // 崩了却判不出失败，日志里照样打出 boot_bepinex -> 1。
+        snprintf(b2, sizeof(b2), "%s/Documents", home);
+        dirs[n++] = b2;
+    }
 
     for (int i = 0; i < n; i++) {
         DIR *d = opendir(dirs[i]);
