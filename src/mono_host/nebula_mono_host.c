@@ -27,6 +27,7 @@
 #include <dirent.h>
 #include <sys/stat.h>    // mkdir（BepInEx 可写根目录）
 #include <strings.h>    // strcasecmp
+#include <errno.h>      // EEXIST（R47 配置目录幂等创建）
 
 #include <mono/jit/jit.h>
 #include <mono/metadata/assembly.h>
@@ -547,6 +548,212 @@ static void nebula_log_paths(MonoDomain *domain) {
     }
     fflush(NULL);
 }
+
+// ---------------------------------------------------------------- R47：iOS IL2CPP 布局校正
+// interop 生成的两个输入路径，BepInEx 6 全是按 PC/安卓那一套硬写的，在 iOS 必然指错：
+//
+//  1) Il2CppInteropManager.get_GameAssemblyPath()
+//        = Path.Combine(Paths.GameRootPath, "GameAssembly." + PlatformHelper.LibrarySuffix)
+//     Windows 上是 GameAssembly.dll、Linux/Android 上是 GameAssembly.so —— 但 iOS 的
+//     IL2CPP 是【静态链进 Frameworks/UnityFramework.framework/UnityFramework】的，
+//     整个 app bundle 里根本没有 GameAssembly 这个文件。Cpp2IL 拿到不存在的路径，
+//     InitializeLibCpp2Il 直接抛 FileNotFound，异常被 GenerateInteropAssemblies 的
+//     catch 吞掉，最后表现成下游 Il2Cppmscorlib 加载失败，完全看不出是路径错了。
+//     好在那个 getter 优先读环境变量 BEPINEX_GAME_ASSEMBLY_PATH —— 我们在 Start() 之前
+//     探出来 setenv 即可，一行代码、完全不用改 IL。
+//
+//  2) [IL2CPP] GlobalMetadataPath 默认 = "{GameDataPath}/il2cpp_data/Metadata/global-metadata.dat"
+//     这是安卓布局。iOS 的落点各家 Unity 版本不同（Data/Metadata 与
+//     Data/Managed/Metadata 都见过），这里运行时扫出来，写进 BepInEx.cfg 纠正。
+//
+// 两者都做成"找到才改、找不到就什么都不做"，绝不因为探测失败把原来能跑的路堵死。
+static int neb_is_file(const char *p) {
+    struct stat st;
+    return (stat(p, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+// 有界深度递归找文件名（只找文件，不找目录），命中返回 1 并把绝对路径写进 out
+static int neb_find_file_rec(const char *dir, const char *fname, int depth, char *out, size_t osz) {
+    if (depth < 0) return 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    char path[PATH_MAX];
+    while ((e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        if (e->d_type == DT_REG) {
+            if (!strcasecmp(e->d_name, fname)) {
+                snprintf(out, osz, "%s", path);
+                closedir(d);
+                return 1;
+            }
+        } else if (e->d_type == DT_DIR) {
+            if (neb_find_file_rec(path, fname, depth - 1, out, osz)) { closedir(d); return 1; }
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+// 往 BepInEx.cfg 里补/改一个 key（section 不存在则新建；key 已存在则原样保留，
+// 避免覆盖用户手改的配置）
+static void neb_cfg_set(const char *cfgpath, const char *sec, const char *key, const char *val) {
+    FILE *in = fopen(cfgpath, "r");
+    char line[4096];
+    int key_exists = 0;
+    if (in) {
+        while (fgets(line, sizeof(line), in)) {
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            char *k = line; while (*k == ' ' || *k == '\t') k++;
+            char *e = eq - 1; while (e > k && (*e == ' ' || *e == '\t')) e--;
+            *(e + 1) = 0;
+            if (!strcasecmp(k, key)) key_exists = 1;
+        }
+        rewind(in);
+    }
+    if (key_exists) {
+        if (in) fclose(in);
+        printf("[host][r47] cfg 已有 %s，保留原值: %s\n", key, cfgpath);
+        return;
+    }
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", cfgpath);
+    FILE *out = fopen(tmp, "w");
+    if (!out) { if (in) fclose(in); return; }
+    if (!in) {
+        fprintf(out, "[%s]\n%s = %s\n", sec, key, val);
+    } else {
+        int in_sec = 0, wrote = 0;
+        char sec_hdr[256]; snprintf(sec_hdr, sizeof(sec_hdr), "[%s]", sec);
+        while (fgets(line, sizeof(line), in)) {
+            char t[4096]; snprintf(t, sizeof(t), "%s", line);
+            char *p = t; while (*p == ' ' || *p == '\t') p++;
+            if (p[0] == '[') {
+                if (in_sec && !wrote) { fprintf(out, "%s = %s\n", key, val); wrote = 1; }
+                in_sec = (!strncasecmp(p, sec_hdr, strlen(sec_hdr)));
+                fprintf(out, "%s", line);
+            } else {
+                fprintf(out, "%s", line);
+            }
+        }
+        if (in_sec && !wrote) fprintf(out, "%s = %s\n", key, val);
+        else if (!in_sec) fprintf(out, "\n[%s]\n%s = %s\n", sec, key, val);
+    }
+    if (in) fclose(in);
+    fclose(out);
+    rename(tmp, cfgpath);
+    printf("[host][r47] cfg 已写入 %s.%s = %s -> %s\n", sec, key, val, cfgpath);
+}
+
+// 探 IL2CPP 二进制 + global-metadata.dat，并落地纠偏
+static void nebula_fix_il2cpp_paths(const char *root) {
+    char app[PATH_MAX]; app[0] = 0;
+#if defined(__APPLE__)
+    char exep[PATH_MAX]; uint32_t sz = (uint32_t)sizeof(exep);
+    if (_NSGetExecutablePath(exep, &sz) == 0) {
+        char *slash = strrchr(exep, '/');
+        if (slash) *slash = 0;
+        snprintf(app, sizeof(app), "%s", exep);   // iPhone App.Bundle 的根（含 Data/ 与 Frameworks/）
+    }
+#endif
+    printf("[host][r47] app bundle=%s | root=%s\n", app[0] ? app : "(未知)", root ? root : "(null)");
+
+    const char *bases[3]; int nb = 0;
+    if (app[0])  bases[nb++] = app;
+    if (root && (!app[0] || strcmp(root, app))) bases[nb++] = root;
+    {
+        const char *home = getenv("HOME");
+        if (home && home[0]) { static char doc[PATH_MAX]; snprintf(doc, sizeof(doc), "%s/Documents", home); bases[nb++] = doc; }
+    }
+
+    // ---- 1) 承载 IL2CPP 的二进制 ----
+    static const char *const bin_rel[] = {
+        "/Frameworks/UnityFramework.framework/UnityFramework",
+        "/GameAssembly.dylib",
+        "/GameAssembly.dll",
+        "/GameAssembly.so",
+    };
+    char hit[PATH_MAX]; int found_bin = 0;
+    for (int i = 0; i < nb && !found_bin; i++) {
+        for (unsigned j = 0; j < sizeof(bin_rel) / sizeof(bin_rel[0]); j++) {
+            snprintf(hit, sizeof(hit), "%s%s", bases[i], bin_rel[j]);
+            if (neb_is_file(hit)) {
+                struct stat st; long long sz = stat(hit, &st) == 0 ? (long long)st.st_size : -1;
+                printf("[host][r47] IL2CPP 二进制命中: %s (%lld bytes)\n", hit, sz);
+                setenv("BEPINEX_GAME_ASSEMBLY_PATH", hit, 1);
+                printf("[host][r47]   已 setenv BEPINEX_GAME_ASSEMBLY_PATH（BepInEx 那个 getter 优先读它）\n");
+                found_bin = 1;
+                break;
+            }
+        }
+    }
+    if (!found_bin) {
+        printf("[host][r47] !! 没找到 IL2CPP 二进制（UnityFramework / GameAssembly 都没有），不做纠偏\n");
+    }
+
+    // ---- 2) global-metadata.dat ----
+    static const char *const md_rel[] = {
+        "/Data/Managed/Metadata/global-metadata.dat",
+        "/Data/Metadata/global-metadata.dat",
+        "/Data/il2cpp_data/Metadata/global-metadata.dat",
+        "/Data/Raw/Metadata/global-metadata.dat",
+        "/Metadata/global-metadata.dat",
+    };
+    char md[PATH_MAX]; int found_md = 0;
+    for (int i = 0; i < nb && !found_md; i++)
+        for (unsigned j = 0; j < sizeof(md_rel) / sizeof(md_rel[0]); j++) {
+            snprintf(md, sizeof(md), "%s%s", bases[i], md_rel[j]);
+            if (neb_is_file(md)) { found_md = 1; break; }
+        }
+    if (!found_md) {   // 兜底：在 Data/ 下递归扫（Unity 各版本落点不一致，最多下钻 6 层）
+        for (int i = 0; i < nb && !found_md; i++) {
+            char dpath[PATH_MAX];
+            snprintf(dpath, sizeof(dpath), "%s/Data", bases[i]);
+            if (neb_find_file_rec(dpath, "global-metadata.dat", 6, md, sizeof(md))) found_md = 1;
+        }
+    }
+    if (found_md) {
+        struct stat st; long long sz = stat(md, &st) == 0 ? (long long)st.st_size : -1;
+        printf("[host][r47] global-metadata.dat 命中: %s (%lld bytes)\n", md, sz);
+        // 写进每一份可能生效的 BepInEx.cfg（BepInExRootPath 在 iOS 上可能被重定向到容器目录）
+        for (int i = 0; i < nb; i++) {
+            char cfgd[PATH_MAX], cfgp[PATH_MAX + 64];
+            snprintf(cfgd, sizeof(cfgd), "%s/BepInEx/config", bases[i]);
+            snprintf(cfgp, sizeof(cfgp), "%s/BepInEx.cfg", cfgd);
+            // 目录不存在就建（幂等，无害）；失败说明这里不可写，跳过
+            if (mkdir(cfgd, 0755) != 0 && errno != EEXIST) continue;
+            neb_cfg_set(cfgp, "IL2CPP", "GlobalMetadataPath", md);
+        }
+    } else {
+        printf("[host][r47] !! 没找到 global-metadata.dat，保留 BepInEx 默认路径\n");
+    }
+
+    // ---- 3) unity-libs（interop 生成器要的 Unity 托管基础库）现状 ----
+    for (int i = 0; i < nb; i++) {
+        char ul[PATH_MAX];
+        snprintf(ul, sizeof(ul), "%s/BepInEx/unity-libs", bases[i]);
+        struct stat st;
+        if (stat(ul, &st) == 0 && S_ISDIR(st.st_mode)) {
+            int ndll = 0, nzip = 0;
+            DIR *d = opendir(ul);
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d)) != NULL) {
+                    size_t L = strlen(e->d_name);
+                    if (L > 4 && !strcasecmp(e->d_name + L - 4, ".dll")) ndll++;
+                    if (L > 4 && !strcasecmp(e->d_name + L - 4, ".zip")) nzip++;
+                }
+                closedir(d);
+            }
+            printf("[host][r47] unity-libs 现状: %s （dll=%d zip=%d）\n", ul, ndll, nzip);
+        }
+    }
+    fflush(NULL);
+}
+
 // 自动算对（iOS 被 PlatformUtils.SetPlatform 识别为 Platform.iOS → 走非 MacOS 分支）。
 // 关键发现（读 BepInEx 6 源码确认）：
 //   - BepInExRootPath 由 DOORSTOP_INVOKE_DLL_PATH 经 Utility.ParentDirectory(.,2) 决定，必须落在
@@ -704,6 +911,9 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     if (!start) { fprintf(stderr, "[host] 找不到 Doorstop.Entrypoint.Start()\n"); return 0; }
 
     // 切换 CWD 到 app 目录（兜底：任何相对路径写入都落在可写容器内），并手动初始化 BepInEx.Paths
+    // [R47] iOS 布局校正：交互前先把 GameAssembly/metadata 的真实位置纠正
+    // （见 nebula_fix_il2cpp_paths 上方注释 —— 不改这两个路径，interop 必然生成失败）
+    nebula_fix_il2cpp_paths(root);
     chdir(root);
     nebula_init_bepinex_paths(domain, root);
     // 关键：在 BepInEx 接管前注入 NEBULA_IOS=1，触发 vendored BepInEx 的 Patch A
