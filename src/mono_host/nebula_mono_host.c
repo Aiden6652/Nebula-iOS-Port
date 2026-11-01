@@ -446,7 +446,7 @@ static void nebula_log_paths(MonoDomain *domain);
 // 前向声明（R43）：查证 Preloader 是否真的成功（Doorstop 会吞异常，见下方定义处注释）
 static int nebula_preloader_failed(const char *root);
 // 前向声明（R44）：把 LogOutput.log 里 interop 相关的行抓进 host 日志
-static void nebula_grep_file(const char *path, const char *const keys[], int nkeys, int maxHits);
+static void nebula_grep_file(const char *path, const char *const keys[], int nkeys, int maxHits, long offset);
 
 // 强制把 MonoMod 的 PlatformHelper.Current 覆写为 iOS。
 // 根因（读 BepInEx / MonoMod 源码确认）：嵌入式 Mono 把 iOS 报成 MacOSX；
@@ -656,8 +656,26 @@ static void *nebula_prelog_tail_thread(void *arg) {
 // 诊断（R35）：递归枚举目录，定义在文件下方，先前向声明
 static void nebula_list_dir(const char *path, int depth);
 
+// [R45] LogOutput.log 是追加写的，而设备上那份可能是别的机器上拷来的旧产物（本次实测：
+// 45KB 内容是 PC 上的日志，iPad 根本没写）。只看本次运行新增的增量，别再把历史内容
+// 当成本次输出，那是误导。
+static long nebula_file_size(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (long)st.st_size : -1;
+}
+
+static const char *boot_logoutput_path(void) {
+    static char p[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (home) snprintf(p, sizeof(p), "%s/Documents/BepInEx/LogOutput.log", home);
+    else snprintf(p, sizeof(p), "/LogOutput.log");
+    return p;
+}
+
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
 static int boot_bepinex(MonoDomain *domain, const char *root) {
+    // 记录 LogOutput.log 的起始大小，Start() 之后只 grep 这一段增量
+    const long log_offset = nebula_file_size(boot_logoutput_path());
     MonoAssembly *as = NULL;
     const blob_entry *e = blob_find("BepInEx.Unity.IL2CPP");
     if (e) {
@@ -737,9 +755,9 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
             "Cpp2IL", "Generating", "Generator", "possibly out of date",
             "Failed", "Exception", "ERROR", "warn"
         };
-        printf("[host][diag] === LogOutput.log 关键行 ===\n");
+        printf("[host][diag] === LogOutput.log 本次增量（起点 %ld B，之前的是历史残留）===\n", log_offset);
         fflush(NULL);
-        nebula_grep_file(lglo, keys, (int)(sizeof(keys) / sizeof(keys[0])), 100);
+        nebula_grep_file(lglo, keys, (int)(sizeof(keys) / sizeof(keys[0])), 200, log_offset);
     }
     if (exc) { fprintf(stderr, "[host] !! Start() 抛出异常\n"); nebula_log_exception(exc); return 0; }
 
@@ -775,9 +793,11 @@ static void nebula_log_exception(MonoObject *exc) {
    而它是判断 interop 到底有没有生成的唯一权威来源（里面会有
    "Interop assemblies are possibly out of date" / Cpp2IL / Generator 的行）。
    maxHits 上限防止把 45KB 日志整个灌进来。 */
-static void nebula_grep_file(const char *path, const char *const keys[], int nkeys, int maxHits) {
+static void nebula_grep_file(const char *path, const char *const keys[], int nkeys, int maxHits, long offset) {
     FILE *f = fopen(path, "rb");
     if (!f) { printf("[host][grep] 打不开 %s\n", path); fflush(NULL); return; }
+    /* 只看本次运行新增的部分：offset>0 就跳到启动时的文件末尾 */
+    if (offset > 0) fseek(f, offset, SEEK_SET);
     char buf[8192];
     int hits = 0;
     while (fgets(buf, sizeof(buf), f)) {
