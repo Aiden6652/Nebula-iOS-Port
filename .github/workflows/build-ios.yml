@@ -18,7 +18,7 @@ concurrency:
 jobs:
   mono-ios:
     name: '1/2 从源码编译 mono iOS arm64（修 sdb trampoline）'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +61,7 @@ jobs:
   host-dylib:
     name: '2/2 交叉编译宿主 dylib → iOS arm64'
     needs: mono-ios
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
