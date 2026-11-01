@@ -443,6 +443,8 @@ static void setup_mono_path(const char *dir, const char *root) {
 static void nebula_log_exception(MonoObject *exc);
 static void nebula_fix_platform(MonoDomain *domain);
 static void nebula_log_paths(MonoDomain *domain);
+// 前向声明（R43）：查证 Preloader 是否真的成功（Doorstop 会吞异常，见下方定义处注释）
+static int nebula_preloader_failed(const char *root);
 
 // 强制把 MonoMod 的 PlatformHelper.Current 覆写为 iOS。
 // 根因（读 BepInEx / MonoMod 源码确认）：嵌入式 Mono 把 iOS 报成 MacOSX；
@@ -721,6 +723,19 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
         fflush(NULL);
     }
     if (exc) { fprintf(stderr, "[host] !! Start() 抛出异常\n"); nebula_log_exception(exc); return 0; }
+
+    // [R43 关键] Doorstop.Entrypoint.Start() 把 Preloader 的所有异常都 catch 住，
+    // 只写一份 preloader_*.log 就正常返回（IL 实证：catch 块里 File.WriteAllText 后
+    // 既不 rethrow 也不 Exit，除非设了 BEPINEX_FAIL_FAST）。
+    // 所以 mono_runtime_invoke 拿不到异常 ≠ BepInEx 成功 —— 只看异常会 100% 误判，
+    // 真机表现就是「boot_bepinex -> 1、游戏照常进、NOS 永远不加载」。
+    // 这里反查 preloader_*.log：它一出现，就说明 Preloader 半路死了。
+    if (nebula_preloader_failed(root)) {
+        fprintf(stderr, "[host] !! 发现 preloader_*.log：Doorstop 吞掉了 Preloader 异常，BepInEx 实际未成功\n");
+        fprintf(stderr, "[host]    异常全文见上方 [host][prelog] 行（或设备上的 preloader_*.log）\n");
+        fflush(NULL);
+        return 0;
+    }
     printf("[host] Start() 已返回，RSS=%ldMB\n", rss_mb());
     return 1;
 }
@@ -735,6 +750,36 @@ static void nebula_log_exception(MonoObject *exc) {
     const char *nm = c ? mono_class_get_name(c) : "?";
     fprintf(stderr, "[host]   异常类型: %s.%s\n", ns ? ns : "", nm ? nm : "?");
     fflush(NULL);
+}
+
+/* [R43] Doorstop 把 Preloader 的异常全吞了（catch 里只写 preloader_*.log 就正常返回），
+   所以 mono_runtime_invoke 没抛异常根本不代表 BepInEx 起来了。
+   只要 BepInEx 根目录里出现任何 preloader_*.log，就判定 Preloader 半路死掉。
+   app 根与 Documents 两处都查（BepInEx 根目录在 iOS 上被重定向到可写容器）。 */
+static int nebula_preloader_failed(const char *root) {
+    const char *home = getenv("HOME");
+    const char *dirs[2];
+    static char b0[PATH_MAX], b1[PATH_MAX];
+    int n = 0;
+    snprintf(b0, sizeof(b0), "%s/BepInEx", root);
+    dirs[n++] = b0;
+    if (home) { snprintf(b1, sizeof(b1), "%s/Documents/BepInEx", home); dirs[n++] = b1; }
+
+    for (int i = 0; i < n; i++) {
+        DIR *d = opendir(dirs[i]);
+        if (!d) continue;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (strncmp(de->d_name, "preloader_", 10) == 0) {
+                printf("[host][prelog] 命中失败标志: %s/%s\n", dirs[i], de->d_name);
+                fflush(NULL);
+                closedir(d);
+                return 1;
+            }
+        }
+        closedir(d);
+    }
+    return 0;
 }
 
 // 诊断（R35）：递归枚举目录打印到 host 日志，确认 BepInEx 运行后生成了哪些产物
@@ -1881,7 +1926,21 @@ static void *boot_thread_impl(void *arg) {
     }
 
     watchdog_run = 0;
-    mono_jit_cleanup(domain);
+
+    // [R43 关键] BepInEx 起来后【绝不】mono_jit_cleanup。
+    // BepInEx 6 IL2CPP 的插件加载根本不在 Preloader 里发生：IL2CPPChainloader.Initialize()
+    // 只做一件事——用 INativeDetour 钩住 il2cpp_runtime_invoke；真正的 chainloader.Start()
+    //（扫 plugins/ 加载 NOS、打 Harmony 补丁）要等 Unity 跑起来、首次切场景时
+    // IL2CPP 调 il2cpp_runtime_invoke 命中那个方法名才触发（IL 实证，见 Preloader.Run 末尾
+    // 只有 Initialize 没有 Start）。也就是插件加载发生在 Unity 之后，Mono 域必须活到那时。
+    // 旧实现在这里无条件 cleanup，等于把 BepInEx 连同刚生成的一切一起拆掉 ——
+    // 这正是「boot_bepinex -> 1、游戏正常进、NOS 永远不出现」的直接原因。
+    if (ok) {
+        hlog("[host] BepInEx 已起：保留 Mono 域常驻（不 cleanup —— 插件要等 Unity 切场景才加载）");
+    } else {
+        hlog("[host] BepInEx 未成功：清理 Mono 域，交还游戏");
+        mono_jit_cleanup(domain);
+    }
     free(dir);
     return NULL;
 }
