@@ -7,13 +7,25 @@ on:
 
 jobs:
   t-linux:
-    name: 'A: ubuntu-latest 冒烟'
+    name: 'A: ubuntu-latest'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "linux runner OK"; uname -a
+      - run: echo "linux runner OK"
 
-  t-macos:
-    name: 'B: macos-14 冒烟'
+  t-macos14:
+    name: 'B: macos-14'
     runs-on: macos-14
     steps:
-      - run: echo "macos runner OK"; uname -a; xcrun --sdk iphoneos --show-sdk-path || true
+      - run: echo "macos-14 OK"
+
+  t-macos15:
+    name: 'C: macos-15'
+    runs-on: macos-15
+    steps:
+      - run: echo "macos-15 OK"
+
+  t-macos-latest:
+    name: 'D: macos-latest'
+    runs-on: macos-latest
+    steps:
+      - run: echo "macos-latest OK"
