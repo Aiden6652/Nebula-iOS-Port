@@ -76,11 +76,12 @@ if [ -z "${BEPINEX_CORE_DIR:-}" ] && [ -d "$ROOT/bepinex-core" ]; then
   BEPINEX_CORE_DIR="$ROOT/bepinex-core"
 fi
 echo "   BepInEx/core 来源: ${BEPINEX_CORE_DIR:-无（仅嵌 BCL）}"
-python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" <<'PY'
+python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
 bepinex_core = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else ""
 blob_path = sys.argv[3]
+root_dir = sys.argv[4] if len(sys.argv) > 4 else "."
 
 entries = []; seen = set()
 def add(name, data):
@@ -102,6 +103,25 @@ if os.path.isdir(bepinex_core):
         if not f.endswith(".dll"): continue
         if f.lower() == "dobby.dll": continue   # 原生库，不是托管，不能当 assembly 加载
         add("BepInEx/core/" + f, open(os.path.join(bepinex_core, f), "rb").read())
+
+# 3) [R48] unity-libs：Unity 2022.3.44 托管基础库（Among Us iOS 实测版本）。
+#    Il2CppInterop 生成器要用它们当 Cecil 参考程序集，必须是【散文件】（AddCecilPlatformAssemblies
+#    只读文件系统，不认内存程序集），所以由宿主在运行时从 blob 释放到 BepInEx/unity-libs。
+#    之所以必须自带：BepInEx 默认联网下载 zip 再用 System.IO.Compression 解压，而本环境的
+#    Mono 无法生成 zlib 封送 IL（Cannot marshal nonblittlable types without marshal-ilgen），
+#    解压必然抛 ZLibException —— 走这条路等于必崩。
+#    注：这批文件的 only 名字与后续真正要加载的 interop 程序集同名，宿主的 blob_find 已对
+#    "unity-libs/" 前缀跳过，不会被误当成可加载程序集抢走 interop 的加载。
+unity_libs = os.path.join(root_dir, "unity-libs")
+if os.path.isdir(unity_libs):
+    n = 0
+    for f in sorted(os.listdir(unity_libs)):
+        if not f.endswith(".dll"): continue
+        add("unity-libs/" + f, open(os.path.join(unity_libs, f), "rb").read())
+        n += 1
+    print("   unity-libs: %d 个基础库 DLL 已嵌入" % n)
+else:
+    print("!! 没找到 unity-libs 目录，运行时将无法自带 Unity 基础库", file=sys.stderr)
 
 buf = struct.pack("<I", 0x4E424C31)  # 'NBL1'
 buf += struct.pack("<I", len(entries))

@@ -160,6 +160,11 @@ static void blob_load(void) {
 // 按程序集简单名查找（去掉路径与 .dll），命中返回 entry
 static const blob_entry *blob_find(const char *aname) {
     if (!g_n || !aname) return NULL;
+    // [R48] unity-libs/ 前缀装的不是"可加载的程序集"，而是 Il2CppInterop 生成器当参考用的
+    // Unity 基础库散文件。它们的文件名（UnityEngine.CoreModule 之类）与后面真正要加载的
+    // interop 程序集同名，若参与简单名匹配，会抢占 blob 加载、把插件要的真程序集顶掉。
+    // 所以对这段前缀一律跳过，只由 nebula_blob_extract_dir 按文件释放。
+    if (!strncmp(aname, "unity-libs/", 11)) return NULL;
     const char *slash = strrchr(aname, '/');
     const char *s = slash ? slash + 1 : aname;
     char base[512];
@@ -572,6 +577,21 @@ static int neb_is_file(const char *p) {
     return (stat(p, &st) == 0 && S_ISREG(st.st_mode));
 }
 
+// mkdir 只建一层，父级不存在就会失败（iOS 上 app bundle 与容器目录父级情况不一），这里递归建。
+static int neb_mkdir_p(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) return S_ISDIR(st.st_mode) ? 0 : -1;
+    char tmp[PATH_MAX];
+    if (strlen(path) >= sizeof(tmp)) return -1;
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    char *slash = strrchr(tmp, '/');
+    if (slash && slash != tmp) {
+        *slash = 0;
+        if (neb_mkdir_p(tmp) != 0) return -1;
+    }
+    return (mkdir(path, 0755) != 0 && errno != EEXIST) ? -1 : 0;
+}
+
 // 有界深度递归找文件名（只找文件，不找目录），命中返回 1 并把绝对路径写进 out
 static int neb_find_file_rec(const char *dir, const char *fname, int depth, char *out, size_t osz) {
     if (depth < 0) return 0;
@@ -598,31 +618,48 @@ static int neb_find_file_rec(const char *dir, const char *fname, int depth, char
 
 // 往 BepInEx.cfg 里补/改一个 key（section 不存在则新建；key 已存在则原样保留，
 // 避免覆盖用户手改的配置）
-static void neb_cfg_set(const char *cfgpath, const char *sec, const char *key, const char *val) {
+// [R48] replace_if_bad：原有值如果是空、或它指向的文件根本不存在（典型是 BepInEx 自己
+// 落盘的默认值，比如 GlobalMetadataPath 的安卓布局路径 / UnityBaseLibrariesSource 的
+// 联网 URL —— 后者在本机 zlib 封送坏掉的前提下必崩），就强制覆盖；否则保留用户手改。
+static void neb_cfg_set(const char *cfgpath, const char *sec, const char *key, const char *val,
+                        int replace_if_bad) {
     FILE *in = fopen(cfgpath, "r");
     char line[4096];
-    int key_exists = 0;
+    int replace = 1;            // 没有 cfg 就是首次，直接写
     if (in) {
         while (fgets(line, sizeof(line), in)) {
-            char *eq = strchr(line, '=');
+            char t[4096]; snprintf(t, sizeof(t), "%s", line);
+            char *eq = strchr(t, '=');
             if (!eq) continue;
             *eq = 0;
-            char *k = line; while (*k == ' ' || *k == '\t') k++;
+            char *k = t; while (*k == ' ' || *k == '\t') k++;
             char *e = eq - 1; while (e > k && (*e == ' ' || *e == '\t')) e--;
             *(e + 1) = 0;
-            if (!strcasecmp(k, key)) key_exists = 1;
+            if (strcasecmp(k, key)) continue;
+            // 取原值判断是否"坏"
+            char *v = eq + 1; while (*v == ' ' || *v == '\t') v++;
+            char *nl = strpbrk(v, "\r\n"); if (nl) *nl = 0;
+            int bad = 1;
+            if (!replace_if_bad) bad = 0;
+            else if (*v) bad = !neb_is_file(v);   // 非空且是真实存在的文件才算"好"
+            if (bad) replace = 1;
+            else {
+                replace = 0;
+                printf("[host][r48] cfg 保留可用的 %s = %s -> %s\n", key, v, cfgpath);
+            }
+            break;
         }
         rewind(in);
-    }
-    if (key_exists) {
-        if (in) fclose(in);
-        printf("[host][r47] cfg 已有 %s，保留原值: %s\n", key, cfgpath);
-        return;
     }
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp", cfgpath);
     FILE *out = fopen(tmp, "w");
     if (!out) { if (in) fclose(in); return; }
+    if (!replace) {
+        printf("[host][r48] cfg 不改动 %s: %s\n", key, cfgpath);
+        if (in) fclose(in);
+        fclose(out); remove(tmp); return;
+    }
     if (!in) {
         fprintf(out, "[%s]\n%s = %s\n", sec, key, val);
     } else {
@@ -630,14 +667,27 @@ static void neb_cfg_set(const char *cfgpath, const char *sec, const char *key, c
         char sec_hdr[256]; snprintf(sec_hdr, sizeof(sec_hdr), "[%s]", sec);
         while (fgets(line, sizeof(line), in)) {
             char t[4096]; snprintf(t, sizeof(t), "%s", line);
+            char *eq = strchr(t, '=');
+            if (eq && !wrote) {
+                char *before = t; while (*before == ' ' || *before == '\t') before++;
+                if (before[0] != '[') {          // 段头行不参与 key 匹配
+                    *eq = 0;
+                    char *k = t; while (*k == ' ' || *k == '\t') k++;
+                    char *e = eq - 1; while (e > k && (*e == ' ' || *e == '\t')) e--;
+                    *(e + 1) = 0;
+                    if (!strcasecmp(k, key)) {   // 原地改写这一行的值
+                        fprintf(out, "%s = %s\n", key, val);
+                        wrote = 1;
+                        continue;
+                    }
+                }
+            }
             char *p = t; while (*p == ' ' || *p == '\t') p++;
             if (p[0] == '[') {
                 if (in_sec && !wrote) { fprintf(out, "%s = %s\n", key, val); wrote = 1; }
                 in_sec = (!strncasecmp(p, sec_hdr, strlen(sec_hdr)));
-                fprintf(out, "%s", line);
-            } else {
-                fprintf(out, "%s", line);
             }
+            fprintf(out, "%s", line);
         }
         if (in_sec && !wrote) fprintf(out, "%s = %s\n", key, val);
         else if (!in_sec) fprintf(out, "\n[%s]\n%s = %s\n", sec, key, val);
@@ -645,7 +695,37 @@ static void neb_cfg_set(const char *cfgpath, const char *sec, const char *key, c
     if (in) fclose(in);
     fclose(out);
     rename(tmp, cfgpath);
-    printf("[host][r47] cfg 已写入 %s.%s = %s -> %s\n", sec, key, val, cfgpath);
+    printf("[host][r48] cfg 已写入 %s.%s = %s -> %s\n", sec, key, val, cfgpath);
+}
+
+// [R48] 把 blob 里某个前缀下的文件原样释放到 dest（缺哪个写哪个，已存在且大小一致则跳过）。
+// 用来投递 Unity 基础库：unity-libs/*.dll 必须【先落盘】成了散文件，BepInEx 才会拿它们
+// 当 Cecil 参考程序集（AddCecilPlatformAssemblies 只读文件系统，不认内存程序集）。
+static int nebula_blob_extract_dir(const char *prefix, const char *dest) {
+    if (!g_n) return 0;
+    struct stat st;
+    if (stat(dest, &st) != 0 && neb_mkdir_p(dest) != 0) return 0;
+    size_t plen = strlen(prefix);
+    int written = 0, skipped = 0;
+    for (int i = 0; i < g_n; i++) {
+        const char *nm = g_entries[i].name;
+        if (strncmp(nm, prefix, plen)) continue;
+        const char *bn = strrchr(nm, '/'); bn = bn ? bn + 1 : nm;
+        if (!*bn) continue;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", dest, bn);
+        if (stat(p, &st) == 0 && st.st_size == (off_t)g_entries[i].size) { skipped++; continue; }
+        FILE *f = fopen(p, "wb");
+        if (!f) continue;
+        if (fwrite(g_entries[i].data, 1, g_entries[i].size, f) != g_entries[i].size) {
+            fclose(f); remove(p); continue;
+        }
+        fclose(f);
+        written++;
+    }
+    if (written || skipped)
+        printf("[host][r48] 释放 %s -> %s （新写 %d，已存在跳过 %d）\n", prefix, dest, written, skipped);
+    return written;
 }
 
 // 探 IL2CPP 二进制 + global-metadata.dat，并落地纠偏
@@ -724,31 +804,53 @@ static void nebula_fix_il2cpp_paths(const char *root) {
             snprintf(cfgd, sizeof(cfgd), "%s/BepInEx/config", bases[i]);
             snprintf(cfgp, sizeof(cfgp), "%s/BepInEx.cfg", cfgd);
             // 目录不存在就建（幂等，无害）；失败说明这里不可写，跳过
-            if (mkdir(cfgd, 0755) != 0 && errno != EEXIST) continue;
-            neb_cfg_set(cfgp, "IL2CPP", "GlobalMetadataPath", md);
+            if (neb_mkdir_p(cfgd) != 0) continue;
+            // replace_if_bad=1：默认值（安卓布局那一串）根本不存在，必须被覆盖
+            neb_cfg_set(cfgp, "IL2CPP", "GlobalMetadataPath", md, 1);
         }
     } else {
         printf("[host][r47] !! 没找到 global-metadata.dat，保留 BepInEx 默认路径\n");
     }
 
-    // ---- 3) unity-libs（interop 生成器要的 Unity 托管基础库）现状 ----
+    // ---- 3) unity-libs：Il2CppInterop 生成器当参考程序集用的 Unity 托管基础库 ----
+    // R48 背景（preloader.log 实锤）：DownloadUnityAssemblies() 联网拉 zip 成功，但解 zip 时
+    //   System.IO.Compression.ZLibException: The underlying compression routine could not be loaded
+    //   ---> System.ApplicationException: Cannot marshal nonblittlable types without marshal-ilgen
+    // 这套 Mono 的 zlib 封送需要运行时生成 IL（第三方 zlib 的 version 字符串参数非 blittable），
+    // 本环境不可用 —— 所以必须把这条路彻底绕开。做法：
+    //   DownloadUnityAssemblies() 开头若发现 UnityBaseLibrariesSource 为空就直接 return，
+    //   而"删光 unity-libs/*.dll 再解 zip"在这行之后 —— 把 source 置空，既跳过联网、
+    //   也保住你已经放好的 dll（否则下次启动会被它先清空，再解压失败）。
     for (int i = 0; i < nb; i++) {
-        char ul[PATH_MAX];
-        snprintf(ul, sizeof(ul), "%s/BepInEx/unity-libs", bases[i]);
+        char ul[PATH_MAX], cfgd[PATH_MAX], cfgp[PATH_MAX + 64];
+        snprintf(ul,   sizeof(ul),   "%s/BepInEx/unity-libs", bases[i]);
+        snprintf(cfgd, sizeof(cfgd), "%s/BepInEx/config",     bases[i]);
+        snprintf(cfgp, sizeof(cfgp), "%s/BepInEx.cfg",        cfgd);
         struct stat st;
-        if (stat(ul, &st) == 0 && S_ISDIR(st.st_mode)) {
-            int ndll = 0, nzip = 0;
-            DIR *d = opendir(ul);
-            if (d) {
-                struct dirent *e;
-                while ((e = readdir(d)) != NULL) {
-                    size_t L = strlen(e->d_name);
-                    if (L > 4 && !strcasecmp(e->d_name + L - 4, ".dll")) ndll++;
-                    if (L > 4 && !strcasecmp(e->d_name + L - 4, ".zip")) nzip++;
-                }
-                closedir(d);
+        int ul_ok = (stat(ul, &st) == 0 && S_ISDIR(st.st_mode));
+
+        // 3a) 缺的话先从 dylib 里带的 unity-libs blob 补上（幂等：大小一致就跳过）
+        if (nebula_blob_extract_dir("unity-libs/", ul) > 0) ul_ok = 1;
+        if (!ul_ok) continue;
+
+        int ndll = 0, nzip = 0;
+        DIR *d = opendir(ul);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                size_t L = strlen(e->d_name);
+                if (L > 4 && !strcasecmp(e->d_name + L - 4, ".dll")) ndll++;
+                if (L > 4 && !strcasecmp(e->d_name + L - 4, ".zip")) nzip++;
             }
-            printf("[host][r47] unity-libs 现状: %s （dll=%d zip=%d）\n", ul, ndll, nzip);
+            closedir(d);
+        }
+        printf("[host][r48] unity-libs 现状: %s （dll=%d zip=%d）\n", ul, ndll, nzip);
+        // 3b) 有可用基础库就强制让 BepInEx 跳过 download+unzip 那一段
+        if (ndll > 0) {
+            if (neb_mkdir_p(cfgd) != 0) continue;
+            // replace_if_bad=1：只要原值不是"真实存在的文件"就覆盖（URL 天然不满足 → 被置空）
+            neb_cfg_set(cfgp, "IL2CPP", "UnityBaseLibrariesSource", "", 1);
+            printf("[host][r48]   unity-libs 已有 %d 个 dll -> 令 BepInEx 跳过联网下载/解压\n", ndll);
         }
     }
     fflush(NULL);
