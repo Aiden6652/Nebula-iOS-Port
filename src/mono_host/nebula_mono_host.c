@@ -1094,6 +1094,14 @@ static long nebula_r54_tail_one(const char *path, long last, const char *prefix,
     if (!f) return last;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return last; }
     long sz = ftell(f);
+    // [R55] 文件被 BepInEx 重写/截断后，从旧 offset 读会漏掉前段新内容
+    // （R54 真机正是因此漏掉 [r54] 初始化插桩）。sz < last 即判定文件已重写，offset 归零从头读。
+    if (sz < last) {
+        if (*budget > 0)
+            printf("%s [host][r55] 检测到 %s 被重写(sz=%ld < last=%ld)，offset 归零从头读\n",
+                   prefix, path, sz, last);
+        last = 0;
+    }
     if (sz > last && fseek(f, last, SEEK_SET) == 0) {
         char buf[8192];
         while (sz > last && *budget > 0) {
@@ -1133,9 +1141,9 @@ static void *nebula_r54_tail_thread(void *arg) {
     if (lastDiag < 0) lastDiag = 0;
     int budget = 800;   // 防止 BepInEx Info 全开时把 host 日志刷爆
 
-    printf("[host][r54] 长期日志监听启动: LogOutput.log 起点=%ld B；diag=%s\n",
+    printf("[host][r55] 长期日志监听启动(重写检测已开): LogOutput.log 起点=%ld B；diag=%s\n",
            lastLog, diag[0] ? diag : "(未使用)");
-    printf("[host][r54] 修复要点: TryLoad(GameAssembly) 改走 Il2CppInterop.Runtime 的 DllImportResolver -> UnityFramework，初始化链路已插桩\n");
+    printf("[host][r55] 修复要点: TryLoad 直接喂 UnityFramework 绝对路径(get_GameAssemblyPath())，绕过 DllImportResolver 命中失败的坑；tail 增加文件重写(截断)检测，不再漏掉初始化插桩\n");
     fflush(NULL);
 
     // 0.25s * 7200 = 30 分钟，覆盖切场景后的插件加载窗口
