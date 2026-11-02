@@ -1078,6 +1078,76 @@ static const char *boot_logoutput_path(void) {
     return p;
 }
 
+/* [R54] 长期日志监听。
+   R53 教训：BepInEx 的插件加载发生在 Doorstop.Entrypoint.Start() 返回、
+   Unity 切场景（Internal_ActiveSceneChanged）之后；而原来的 preloader tail
+   只活 120 秒、LogOutput.log 也只在 Start() 之后 grep 一次关键字。于是
+   "Error loading [NebulaLoader]: <异常堆栈>" 这类决定性信息永远看不到。
+   这里把 LogOutput.log 的【本次增量全量】持续转发进 host 日志（不再只 grep
+   关键字），并顺带监听 managed 侧可选的 nebula_diag.log。
+   起点用线程启动时的文件大小，天然跳过 PC 拷来的历史残留。 */
+static volatile int g_r54_tail_running = 0;
+
+static long nebula_r54_tail_one(const char *path, long last, const char *prefix, int *budget) {
+    if (!path || !*path || *budget <= 0) return last;
+    FILE *f = fopen(path, "rb");
+    if (!f) return last;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return last; }
+    long sz = ftell(f);
+    if (sz > last && fseek(f, last, SEEK_SET) == 0) {
+        char buf[8192];
+        while (sz > last && *budget > 0) {
+            long want = sz - last;
+            if (want > (long)sizeof(buf) - 1) want = (long)sizeof(buf) - 1;
+            size_t n = fread(buf, 1, (size_t)want, f);
+            if (n <= 0) break;
+            buf[n] = '\0';
+            char *p = buf;
+            while (p && *p && *budget > 0) {
+                char *nl = strchr(p, '\n');
+                if (nl) *nl = '\0';
+                printf("%s %s\n", prefix, p);
+                (*budget)--;
+                if (!nl) break;
+                p = nl + 1;
+            }
+            last += (long)n;
+        }
+        fflush(NULL);
+    }
+    fclose(f);
+    return last;
+}
+
+static void *nebula_r54_tail_thread(void *arg) {
+    (void)arg;
+    const char *home = getenv("HOME");
+    char diag[PATH_MAX];
+    if (home) snprintf(diag, sizeof(diag), "%s/Documents/nebula_diag.log", home);
+    else diag[0] = '\0';
+
+    const char *lp = boot_logoutput_path();
+    long lastLog = nebula_file_size(lp);
+    if (lastLog < 0) lastLog = 0;
+    long lastDiag = diag[0] ? nebula_file_size(diag) : 0;
+    if (lastDiag < 0) lastDiag = 0;
+    int budget = 800;   // 防止 BepInEx Info 全开时把 host 日志刷爆
+
+    printf("[host][r54] 长期日志监听启动: LogOutput.log 起点=%ld B；diag=%s\n",
+           lastLog, diag[0] ? diag : "(未使用)");
+    printf("[host][r54] 修复要点: TryLoad(GameAssembly) 改走 Il2CppInterop.Runtime 的 DllImportResolver -> UnityFramework，初始化链路已插桩\n");
+    fflush(NULL);
+
+    // 0.25s * 7200 = 30 分钟，覆盖切场景后的插件加载窗口
+    for (int i = 0; i < 7200 && g_r54_tail_running && budget > 0; i++) {
+        lastLog = nebula_r54_tail_one(lp, lastLog, "[host][r54][log]", &budget);
+        if (diag[0])
+            lastDiag = nebula_r54_tail_one(diag, lastDiag, "[host][r54][diag]", &budget);
+        usleep(250 * 1000);
+    }
+    return NULL;
+}
+
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
 static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 记录 LogOutput.log 的起始大小，Start() 之后只 grep 这一段增量
@@ -1135,6 +1205,13 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     {
         pthread_t tt;
         if (pthread_create(&tt, NULL, nebula_prelog_tail_thread, NULL) == 0) pthread_detach(tt);
+    }
+    // [R54] 插件加载发生在 Start() 返回、Unity 切场景之后，原来的 120s preloader tail
+    // 与一次性 LogOutput.log grep 都覆盖不到；再起一个 30 分钟的长期 tail 抓异常堆栈。
+    g_r54_tail_running = 1;
+    {
+        pthread_t rt;
+        if (pthread_create(&rt, NULL, nebula_r54_tail_thread, NULL) == 0) pthread_detach(rt);
     }
 
     printf("[host] 调用 Doorstop.Entrypoint.Start() —— 之后交给 BepInEx chainloader\n");
