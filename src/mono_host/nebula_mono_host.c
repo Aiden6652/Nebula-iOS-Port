@@ -889,6 +889,27 @@ static void nebula_fix_il2cpp_paths(const char *root) {
                 }
             }
             printf("[host][r51] interop 产物: %s （dll=%d）\n", ip, nip);
+
+            // [R52] 复用外来 interop 时，把 PC 带来的 assembly-hash.txt 删掉。
+            // 只要这个文件存在，CheckIfGenerationRequired() 就会去调 ComputeHash()：
+            //   MD5 逐块读 96MB 的 UnityFramework（Mach-O）+ 66 个基础库 + 两个程序集版本，
+            //   慢且在这种 Mono 上有触发 P/Invoke 封送问题的风险；算出来又必然和 PC 的
+            //   PE GameAssembly.dll 不一致，白算一趟还得再问 NeedGenerationOrSkip()。
+            // 删掉后走最短路：File.Exists(HashPath)=false -> NeedGenerationOrSkip()
+            //   -> UpdateInteropAssemblies=false -> 返回 false，直接加载现成产物。
+            // 现场生成路线不受影响：生成成功后 BepInEx 自己会重新写这个文件。
+            if (nip > 0) {
+                char hp[PATH_MAX];
+                snprintf(hp, sizeof(hp), "%s/assembly-hash.txt", ip);
+                struct stat hst;
+                if (stat(hp, &hst) == 0) {
+                    if (unlink(hp) == 0)
+                        printf("[host][r52] 已移除 PC 带来的 assembly-hash.txt，跳过 ComputeHash 直接复用 interop\n");
+                    else
+                        printf("[host][r52] 警告: assembly-hash.txt 删除失败 errno=%d\n", errno);
+                }
+            }
+
             if (neb_mkdir_p(cfgd) != 0) continue;
             neb_cfg_set(cfgp, "IL2CPP", "UpdateInteropAssemblies", nip > 0 ? "false" : "true", 1);
         }
