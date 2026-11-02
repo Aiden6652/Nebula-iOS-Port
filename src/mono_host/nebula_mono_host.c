@@ -733,6 +733,39 @@ static int nebula_blob_extract_dir(const char *prefix, const char *dest) {
 }
 
 // 探 IL2CPP 二进制 + global-metadata.dat，并落地纠偏
+/* [R53] 只探测、绝不调用 il2cpp C API。
+   宿主 boot() 是阻塞式 constructor：主线程泵着 CFRunLoop 死等 boot_thread 结束，
+   Unity 主线程此时还没跑 il2cpp_init。任何在此刻发生的 il2cpp_domain_get()
+   都会在 native 里解引用空 thread/domain 直接 SIGSEGV —— R52 设备日志实证：
+       at Il2CppInterop.Runtime.IL2CPP:il2cpp_domain_get <0x00007>
+       at Il2CppInterop.Runtime.IL2CPP:.cctor <0x0006f>
+       at ...IL2CPPLogSource:.ctor <0x00113>
+       at ...IL2CPPChainloader:InitializeLoggers <0x000bf>
+   所以这里只 dlsym 看导出是否可见，不做 domain / thread 状态探测。
+   R53 的修复在托管侧：IL2CPPLogSource..ctor 不再注册 il2cpp log callback，
+   让 IL2CPP.cctor 的首次触发推迟到 Unity 主线程第一次 il2cpp_runtime_invoke
+   （那时 VM 必然已 init，ourImagesMap 才能正常填充）。*/
+static void nebula_r53_probe_il2cpp(const char *uf) {
+    void *dg  = dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
+    void *ta  = dlsym(RTLD_DEFAULT, "il2cpp_thread_attach");
+    void *ini = dlsym(RTLD_DEFAULT, "il2cpp_init");
+    void *ri  = dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
+    void *h = NULL;
+    if (!ri) {   // 全局命名空间没看到就按 BepInEx 同款方式 dlopen 后再查
+        h = dlopen(uf, RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            if (!dg)  dg  = dlsym(h, "il2cpp_domain_get");
+            if (!ta)  ta  = dlsym(h, "il2cpp_thread_attach");
+            if (!ini) ini = dlsym(h, "il2cpp_init");
+            if (!ri)  ri  = dlsym(h, "il2cpp_runtime_invoke");
+        }
+    }
+    printf("[host][r53] IL2CPP C API 导出探测(只查不调): domain_get=%p thread_attach=%p init=%p runtime_invoke=%p handle=%p\n",
+           dg, ta, ini, ri, h);
+    printf("[host][r53] 版本策略: preloader 阶段不注册 il2cpp log callback，IL2CPP.cctor 首次触发推迟到 Unity 主线程首次 il2cpp_runtime_invoke(VM 已 init)\n");
+    /* 不 dlclose：UnityFramework 由 app 持有，多一次引用无害；误卸载反而灾难 */
+}
+
 static void nebula_fix_il2cpp_paths(const char *root) {
     char app[PATH_MAX]; app[0] = 0;
 #if defined(__APPLE__)
@@ -776,6 +809,9 @@ static void nebula_fix_il2cpp_paths(const char *root) {
     }
     if (!found_bin) {
         printf("[host][r47] !! 没找到 IL2CPP 二进制（UnityFramework / GameAssembly 都没有），不做纠偏\n");
+    } else {
+        // [R53] 只打印导出符号地址，绝不调用（VM 此刻尚未 init）
+        nebula_r53_probe_il2cpp(hit);
     }
 
     // ---- 2) global-metadata.dat ----
