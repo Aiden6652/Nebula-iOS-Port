@@ -1156,6 +1156,13 @@ static void *nebula_r54_tail_thread(void *arg) {
     return NULL;
 }
 
+/* [R56] 宿主主动触发插件加载所需的两个全局句柄。
+   R55 真机 preloader.log = System.DllNotFoundException: dobby（设备 core/dobby.dll
+   是 Windows x64 PE，iOS arm64 无法 dlopen），native inline detour 装不上，
+   OnInvokeMethod 永不触发 → 不扫 plugins → 进原版。详见下方 nebula_r56_* 注释。 */
+static MonoDomain *g_r56_domain     = NULL;   // Mono 根域（boot_thread 里 init，主线程需 attach）
+static MonoImage  *g_r56_il2cpp_img = NULL;   // BepInEx.Unity.IL2CPP 的 image
+
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
 static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 记录 LogOutput.log 的起始大小，Start() 之后只 grep 这一段增量
@@ -1181,6 +1188,9 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     if (!as) { fprintf(stderr, "[host] 打开 BepInEx.Unity.IL2CPP 失败\n"); return 0; }
 
     MonoImage *img = mono_assembly_get_image(as);
+    /* [R56] 保存 image：dobby detour 装不上时，宿主要在 Unity 主线程从这里取
+       IL2CPPChainloader.NebulaManualExecute() 主动扫 plugins（见 boot() 末尾派发）。 */
+    g_r56_il2cpp_img = img;
     MonoClass *klass = mono_class_from_name(img, "Doorstop", "Entrypoint");
     if (!klass) { fprintf(stderr, "[host] 找不到 Doorstop.Entrypoint\n"); return 0; }
 
@@ -2501,6 +2511,16 @@ static void *boot_thread_impl(void *arg) {
     // 这正是「boot_bepinex -> 1、游戏正常进、NOS 永远不出现」的直接原因。
     if (ok) {
         hlog("[host] BepInEx 已起：保留 Mono 域常驻（不 cleanup —— 插件要等 Unity 切场景才加载）");
+        /* [R56] 只有真的加载了 BepInEx.Unity.IL2CPP（有 image）才登记 domain：
+           dobby detour 失败不影响 chainloader 实例（Initialize 里 set_Instance 在
+           TryLoad/detour 之前已完成，R55 真机已打印 Chainloader initialized）。
+           放行 Unity 后由主线程主动调 NebulaManualExecute() 顶替 detour 的延迟触发。 */
+        if (g_r56_il2cpp_img) {
+            g_r56_domain = domain;
+            hlog("[host][r56] 已登记 Mono domain + BepInEx image，准备主线程主动触发 Execute()");
+        } else {
+            hlog("[host][r56] !! 无 BepInEx image（走的不是 BepInEx 路径），跳过主动触发");
+        }
     } else {
         hlog("[host] BepInEx 未成功：清理 Mono 域，交还游戏");
         mono_jit_cleanup(domain);
@@ -2514,6 +2534,110 @@ static void *boot_thread(void *arg) {
     void *r = boot_thread_impl(arg);
     g_boot_complete = 1;
     return r;
+}
+
+/* ============================================================================
+ * [R56] 绕开 native inline hook，由宿主在 Unity 主线程主动触发 chainloader
+ *
+ * 【为什么】R55 真机 preloader.log 全文：
+ *   System.DllNotFoundException: dobby
+ *     at DobbyDetour.PrepareImpl / INativeDetour.CreateAndApply /
+ *        IL2CPPChainloader.Initialize / Preloader.Run / Doorstop.Entrypoint.Start
+ *   此前 [r55] TryLoad OK -> GetExport(il2cpp_runtime_invoke) 已经打通，
+ *   但设备 BepInEx/core/dobby.dll 是 Windows x64 PE (153088 B)，iOS arm64
+ *   dlopen 不了；iOS 侧载环境改 __TEXT 做 inline hook 也不现实。detour 装不上
+ *   → il2cpp_runtime_invoke 永不被钩 → OnInvokeMethod 不触发 → plugins 不扫
+ *   → 进原版、NOS 不加载。
+ *
+ * 【能绕开的依据】IL 实证 OnInvokeMethod 只是「一次性延迟触发器」：
+ *   命中 Internal_ActiveSceneChanged 后执行 SetupUnityLogging() +
+ *   PreloadInteropAssemblies() + Instance.Execute()，然后 Dispose 卸掉自己。
+ *   三段全是纯 managed（Preload 只是 Assembly.Load(interop/*.dll)，Execute 扫
+ *   plugins 加载 NebulaLoader），都不依赖 dobby。R56 的 BepInEx.Unity.IL2CPP.dll
+ *   已新增 public static IL2CPPChainloader.NebulaManualExecute()，把这三段原样
+ *   搬出来，并带 catch(Exception) 把完整堆栈写进 LogOutput.log。
+ *   Initialize() 里 set_Instance 在 TryLoad/detour 之前就完成了（R55 真机已打印
+ *   Chainloader initialized），detour 抛异常被 Doorstop 吞掉不影响 Instance。
+ *
+ * 【线程与时机】必须用 dispatch_get_main_queue() 在 Unity 主线程调用：
+ *   - Il2CppInterop 桥接类首次访问会触发 Il2CppInterop.Runtime.IL2CPP 的 .cctor
+ *     → il2cpp_domain_get()。R52 的 native SIGSEGV 就是 preloader 阶段 Unity 尚未
+ *     il2cpp_init 就碰它；这里等 boot() 放行、Unity 初始化完再调。
+ *   - il2cpp_init 在主线程发生并自动 attach 该线程，插件 Load() 访问游戏类才安全。
+ *   - Mono 域是 boot_thread 里 mono_jit_init 的，主线程默认未 attach，故先
+ *     mono_thread_attach() 再 mono_runtime_invoke()。
+ *
+ * 【延迟】默认 4000ms（NEBULA_EXEC_DELAY_MS 可调，0~60000），从 boot() 放行
+ *   Unity 起算，覆盖 didFinishLaunching / il2cpp_init / 首个场景加载。
+ * ==========================================================================*/
+static int64_t nebula_r56_delay_ms(void) {
+    const char *e = getenv("NEBULA_EXEC_DELAY_MS");
+    if (!e || !*e) return 4000;
+    long v = strtol(e, NULL, 10);
+    if (v < 0) v = 0;
+    if (v > 60000) v = 60000;
+    return (int64_t)v;
+}
+
+static void nebula_r56_invoke_manual_execute(void) {
+    printf("[host][r56] ===== Unity 主线程触发开始 =====\n");
+    fflush(NULL);
+    if (!g_r56_domain || !g_r56_il2cpp_img) {
+        printf("[host][r56] !! domain/image 为空，放弃触发\n");
+        fflush(NULL);
+        return;
+    }
+
+    /* 函数内 extern：iOS 自定义 mono 头可能未声明（与 watchdog_thread 一致） */
+    extern void mono_thread_attach(MonoDomain *domain);
+    mono_thread_attach(g_r56_domain);
+    printf("[host][r56] mono_thread_attach 完成\n");
+    fflush(NULL);
+
+    MonoClass *k = mono_class_from_name(g_r56_il2cpp_img,
+                                        "BepInEx.Unity.IL2CPP", "IL2CPPChainloader");
+    if (!k) {
+        printf("[host][r56] !! 找不到 IL2CPPChainloader 类\n");
+        fflush(NULL);
+        return;
+    }
+    MonoMethod *m = mono_class_get_method_from_name(k, "NebulaManualExecute", 0);
+    if (!m) {
+        printf("[host][r56] !! 找不到 NebulaManualExecute() —— 内嵌 DLL 不是 r56 版？\n");
+        fflush(NULL);
+        return;
+    }
+
+    printf("[host][r56] 已定位 NebulaManualExecute()，开始 mono_runtime_invoke（扫 plugins / 加载 NOS）\n");
+    fflush(NULL);
+    MonoObject *exc = NULL;
+    mono_runtime_invoke(m, NULL, NULL, &exc);
+    if (exc) {
+        fprintf(stderr, "[host][r56] !! managed 抛出异常（类型见下）：\n");
+        nebula_log_exception(exc);
+    } else {
+        printf("[host][r56] mono_runtime_invoke 返回（无托管异常）；插件加载结果看 LogOutput.log 的 [r56] 行\n");
+    }
+    printf("[host][r56] ===== Unity 主线程触发结束 =====\n");
+    fflush(NULL);
+}
+
+static void nebula_r56_schedule_execute(void) {
+    if (!g_r56_domain || !g_r56_il2cpp_img) {
+        printf("[host][r56] BepInEx 入口未就绪(domain=%p img=%p)，跳过主动触发\n",
+               (void *)g_r56_domain, (void *)g_r56_il2cpp_img);
+        fflush(NULL);
+        return;
+    }
+    int64_t d = nebula_r56_delay_ms();
+    printf("[host][r56] 已派发：%lld ms 后在 Unity 主线程调用 IL2CPPChainloader.NebulaManualExecute()\n", (long long)d);
+    printf("[host][r56] 修复要点：R55 的 DllNotFoundException: dobby 使 native detour 装不上；改由宿主直接触发纯 managed 的 SetupUnityLogging/PreloadInteropAssemblies/Execute()\n");
+    printf("[host][r56] 延迟可用 NEBULA_EXEC_DELAY_MS 调整（当前 %lld ms）；Execute() 异常堆栈会写进 LogOutput.log 并由长期 tail 转发\n", (long long)d);
+    fflush(NULL);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, d * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        nebula_r56_invoke_manual_execute();
+    });
 }
 
 static void boot(void) {
@@ -2546,6 +2670,11 @@ static void boot(void) {
         }
         pthread_join(t, NULL);
         hlog("[host] boot 阻塞结束，放行 Unity 继续加载（游戏与 NOS 一同加载）");
+        /* [R56] 派发点必须在 pthread_join 之后：此时 boot_thread 已结束、domain/image
+           已登记，且 boot() 即将返回放行 Unity。从这一刻起算延迟，block 由主线程
+           runloop 在 Unity 初始化完成后执行，天然对齐官方 detour「Unity 起来后触发」
+           的语义。非阻塞分支（NEBULA_BLOCK_BOOT=0）只作对照实验，不派发。 */
+        nebula_r56_schedule_execute();
     } else {
         pthread_detach(t);
     }
