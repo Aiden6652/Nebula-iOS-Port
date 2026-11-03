@@ -2631,7 +2631,7 @@ static void nebula_r56_schedule_execute(void) {
     }
     int64_t d = nebula_r56_delay_ms();
     printf("[host][r56] 已派发：%lld ms 后在 Unity 主线程调用 IL2CPPChainloader.NebulaManualExecute()\n", (long long)d);
-    printf("[host][r56] 修复要点：R55 的 DllNotFoundException: dobby 使 native detour 装不上；改由宿主直接触发纯 managed 的 SetupUnityLogging/PreloadInteropAssemblies/Execute()\n");
+    printf("[host][r57] 修复要点：dobby 装不上已用「宿主主线程主动触发」绕开；R57 进一步跳过 iOS IL2CPP 缺失的 SetupUnityLogging(op_Implicit)，直接 PreloadInteropAssemblies + Execute() 扫 plugins / 加载 NOS\n");
     printf("[host][r56] 延迟可用 NEBULA_EXEC_DELAY_MS 调整（当前 %lld ms）；Execute() 异常堆栈会写进 LogOutput.log 并由长期 tail 转发\n", (long long)d);
     fflush(NULL);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, d * NSEC_PER_MSEC),
