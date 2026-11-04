@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ★ 本文件用途：用侧载签名工具（全能签 / Feather / Esign 等）重签 AmongUs.app 时，
+    作为该 App 的 entitlements 注入文件。CI 不对 dylib 签名（dylib 裸进进程），
+    JIT 能力看的是 **App 进程签名**，所以必须由你的侧载工具把下面这些写进 App 签名。
+
+  get-task-allow:                              允许调试器附加（开发者签名必备，StikDebug 靠它启用 JIT）
+  com.apple.private.skip-library-validation:  ★允许加载我们注入的外部 dylib
+                                              少了这条，iOS 会拒绝加载 nebula dylib
+                                              （表现就是"游戏正常但毫无效果"）
+  com.apple.developer.kernel.increased-memory-limit:     大内存上限（默认约 1GB → 5GB+）
+  com.apple.developer.kernel.extended-virtual-addressing: 扩展虚拟地址空间（arm64 大幅扩 VA）
+  dynamic-codesigning:                        = com.apple.security.cs.allow-jit
+                                              允许运行时创建"可写又可执行"的 MAP_JIT 内存。
+                                              mono 初始化必然生成 trampoline（无论解释器还是 JIT），
+                                              没有它 → 内核 CODESIGNING / Invalid Page 秒杀进程。
+                                              ★ 标准版（解释器）同样需要！不是只有 pro 需要。
+
+  —— 关于 allow-jit 能否签上 ——
+  你是付费开发证书 → 有能力签 allow-jit。但有两个前提：
+  1) 签名工具（全能签）要把本文件作为 App entitlements 注入（别用默认模板漏掉 dynamic-codesigning）。
+  2) 你导入的 mobileprovision 描述文件**允许**该 entitlement。
+     通配 App ID（com.example.*）的描述文件 Entitlements 字典常**不含** allow-jit，会被 codesign 剥离；
+     建议用**显式 App ID** 生成的描述文件，或确认其 Entitlements 含 com.apple.security.cs.allow-jit。
+
+  —— 退路（不依赖 allow-jit 描述文件）——
+  只要保留 get-task-allow=true，用 StikDebug 给 AmongUs 附加 → 内核授予 CS_DEBUGGED → 自动获得 JIT。
+  host 已带"轮询等待 JIT 就绪"逻辑：先启动 App，等 StikDebug 附加后 boot 自动继续，不死锁。
+
+  若签名工具报错"entitlement not permitted by provisioning profile"，说明描述文件不含 allow-jit：
+  临时删掉 dynamic-codesigning 这一行，改用 get-task-allow + StikDebug 之路即可。
+-->
+<plist version="1.0">
+<dict>
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.private.skip-library-validation</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>dynamic-codesigning</key>
+	<true/>
+</dict>
+</plist>

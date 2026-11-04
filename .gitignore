@@ -46,6 +46,13 @@ src/mono_host/out/
 # 例外：[R60] 预编译的服务器列表滑动补丁（BepInEx IL2CPP 插件，随包发布）
 !src/plugins/ServerScroll/
 !src/plugins/ServerScroll/*.dll
+# 例外：[LEGACY_MONO] BepInEx5 Unity Mono core（vendored，构建期嵌进 dylib，非构建产物）
+!src/mono_host_mono/bepinex-mono-core/
+!src/mono_host_mono/bepinex-mono-core/*.dll
+# [LEGACY_MONO] 游戏 managed 程序集从老 AU .ipa 的 Data/Managed 提取，按设备提供，不入库
+src/mono_host_mono/game-managed/
+# 例外：该目录的使用说明要入库（实际 dll 不入库）
+!src/mono_host_mono/game-managed/README.md
 *.zip
 *.dat
 metadata/
