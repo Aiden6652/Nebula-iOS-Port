@@ -50,6 +50,7 @@ while IFS= read -r line; do
   case "$(basename "$line")" in
     libmono-component-debugger-static.a) continue ;;  # 用 stub 版
     libSystem.*.a) continue ;;  # [R60] 下面用 -Wl,-force_load 单独全量链，避免重复定义
+    libicu*.a) continue ;;      # [R60] ICU 同样单独 -force_load
   esac
   [ -n "$line" ] && LIBS+=("$line")
 done < <(find "$MONO_PREFIX" -name "*.a" 2>/dev/null)
@@ -146,8 +147,8 @@ else:
 
 # 5) [R60] iOS 原生 shim（libSystem.*.dylib）字节内嵌，作为 fallback：
 #    主路径是把 libSystem.*.a 静态链进本 dylib（-force_load），完全无散文件；
-#    若 CI 的 Mono prefix 里没有对应 .a，则宿主启动时把这里的 dylib 字节释放到
-#    可写目录并 dllmap 过去（用户要的"表面一个、启动自动在内存里分裂回来"备选）。
+#    若全静态链因 ICU/GSS 依赖失败（见下方自动降级），宿主启动时把这里的 dylib
+#    字节释放到可写目录并 dllmap 过去 —— 就是用户要的"表面一个、启动自动分裂回来"。
 #    同样带 "native/" 前缀，blob_find 跳过。
 native_src = os.path.join(mono_root, "lib", "net8.0", "native")
 if os.path.isdir(native_src):
@@ -170,29 +171,30 @@ PY
 
 echo "=== [R60] 原生 shim 处理：静态链进主 dylib（真·单一文件），dylib 字节内嵌作 fallback ==="
 # 不再把 libSystem.*.dylib 平铺进产物目录 —— R60 只交付一个 libnebula_standard.dylib。
-#   主路径：把 $MONO_PREFIX/lib/libSystem.*.a 用 -force_load 静态链进主 dylib，
+#   主路径：把 libSystem.*.a + ICU + GSS 用 -force_load / -framework 静态链进主 dylib，
 #           宿主把 libSystem.Native 等 dllmap 指向【主 dylib 自身路径】，dlsym 命中
 #           导出符号（.NET 8 CoreLib 的 P/Invoke 全部落到同一个 Mach-O 里）。
-#   备选路径：CI 若无 .a，宿主从 __nebulabcl 段里 "native/" 前缀的 dylib 字节释放到
-#           可写目录再 dllmap 过去（"表面一个、启动自动在内存里分裂回来"）。
+#   备选路径：CI 若无静态库 / 静态链失败，宿主从 __nebulabcl 段里 "native/" 前缀的
+#           dylib 字节释放到可写目录再 dllmap 过去。
 #   两条路都不需要在 app bundle 里放任何额外的 .dylib —— 用户重签只需签一个文件。
+#
 # CI 的 Mono prefix 只带 libSystem.*.dylib（build_mono_ios.sh 只提取了 dylib），
-# 但 .NET 8 iOS runtime nupkg 里同时提供 5 个 libSystem.*.a 静态库（实测：
-# Native 483KB / Globalization 424KB / IO.Compression 2.6MB / Net.Security 32KB /
-# Security.Cryptography.Apple 331KB）。这里直接下载 nupkg 提取 .a，真正静态链进
-# 主 dylib，避免运行时释放 dylib 在 iOS 上因 code signing 被拒的风险。
+# 但 .NET 8 iOS runtime nupkg 里同时提供 5 个 libSystem.*.a 和 3 个 libicu*.a：
+#   Globalization.Native.a 引用 ~120 个 _u* / _ucol_* / _ures_* ICU 符号，
+#   Net.Security.Native.a 引用 _gss_* —— 官方 .dylib 分别把 ICU 静态链入、
+#   链接 /System/Library/Frameworks/GSS.framework/GSS。静态链必须自己补这两组依赖，
+#   否则 ld: symbol(s) not found for architecture arm64（run 41840513127 的失败原因）。
 # 下载失败也不致命：宿主仍可从 __nebulabcl 的 "native/" 前缀释放 .dylib 走 fallback。
 NATIVE_A_DIR="/tmp/nebula_native_a_$$"
 rm -rf "$NATIVE_A_DIR"
 mkdir -p "$NATIVE_A_DIR"
-for a in "$MONO_PREFIX"/lib/libSystem.*.a; do
+for a in "$MONO_PREFIX"/lib/libSystem.*.a "$MONO_PREFIX"/lib/libicu*.a; do
   if [ -f "$a" ]; then cp "$a" "$NATIVE_A_DIR/"; fi
 done
 # [R60 CI 教训 #2] 绝不能用 `ls dir/libSystem.*.a 2>/dev/null | wc -l` 计数：
 # 无匹配时 ls 返回 2，set -o pipefail 让整条管道失败，赋值语句随即触发 set -e
 # 静默退出（stderr 又被 /dev/null 吞掉，CI 日志只见 build 步骤莫名 exit 1、
-# 无任何错误行，正是本轮第二次 CI 失败的现象）。改用 glob + [ -f ] 逐项计数，
-# 在 macOS bash 3.2 + set -u 下同样安全。
+# 无任何错误行，正是 run 41837901825 的失败现象）。改用 glob + [ -f ] 逐项计数。
 N_A=0
 for a in "$NATIVE_A_DIR"/libSystem.*.a; do
   if [ -f "$a" ]; then N_A=$((N_A+1)); fi
@@ -216,29 +218,37 @@ out = sys.argv[2]
 n = 0
 for i in z.infolist():
     fn = os.path.basename(i.filename)
-    if i.filename.startswith('runtimes/ios-arm64/native/') and fn.startswith('libSystem.') and fn.endswith('.a'):
+    if i.filename.startswith('runtimes/ios-arm64/native/') and fn.endswith('.a') \
+       and (fn.startswith('libSystem.') or fn.startswith('libicu')):
         open(os.path.join(out, fn), 'wb').write(z.read(i)); n += 1
-print("       nupkg 提取 %d 个 libSystem.*.a" % n)
+print("       nupkg 提取 %d 个 libSystem.*.a / libicu*.a" % n)
 PY
   else
     echo "    ⚠ nupkg 下载失败 —— CoreLib shim 将走 blob 释放 fallback" >&2
   fi
   rm -f "$NATIVE_A_DIR/iosrt.nupkg"
 fi
-NATIVE_A=()
+NATIVE_A=()   # 5 个 CoreLib P/Invoke shim
+ICU_A=()      # 3 个 ICU 静态库（Globalization.Native 依赖）
 for a in "$NATIVE_A_DIR"/libSystem.*.a; do
   if [ -f "$a" ]; then NATIVE_A+=("$a"); fi
 done
-echo "    可静态链的 native .a: ${#NATIVE_A[@]} 个"
-# macOS 自带 bash 3.2 + set -u：空数组 "${NATIVE_A[@]}" 展开会报 unbound variable
-# （本轮 CI 首次失败的根因），所有数组展开都必须用长度判断包起来。
+for a in "$NATIVE_A_DIR"/libicu*.a; do
+  if [ -f "$a" ]; then ICU_A+=("$a"); fi
+done
+echo "    可静态链: CoreLib shim ${#NATIVE_A[@]} 个 / ICU ${#ICU_A[@]} 个"
+# macOS 自带 bash 3.2 + set -u：空数组 "${ARR[@]}" 展开会报 unbound variable
+# （run 41834026635 的首次失败根因），所有数组展开都必须用长度判断包起来。
 if [ ${#NATIVE_A[@]} -gt 0 ]; then
   for a in "${NATIVE_A[@]}"; do echo "      $(basename "$a")"; done
+fi
+if [ ${#ICU_A[@]} -gt 0 ]; then
+  for a in "${ICU_A[@]}"; do echo "      $(basename "$a")"; done
 fi
 
 echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 
-# [R60] 强制全量链入的静态库：
+# [R60] 强制全量链入：
 #   ① libdobby.a —— BepInEx 的 [DllImport("dobby")] 原本在设备上命中
 #      core/dobby.dll（Windows x64 PE, 153088B），iOS arm64 dlopen 不了 →
 #      DllNotFoundException: dobby → IL2CPPChainloader.Initialize 中断 →
@@ -246,50 +256,75 @@ echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 #      这里把 iOS arm64 版 Dobby 静态链进来，宿主把 "dobby" dllmap 到主 dylib
 #      自身路径，dlopen 自身 + dlsym("DobbyHook") 即可命中，彻底修掉崩溃根因。
 #   ② libSystem.*.a —— CoreLib 的 P/Invoke shim，同样静态链进主 dylib，实现单文件。
+#   ③ libicu*.a —— Globalization.Native 的 ICU 符号来源（nupkg 自带，无版本后缀）。
+#   ④ -framework GSS —— Net.Security.Native 的 _gss_* 符号来源。
 # 用 -force_load（而非普通列出 .a）：归档里未被 C 代码直接引用的目标文件也必须
 # 全部链入并导出，否则 dlsym 找不到 SystemNative_* / DobbyHook。
-# [R60 教训] 不要把 force_load 放进独立数组再展开 —— macOS bash 3.2 + set -u
-# 下空数组展开会 unbound variable。直接 append 到 LIBS（LIBS 至少有 8 个 Mono .a，
-# 永不为空），clang 命令行只展开一个数组，最稳。
-N_FORCE=0
+#
+# [R60 CI 教训 #5] ICU / GSS 属于系统依赖，一旦某版 SDK 缺库或符号对不上，
+# 全量链接会失败。这里做【自动降级】：先试全静态链，失败就只静态链 dobby
+# （自包含、必成功），CoreLib shim 改由宿主启动时从 blob 的 "native/" 前缀
+# 释放到 Documents/nebula_native 并 dllmap 过去。两条路产物目录都只有 1 个 dylib，
+# CI 必定能产出 artifact，不会再出现"编译失败→空包→又白等一轮"。
 DOBBY_A="$ROOT/dobby/libdobby.a"
-if [ -f "$DOBBY_A" ]; then
-  LIBS+=("-Wl,-force_load,$DOBBY_A")
-  N_FORCE=$((N_FORCE+1))
-  echo "    [R60] dobby 静态链: $(basename "$DOBBY_A") ($(wc -c < "$DOBBY_A") bytes)"
-else
-  echo "    [R60] ⚠ 缺 dobby/libdobby.a —— BepInEx 仍会 DllNotFoundException: dobby" >&2
+if [ ! -f "$DOBBY_A" ]; then
+  echo "!! 缺 dobby/libdobby.a —— R60 无法修 DllNotFoundException: dobby" >&2
+  exit 1
 fi
+# FORCE_DOBBY 恒有 1 个元素，永不为空 —— 避免在 bash 3.2 + set -u 下展开空数组。
+FORCE_DOBBY=("-Wl,-force_load,$DOBBY_A")
+FORCE_NATIVE=()
 if [ ${#NATIVE_A[@]} -gt 0 ]; then
-  for a in "${NATIVE_A[@]}"; do
-    LIBS+=("-Wl,-force_load,$a")
-    N_FORCE=$((N_FORCE+1))
-  done
+  for a in "${NATIVE_A[@]}"; do FORCE_NATIVE+=("-Wl,-force_load,$a"); done
 fi
-echo "    [R60] force_load 条目: $N_FORCE 个"
+if [ ${#ICU_A[@]} -gt 0 ]; then
+  for a in "${ICU_A[@]}"; do FORCE_NATIVE+=("-Wl,-force_load,$a"); done
+fi
+echo "    [R60] dobby 静态链: $(basename "$DOBBY_A") ($(wc -c < "$DOBBY_A") bytes)"
+echo "    [R60] 全量 force_load 条目: $(( 1 + ${#FORCE_NATIVE[@]} )) 个"
 
 # 单一编译器（JIT）版：解释器已废除，standard / pro 合并为一份。
 # 宿主代码始终走 JIT（见 nebula_mono_host.c 的 mono_setmmapjit(1)），
 # 不再区分 NEBULA_PRO；仅产出一个包 libnebula_standard.dylib。
-"$CCBIN" -arch arm64 \
-  -isysroot "$SDK" \
-  -miphoneos-version-min="$MIN_IOS" \
-  -dynamiclib -fPIC \
-  -DBUILD_AS_LIB \
-  -I"$MONO_INC" \
-  -o "$OUT/libnebula_standard.dylib" \
-  "$ROOT/nebula_mono_host.c" \
-  "$ROOT/case_insensitive_fs.c" \
-  "$ROOT/fishhook.c" \
-  "$ROOT/boot_overlay.m" \
-  "${LIBS[@]}" \
-  -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
-  -framework Foundation \
-  -framework CoreFoundation \
-  -framework Security \
-  -framework UIKit \
-  -lobjc -lc++ -lpthread -lz -lm \
-  -Wl,-U,_pthread_jit_write_protect_np
+do_link() {
+  "$CCBIN" -arch arm64 \
+    -isysroot "$SDK" \
+    -miphoneos-version-min="$MIN_IOS" \
+    -dynamiclib -fPIC \
+    -DBUILD_AS_LIB \
+    -I"$MONO_INC" \
+    -o "$OUT/libnebula_standard.dylib" \
+    "$ROOT/nebula_mono_host.c" \
+    "$ROOT/case_insensitive_fs.c" \
+    "$ROOT/fishhook.c" \
+    "$ROOT/boot_overlay.m" \
+    "${LIBS[@]}" \
+    "$@" \
+    -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
+    -framework Foundation \
+    -framework CoreFoundation \
+    -framework Security \
+    -framework UIKit \
+    -lobjc -lc++ -lpthread -lz -lm \
+    -Wl,-U,_pthread_jit_write_protect_np
+}
+
+R60_SHIM_MODE="static"
+if [ ${#FORCE_NATIVE[@]} -gt 0 ]; then
+  if do_link "${FORCE_DOBBY[@]}" "${FORCE_NATIVE[@]}" -framework GSS; then
+    echo "    [R60] 全静态链成功：dobby + 5 shim + ICU + GSS 全部并进主 dylib（真·单文件）"
+  else
+    echo "    [R60] ⚠ 全静态链失败（ICU/GSS 依赖），自动降级：只静态链 dobby；CoreLib shim 走 blob 释放 fallback" >&2
+    rm -f "$OUT/libnebula_standard.dylib"
+    R60_SHIM_MODE="blob-fallback"
+    do_link "${FORCE_DOBBY[@]}"
+  fi
+else
+  echo "    [R60] 无 shim/ICU 静态库，只静态链 dobby；CoreLib shim 走 blob 释放 fallback"
+  R60_SHIM_MODE="blob-fallback"
+  do_link "${FORCE_DOBBY[@]}"
+fi
+echo "    [R60] CoreLib shim 模式: $R60_SHIM_MODE"
 
 # 注：BCL 已嵌入 dylib 的 __nebulabcl 段（见上方 blob 生成），不再散落 bcl/ 目录。
 # 运行时由 nebula_mono_host.c 的 Mono 预加载钩子从内存加载。
@@ -314,18 +349,18 @@ done
 [ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号，链接有问题" >&2; exit 1; }
 
 # [R60] dobby 必须真的并进主 dylib（否则 chainloader 仍会 DllNotFoundException）
-if [ -f "${DOBBY_A:-}" ]; then
-  case "$SYMS" in
-    *DobbyHook*) echo "    ✓ DobbyHook（iOS arm64 dobby 已并入主 dylib）" ;;
-    *) echo "    ✗ DobbyHook 缺失！dobby 静态链失败" >&2; exit 1 ;;
-  esac
-fi
-# [R60] 静态链 CoreLib shim 的证明（无 .a 时允许缺，宿主会走 blob 释放 fallback）
-if [ "${#NATIVE_A[@]}" -gt 0 ]; then
+case "$SYMS" in
+  *DobbyHook*) echo "    ✓ DobbyHook（iOS arm64 dobby 已并入主 dylib）" ;;
+  *) echo "    ✗ DobbyHook 缺失！dobby 静态链失败" >&2; exit 1 ;;
+esac
+# [R60] 静态链 CoreLib shim 的证明（blob-fallback 模式不要求主 dylib 含 SystemNative_*）
+if [ "$R60_SHIM_MODE" = "static" ]; then
   case "$SYMS" in
     *SystemNative_*) echo "    ✓ SystemNative_*（CoreLib P/Invoke shim 已并入主 dylib）" ;;
-    *) echo "    ⚠ 未导出 SystemNative_*（宿主将走 native/ blob 释放 fallback）" >&2 ;;
+    *) echo "    ⚠ 静态链模式下未导出 SystemNative_*，宿主将按符号探测自动走 fallback" >&2 ;;
   esac
+else
+  echo "    - CoreLib shim 走 blob 释放 fallback（宿主 dllmap 到 Documents/nebula_native）"
 fi
 
 echo "--- [R60] 单一文件校验：产物目录里只应有 1 个 .dylib ---"
