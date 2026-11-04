@@ -19,7 +19,7 @@ NOS="${2:?缺 NOS 改装包 zip}"
 OUT="${3:?缺输出目录}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-echo "=== 打包 profile=$profile -> $OUT ===" 2>/dev/null
+echo "=== 打包 -> $OUT ==="
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 echo "=== [1/5] 宿主 dylib（BCL + BepInEx/core 已内嵌，无散文件）==="
@@ -45,6 +45,9 @@ SKIP_NAMES = {'winhttp.dll', 'doorstop_config.ini', 'GameAssembly.dll',
               'UnityPlayer.dll', 'UnityCrashHandler32.exe', 'Among Us.exe',
               'baselib.dll', 'opus.dll', 'msvcp140.dll', 'vcruntime140.dll',
               'dobby.dll'}
+# 注意：BepInEx/interop 必须 SKIP —— NOS 改装包自带的是【PC/Windows 版】interop
+#（含 Rewired_Windows.dll 等 Windows 专属桥接），绝不能上 iOS 设备。iOS 版 interop
+# 由下面的 [2.5/5] 从仓库 src/mono_host/prebuilt-interop/ 专门拷贝覆盖。
 SKIP_DIRS = ['dotnet/', 'MonoBleedingEdge/', 'UnityPlayer_Data/', 'BepInEx/core/', 'BepInEx/interop/']
 
 kept = collections.Counter()
@@ -70,6 +73,22 @@ for n in names:
 for k, v in kept.items():
     print(f"    {k}: {v} 个文件")
 PY
+
+echo "=== [2.5/5] 预生成 iOS 版 interop（随包发布，设备端不再现场生成）==="
+# R58 教训：iPad 现场跑 Cpp2IL 分析 ~96MB UnityFramework 会卡死/整夜跑不完 → 永久黑屏。
+# 这里直接拷入 PC 端针对 17.3.1o 预生成的完整 interop（与 dylib 内 baked 的
+# BepInEx/core 同版本 Il2CppInterop 产出），设备端只加载复用、绝不重新生成。
+PREBUILT="$ROOT/src/mono_host/prebuilt-interop"
+if [ -d "$PREBUILT" ]; then
+  # 兜底：先清空可能从 NOS 包漏入的 PC 版 interop（NOS 包自带 Windows 版，绝不能上 iOS）
+  rm -rf "$OUT/BepInEx/interop"
+  mkdir -p "$OUT/BepInEx/interop"
+  cp -a "$PREBUILT/." "$OUT/BepInEx/interop/"
+  N_DLL=$(ls "$OUT/BepInEx/interop/" | grep -c '\.dll$' || true)
+  echo "    已植入预生成 interop: $N_DLL 个 dll（版本锁定 17.3.1o，勿替换为 PC 版）"
+else
+  echo "    ⚠ 未找到 $PREBUILT —— 未随包发布 interop，NOS 将无法加载（R59 设备端不生成）"
+fi
 
 echo "=== [3/5] 配置 ==="
 cp "$ROOT/src/mono_host/nebula_host.standard.cfg" "$OUT/nebula_host.cfg"
@@ -113,7 +132,7 @@ cat > "$OUT/INSTALL.md" <<EOF
 |---|---|
 | \`libnebula_standard.dylib\` | 宿主（单一编译器/JIT 版，内含 MonoVM + BCL + BepInEx.core，自包含，无散 dll） |
 | \`BepInEx/plugins/\` | BepInEx 插件（星云舰加载器等）—— **新模组扔这里** |
-| \`BepInEx/interop/\` | Il2CppInterop 包装层（**首次启动自动生成 iOS 版**；不要带 PC 版） |
+| \`BepInEx/interop/\` | Il2CppInterop 包装层（**已由 PC 针对 17.3.1o 预生成并随包发布（iOS 版），设备端不再生成**；勿替换为 PC 版） |
 | \`BepInEx/config/\` | 配置 |
 | \`NebulaLibs/\` | 星云舰依赖 |
 | \`Addons/\` | 附加组件（职业定义在里面，默认全加载） |

@@ -900,19 +900,18 @@ static void nebula_fix_il2cpp_paths(const char *root) {
         if (neb_mkdir_p(cfgd) != 0) continue;
         neb_cfg_set(cfgp, "IL2CPP", "ScanMethodRefs", "false", 1);
 
-        // 3d) [R58] 强制在设备上按真实版本(17.3.1o)重新生成 interop。
-        // 现存的 interop 是从 PC(AU 17.3s) 拷来的，设备实际跑 17.3.1o；
-        // NOS 的 GateThread 等类型在静态构造里按名字调 il2cpp，版本错配会让
-        // il2cpp_runtime_invoke(NULL,...) native SIGSEGV（R57 真机已坐实）。
-        // 重新生成对齐版本即可。为防 regen 失败丢现场，先把外来 interop 备份到
-        // interop.bak/，再用 nip=0 触发设备端现场生成；生成成功后 BepInEx 自己
-        // 写 assembly-hash.txt，后续启动走"复用"分支（删 hash 走最短路，不重复 ComputeHash）。
+        // 3d) [R59] 设备端【不再生成】interop —— iOS 上跑 Cpp2IL 分析那颗 ~96MB 的
+        //     UnityFramework 二进制会卡死/超慢（R58 真机实测整夜跑不完，t+31700s 仍未结束），
+        //     彻底不可行。改为：interop 由 PC 端针对 17.3.1o 预生成后随包发布，设备只加载复用。
+        //     只要 BepInEx/interop/ 里有 dll，就强制 UpdateInteropAssemblies=false 直接复用；
+        //     绝不备份/移除/重生成（R58 的"备份到 interop.bak + 强制重生成"与 R52 的"删哈希"一并废除，
+        //     否则二次启动会把随包 interop 当外来搬走并重生成，再次卡死）。
+        //     哈希文件保留不动（仅供 BepInEx 做一致性提示，不影响复用）。
         {
             char ip[PATH_MAX];
             snprintf(ip, sizeof(ip), "%s/BepInEx/interop", bases[i]);
             struct stat ist;
             int nip = 0;
-            int has_hash = 0;
             if (stat(ip, &ist) == 0 && S_ISDIR(ist.st_mode)) {
                 DIR *dd = opendir(ip);
                 if (dd) {
@@ -920,55 +919,22 @@ static void nebula_fix_il2cpp_paths(const char *root) {
                     while ((e = readdir(dd)) != NULL) {
                         size_t L = strlen(e->d_name);
                         if (L > 4 && !strcasecmp(e->d_name + L - 4, ".dll")) nip++;
-                        if (!strcmp(e->d_name, "assembly-hash.txt")) has_hash = 1;
                     }
                     closedir(dd);
                 }
             }
-            printf("[host][r58] interop 产物: %s （dll=%d, hash=%d）\n", ip, nip, has_hash);
-
-            if (nip > 0 && !has_hash) {
-                // 外来(PC 17.3s) interop，且无我们自己的哈希 —— 备份后整目录搬走，
-                // 令 nip=0 触发设备端为 17.3.1o 重新生成。
-                char bak[PATH_MAX];
-                snprintf(bak, sizeof(bak), "%s/BepInEx/interop.bak", bases[i]);
-                neb_mkdir_p(bak);
-                DIR *dd = opendir(ip);
-                if (dd) {
-                    struct dirent *e;
-                    while ((e = readdir(dd)) != NULL) {
-                        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-                        char from[PATH_MAX], to[PATH_MAX];
-                        snprintf(from, sizeof(from), "%s/%s", ip, e->d_name);
-                        snprintf(to,   sizeof(to),   "%s/%s", bak, e->d_name);
-                        if (rename(from, to) == 0)
-                            printf("[host][r58] 备份外来 interop: %s -> interop.bak/\n", e->d_name);
-                        else
-                            printf("[host][r58] 警告: 备份失败 %s errno=%d\n", e->d_name, errno);
-                    }
-                    closedir(dd);
-                }
-                nip = 0;
-                printf("[host][r58] 已备份并移除外来 interop，将在设备上为 17.3.1o 重新生成\n");
-            } else if (nip > 0 && has_hash) {
-                // [R52] 我们自己已重新生成的 interop：删掉 hash 让 BepInEx 走最短路，
-                // File.Exists(HashPath)=false -> NeedGenerationOrSkip()=false -> 直接复用，
-                // 跳过 ComputeHash（96MB UnityFramework + 66 库逐块 MD5，省时且避开 Mono P/Invoke 隐患）。
-                char hp[PATH_MAX];
-                snprintf(hp, sizeof(hp), "%s/assembly-hash.txt", ip);
-                struct stat hst;
-                if (stat(hp, &hst) == 0) {
-                    if (unlink(hp) == 0)
-                        printf("[host][r52] 已移除 assembly-hash.txt，跳过 ComputeHash 直接复用 interop\n");
-                    else
-                        printf("[host][r52] 警告: assembly-hash.txt 删除失败 errno=%d\n", errno);
-                }
-            }
+            printf("[host][r59] interop 现状: %s （dll=%d）\n", ip, nip);
 
             if (neb_mkdir_p(cfgd) != 0) continue;
-            // 重新生成期间保持黑屏 + "正在生成interop"（boot_overlay 已处理）；
-            // 生成成功后后续启动 nip>0+hash -> 复用，不再黑屏。
-            neb_cfg_set(cfgp, "IL2CPP", "UpdateInteropAssemblies", nip > 0 ? "false" : "true", 1);
+            if (nip > 0) {
+                // 预生成 interop 已随包发布：直接复用，绝不在设备端重新生成
+                neb_cfg_set(cfgp, "IL2CPP", "UpdateInteropAssemblies", "false", 1);
+                printf("[host][r59] interop 已随包发布(%d dll)，设 UpdateInteropAssemblies=false 直接复用（设备端不生成，黑屏占位不再出现）\n", nip);
+            } else {
+                // 没有预生成 interop（安装漏带）：不生成（会卡死），明确报错，游戏以原版可玩
+                printf("[host][r59] 警告: BepInEx/interop 为空 —— 未随包发布预生成 interop，NOS 无法加载；请确认安装包含 BepInEx/interop/\n");
+                neb_cfg_set(cfgp, "IL2CPP", "UpdateInteropAssemblies", "false", 1);
+            }
         }
     }
     fflush(NULL);

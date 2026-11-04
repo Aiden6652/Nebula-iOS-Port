@@ -34,6 +34,15 @@ src/mono_host/out/
 # 例外：BepInEx/core 托管 dll 是 vendored 进来的（与星云包锁版本，构建期嵌进 dylib，非构建产物）
 !src/mono_host/bepinex-core/
 !src/mono_host/bepinex-core/*.dll
+# 例外：预生成 iOS 版 interop 桥接 dll（PC 针对 17.3.1o 预生成、随包发布，非构建产物；
+#       设备端 R59 不再现场生成，必须随仓库固定版本，否则 CI/clone 打包时无 interop）
+!src/mono_host/prebuilt-interop/
+!src/mono_host/prebuilt-interop/*.dll
+!src/mono_host/prebuilt-interop/*.db
+!src/mono_host/prebuilt-interop/*.txt
+# 例外：Unity 2022.3.44 托管基础库（构建期嵌进 dylib 当 Cecil 参考，vendored，非构建产物）
+!src/mono_host/unity-libs/
+!src/mono_host/unity-libs/*.dll
 *.zip
 *.dat
 metadata/
