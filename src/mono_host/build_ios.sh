@@ -54,13 +54,14 @@ while IFS= read -r line; do
   [ -n "$line" ] && LIBS+=("$line")
 done < <(find "$MONO_PREFIX" -name "*.a" 2>/dev/null)
 
-echo "静态库 ${#LIBS[@]} 个:"
-printf '  %s\n' "${LIBS[@]}"
-
+# [R60 CI 教训 #3] 先判空再展开数组：macOS bash 3.2 + set -u 下，
+# 对空数组 "${LIBS[@]}" 展开会直接 unbound variable。
 if [ "${#LIBS[@]}" -eq 0 ]; then
   echo "!! 没找到 Mono 静态库，检查 $MONO_PREFIX" >&2
   exit 1
 fi
+echo "静态库 ${#LIBS[@]} 个:"
+printf '  %s\n' "${LIBS[@]}"
 
 # 定位 .NET 8 BCL 目录（解包后真实位置是 <prefix>/ios-monovm/lib/net8.0）
 MONO_ROOT="$MONO_PREFIX"
@@ -185,10 +186,17 @@ NATIVE_A_DIR="/tmp/nebula_native_a_$$"
 rm -rf "$NATIVE_A_DIR"
 mkdir -p "$NATIVE_A_DIR"
 for a in "$MONO_PREFIX"/lib/libSystem.*.a; do
-  [ -f "$a" ] || continue
-  cp "$a" "$NATIVE_A_DIR/"
+  if [ -f "$a" ]; then cp "$a" "$NATIVE_A_DIR/"; fi
 done
-N_A="$(ls "$NATIVE_A_DIR"/libSystem.*.a 2>/dev/null | wc -l | tr -d ' ')"
+# [R60 CI 教训 #2] 绝不能用 `ls dir/libSystem.*.a 2>/dev/null | wc -l` 计数：
+# 无匹配时 ls 返回 2，set -o pipefail 让整条管道失败，赋值语句随即触发 set -e
+# 静默退出（stderr 又被 /dev/null 吞掉，CI 日志只见 build 步骤莫名 exit 1、
+# 无任何错误行，正是本轮第二次 CI 失败的现象）。改用 glob + [ -f ] 逐项计数，
+# 在 macOS bash 3.2 + set -u 下同样安全。
+N_A=0
+for a in "$NATIVE_A_DIR"/libSystem.*.a; do
+  if [ -f "$a" ]; then N_A=$((N_A+1)); fi
+done
 if [ "$N_A" -lt 5 ]; then
   VM="${MONOVM_VERSION:-8.0.32}"
   PKG_IOS="microsoft.netcore.app.runtime.mono.ios-arm64"
@@ -197,7 +205,14 @@ if [ "$N_A" -lt 5 ]; then
   if curl -sSL --max-time 240 -o "$NATIVE_A_DIR/iosrt.nupkg" "$URL_IOS" && [ -s "$NATIVE_A_DIR/iosrt.nupkg" ]; then
     python3 - "$NATIVE_A_DIR/iosrt.nupkg" "$NATIVE_A_DIR" <<'PY'
 import zipfile, sys, os
-z = zipfile.ZipFile(sys.argv[1]); out = sys.argv[2]
+try:
+    z = zipfile.ZipFile(sys.argv[1])
+except Exception as e:
+    # [R60 CI 教训 #4] 下载到 302 HTML / 坏 zip 时不能让 python3 非零退出，
+    # 否则 set -e 又静默杀掉脚本；静态链失败本来就允许走 blob fallback。
+    print("       ⚠ nupkg 不是有效 zip（%s），跳过静态链走 blob fallback" % e)
+    sys.exit(0)
+out = sys.argv[2]
 n = 0
 for i in z.infolist():
     fn = os.path.basename(i.filename)
@@ -212,11 +227,10 @@ PY
 fi
 NATIVE_A=()
 for a in "$NATIVE_A_DIR"/libSystem.*.a; do
-  [ -f "$a" ] || continue
-  NATIVE_A+=("$a")
+  if [ -f "$a" ]; then NATIVE_A+=("$a"); fi
 done
 echo "    可静态链的 native .a: ${#NATIVE_A[@]} 个"
-# macOS 自带 bash 3.2 + set -u：空数组 " ${NATIVE_A[@]} " 展开会报 unbound variable
+# macOS 自带 bash 3.2 + set -u：空数组 "${NATIVE_A[@]}" 展开会报 unbound variable
 # （本轮 CI 首次失败的根因），所有数组展开都必须用长度判断包起来。
 if [ ${#NATIVE_A[@]} -gt 0 ]; then
   for a in "${NATIVE_A[@]}"; do echo "      $(basename "$a")"; done
@@ -316,7 +330,7 @@ fi
 
 echo "--- [R60] 单一文件校验：产物目录里只应有 1 个 .dylib ---"
 find "$OUT" -name '*.dylib' -print | sed 's|^|    |'
-NDYLIB="$(find "$OUT" -name '*.dylib' | wc -l | tr -d ' ')"
+NDYLIB="$(find "$OUT" -name '*.dylib' | wc -l | tr -d ' ' || true)"
 [ "$NDYLIB" = "1" ] || { echo "!! 产物目录有 $NDYLIB 个 dylib，R60 要求只交付一个" >&2; exit 1; }
 
 echo "--- 产物 ---"
