@@ -43,6 +43,9 @@ src/mono_host/out/
 # 例外：Unity 2022.3.44 托管基础库（构建期嵌进 dylib 当 Cecil 参考，vendored，非构建产物）
 !src/mono_host/unity-libs/
 !src/mono_host/unity-libs/*.dll
+# 例外：[R60] 预编译的服务器列表滑动补丁（BepInEx IL2CPP 插件，随包发布）
+!src/plugins/ServerScroll/
+!src/plugins/ServerScroll/*.dll
 *.zip
 *.dat
 metadata/

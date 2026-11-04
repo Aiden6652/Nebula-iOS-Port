@@ -49,6 +49,7 @@ LIBS=()
 while IFS= read -r line; do
   case "$(basename "$line")" in
     libmono-component-debugger-static.a) continue ;;  # 用 stub 版
+    libSystem.*.a) continue ;;  # [R60] 下面用 -Wl,-force_load 单独全量链，避免重复定义
   esac
   [ -n "$line" ] && LIBS+=("$line")
 done < <(find "$MONO_PREFIX" -name "*.a" 2>/dev/null)
@@ -123,6 +124,39 @@ if os.path.isdir(unity_libs):
 else:
     print("!! 没找到 unity-libs 目录，运行时将无法自带 Unity 基础库", file=sys.stderr)
 
+# 4) [R60] 预生成 iOS interop：随 dylib 内嵌，启动时由宿主释放到 BepInEx/interop/
+#    ① 用户无需手动放（R59 仍要手动解压 zip，用户明确不要）；
+#    ② interop 目录永不为空 —— BepInEx 的 Il2CppInteropManager 在目录空/无 dll 时
+#       会无视 UpdateInteropAssemblies=false 而触发现场生成，R58 真机整夜卡死黑屏；
+#    ③ 与 dylib 内 baked 的 BepInEx/core 同版本 Generator 产出，版本锁定。
+#    注意：这些条目带 "interop/" 前缀，宿主 blob_find 一律跳过（不能当普通程序集
+#    内存加载，否则会抢占 Il2CppInterop 桥接类的加载），只由 extract_dir 按文件释放。
+interop_dir = os.path.join(root_dir, "prebuilt-interop")
+if os.path.isdir(interop_dir):
+    n = 0
+    for f in sorted(os.listdir(interop_dir)):
+        p = os.path.join(interop_dir, f)
+        if not os.path.isfile(p): continue
+        add("interop/" + f, open(p, "rb").read())
+        n += 1
+    print("   [R60] interop: %d 个文件已内嵌（启动自动释放，免手动放）" % n)
+else:
+    print("!! 没找到 prebuilt-interop/（R60 无法免手动放 interop）", file=sys.stderr)
+
+# 5) [R60] iOS 原生 shim（libSystem.*.dylib）字节内嵌，作为 fallback：
+#    主路径是把 libSystem.*.a 静态链进本 dylib（-force_load），完全无散文件；
+#    若 CI 的 Mono prefix 里没有对应 .a，则宿主启动时把这里的 dylib 字节释放到
+#    可写目录并 dllmap 过去（用户要的"表面一个、启动自动在内存里分裂回来"备选）。
+#    同样带 "native/" 前缀，blob_find 跳过。
+native_src = os.path.join(mono_root, "lib", "net8.0", "native")
+if os.path.isdir(native_src):
+    n = 0
+    for f in sorted(os.listdir(native_src)):
+        if f.startswith("libSystem.") and f.endswith(".dylib"):
+            add("native/" + f, open(os.path.join(native_src, f), "rb").read())
+            n += 1
+    print("   [R60] native shim(fallback): %d 个已内嵌" % n)
+
 buf = struct.pack("<I", 0x4E424C31)  # 'NBL1'
 buf += struct.pack("<I", len(entries))
 for name, data in entries:
@@ -133,28 +167,46 @@ open(blob_path, "wb").write(buf)
 print("blob: %d 个程序集, %d bytes" % (len(entries), len(buf)))
 PY
 
-echo "=== 拷贝 iOS 原生 interop shim（libSystem.*.dylib）进产物目录 ==="
-# [Nebula iOS 第二十轮] .NET 8 CoreLib 的 P/Invoke 依赖这些原生 shim（getenv/文件IO/加密/
-# 压缩/TLS）。它们来自 ios-arm64 运行时包（为 iOS 链接），由宿主 mono_dllmap_insert 重映射。
-# 单独作为文件落进 app bundle（用户重签时一并签名），不走 BCL blob（那是托管程序集）。
-NATIVE_SRC="$MONO_ROOT/lib/net8.0/native"
-if [ -d "$NATIVE_SRC" ]; then
-  mkdir -p "$OUT/native"
-  cnt=0
-  for d in "$NATIVE_SRC"/libSystem.*.dylib; do
-    [ -f "$d" ] || continue
-    # 双份落盘：native/ 子目录（结构化）+ OUT 根（平铺），
-    # 宿主在两处都查，用户"整包平铺"或"native 子目录"两种部署都能命中。
-    cp "$d" "$OUT/native/"
-    cp "$d" "$OUT/"
-    cnt=$((cnt+1))
-  done
-  echo "    原生 shim: $cnt 个 -> $OUT/native/ 与 $OUT/ (平铺)"
-else
-  echo "    ⚠ 未找到 iOS 原生 shim 目录 $NATIVE_SRC（P/Invoke 将缺库，运行时 DllNotFound）" >&2
-fi
+echo "=== [R60] 原生 shim 处理：静态链进主 dylib（真·单一文件），dylib 字节内嵌作 fallback ==="
+# 不再把 libSystem.*.dylib 平铺进产物目录 —— R60 只交付一个 libnebula_standard.dylib。
+#   主路径：把 $MONO_PREFIX/lib/libSystem.*.a 用 -force_load 静态链进主 dylib，
+#           宿主把 libSystem.Native 等 dllmap 指向【主 dylib 自身路径】，dlsym 命中
+#           导出符号（.NET 8 CoreLib 的 P/Invoke 全部落到同一个 Mach-O 里）。
+#   备选路径：CI 若无 .a，宿主从 __nebulabcl 段里 "native/" 前缀的 dylib 字节释放到
+#           可写目录再 dllmap 过去（"表面一个、启动自动在内存里分裂回来"）。
+#   两条路都不需要在 app bundle 里放任何额外的 .dylib —— 用户重签只需签一个文件。
+NATIVE_A=()
+for a in "$MONO_PREFIX"/lib/libSystem.*.a; do
+  [ -f "$a" ] || continue
+  NATIVE_A+=("$a")
+done
+echo "    可静态链的 native .a: ${#NATIVE_A[@]} 个"
+for a in "${NATIVE_A[@]}"; do echo "      $(basename "$a")"; done
 
 echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
+
+# [R60] 强制全量链入的静态库：
+#   ① libdobby.a —— BepInEx 的 [DllImport("dobby")] 原本在设备上命中
+#      core/dobby.dll（Windows x64 PE, 153088B），iOS arm64 dlopen 不了 →
+#      DllNotFoundException: dobby → IL2CPPChainloader.Initialize 中断 →
+#      宿主 R56 兜底强扫 plugins 时 SIGSEGV（真机 preloader.log / nebula_host.log 实锤）。
+#      这里把 iOS arm64 版 Dobby 静态链进来，宿主把 "dobby" dllmap 到主 dylib
+#      自身路径，dlopen 自身 + dlsym("DobbyHook") 即可命中，彻底修掉崩溃根因。
+#   ② libSystem.*.a —— CoreLib 的 P/Invoke shim，同样静态链进主 dylib，实现单文件。
+# 用 -force_load（而非普通列出 .a）：归档里未被 C 代码直接引用的目标文件也必须
+# 全部链入并导出，否则 dlsym 找不到 SystemNative_* / DobbyHook。
+FORCE_LOAD=()
+DOBBY_A="$ROOT/dobby/libdobby.a"
+if [ -f "$DOBBY_A" ]; then
+  FORCE_LOAD+=(-Wl,-force_load,"$DOBBY_A")
+  echo "    [R60] dobby 静态链: $(basename "$DOBBY_A") ($(wc -c < "$DOBBY_A") bytes)"
+else
+  echo "    [R60] ⚠ 缺 dobby/libdobby.a —— BepInEx 仍会 DllNotFoundException: dobby" >&2
+fi
+for a in "${NATIVE_A[@]}"; do
+  FORCE_LOAD+=(-Wl,-force_load,"$a")
+done
+echo "    [R60] force_load 条目: ${#FORCE_LOAD[@]} 个"
 
 # 单一编译器（JIT）版：解释器已废除，standard / pro 合并为一份。
 # 宿主代码始终走 JIT（见 nebula_mono_host.c 的 mono_setmmapjit(1)），
@@ -171,6 +223,7 @@ echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
   "$ROOT/fishhook.c" \
   "$ROOT/boot_overlay.m" \
   "${LIBS[@]}" \
+  "${FORCE_LOAD[@]}" \
   -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
   -framework Foundation \
   -framework CoreFoundation \
@@ -200,6 +253,26 @@ for s in mono_jit_init mono_domain_assembly_open mono_runtime_invoke mono_gc_col
   esac
 done
 [ -n "${MISSING:-}" ] && { echo "!! 缺少 Mono 符号，链接有问题" >&2; exit 1; }
+
+# [R60] dobby 必须真的并进主 dylib（否则 chainloader 仍会 DllNotFoundException）
+if [ -f "${DOBBY_A:-}" ]; then
+  case "$SYMS" in
+    *DobbyHook*) echo "    ✓ DobbyHook（iOS arm64 dobby 已并入主 dylib）" ;;
+    *) echo "    ✗ DobbyHook 缺失！dobby 静态链失败" >&2; exit 1 ;;
+  esac
+fi
+# [R60] 静态链 CoreLib shim 的证明（无 .a 时允许缺，宿主会走 blob 释放 fallback）
+if [ "${#NATIVE_A[@]}" -gt 0 ]; then
+  case "$SYMS" in
+    *SystemNative_*) echo "    ✓ SystemNative_*（CoreLib P/Invoke shim 已并入主 dylib）" ;;
+    *) echo "    ⚠ 未导出 SystemNative_*（宿主将走 native/ blob 释放 fallback）" >&2 ;;
+  esac
+fi
+
+echo "--- [R60] 单一文件校验：产物目录里只应有 1 个 .dylib ---"
+find "$OUT" -name '*.dylib' -print | sed 's|^|    |'
+NDYLIB="$(find "$OUT" -name '*.dylib' | wc -l | tr -d ' ')"
+[ "$NDYLIB" = "1" ] || { echo "!! 产物目录有 $NDYLIB 个 dylib，R60 要求只交付一个" >&2; exit 1; }
 
 echo "--- 产物 ---"
 for f in libnebula_standard.dylib; do

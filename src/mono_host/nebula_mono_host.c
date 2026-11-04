@@ -172,8 +172,18 @@ static const blob_entry *blob_find(const char *aname) {
     size_t L = strlen(base);
     if (L > 4 && !strcasecmp(base + L - 4, ".dll")) base[L - 4] = 0;
     for (int i = 0; i < g_n; i++) {
-        const char *bn = strrchr(g_entries[i].name, '/');
-        const char *en = bn ? bn + 1 : g_entries[i].name;
+        const char *full = g_entries[i].name;
+        // [R60] 这三段前缀装的是【按文件释放的资源】，不是可内存加载的普通程序集：
+        //   unity-libs/  → Il2CppInterop 生成器的 Cecil 参考程序集（R48）
+        //   interop/     → 预生成的 iOS 桥接 dll（131 个，必须落成散文件给
+        //                  Il2CppInteropManager 用 Assembly.Load 按路径加载；
+        //                  若在这里被简单名匹配抢走，会顶掉真正的桥接加载）
+        //   native/      → CoreLib P/Invoke 的 iOS shim dylib（fallback 释放用）
+        if (!strncmp(full, "unity-libs/", 11) ||
+            !strncmp(full, "interop/", 8)    ||
+            !strncmp(full, "native/", 7)) continue;
+        const char *bn = strrchr(full, '/');
+        const char *en = bn ? bn + 1 : full;
         size_t EL = strlen(en); char ebase[512];
         strncpy(ebase, en, sizeof(ebase) - 1); ebase[sizeof(ebase) - 1] = 0;
         if (EL > 4 && !strcasecmp(ebase + EL - 4, ".dll")) ebase[EL - 4] = 0;
@@ -732,6 +742,57 @@ static int nebula_blob_extract_dir(const char *prefix, const char *dest) {
     return written;
 }
 
+/* [R60] 取本 dylib 自身的绝对路径。
+   dllmap 的 target 指向它：dlopen(自身) 会返回已加载镜像的 handle，随后 dlsym
+   即可命中静态链进来的 DobbyHook / SystemNative_* 符号。这样所有原生库都住在
+   同一个 Mach-O 里，成品就一个 libnebula_standard.dylib。 */
+static char g_r60_self_path[PATH_MAX] = {0};
+static const char *nebula_r60_self_path(void) {
+#ifdef __APPLE__
+    if (g_r60_self_path[0]) return g_r60_self_path;
+    Dl_info info;
+    if (dladdr((void *)blob_load, &info) && info.dli_fname) {
+        snprintf(g_r60_self_path, sizeof(g_r60_self_path), "%s", info.dli_fname);
+        return g_r60_self_path;
+    }
+#endif
+    return NULL;
+}
+
+/* [R60] 把 dylib 内嵌的 interop/ 与 native/ 资源释放到磁盘（blob_load 之后立刻调用）。
+
+   interop：R59 只做到"随包发布"，用户仍要手动解压 zip 放进 BepInEx/interop/。
+    一旦目录为空，BepInEx 的 Il2CppInteropManager 会无视
+    UpdateInteropAssemblies=false 而【现场生成】（R58 真机整夜卡死/黑屏）——
+    这正是用户反馈的"不手动放 interop 他还会生成"。R60 直接从 dylib 内嵌
+    释放 131 个预生成 iOS 桥接 dll，目录永不为空 → 用户零操作、设备端永不生成。
+
+   native：CoreLib P/Invoke shim 的 fallback。主路径是静态链进主 dylib；
+    若 CI 的 Mono prefix 没带 libSystem.*.a，则宿主释放这里的 dylib 字节到
+    可写目录（Documents/nebula_native/）再 dllmap 过去 —— 即用户说的
+    「表面上一个 dylib，启动自动在内存里分裂回来」。 */
+static void nebula_r60_extract_bundle(const char *root) {
+    if (!g_n) return;
+    char dest[PATH_MAX];
+    const char *home = getenv("HOME");
+
+    // 投到所有可能的 BepInEx 基准目录：游戏根（用户放包处）+ Documents（BepInEx Paths 实际用）
+    const char *bases[2]; int nb = 0;
+    if (root && root[0]) bases[nb++] = root;
+    if (home && home[0]) { static char doc[PATH_MAX]; snprintf(doc, sizeof(doc), "%s/Documents", home); bases[nb++] = doc; }
+    for (int i = 0; i < nb; i++) {
+        snprintf(dest, sizeof(dest), "%s/BepInEx/interop", bases[i]);
+        int n = nebula_blob_extract_dir("interop/", dest);
+        printf("[host][r60] 预生成 interop -> %s（本次新写 %d，已存在则跳过）\n", dest, n);
+    }
+    // native shim 只投可写目录（app bundle 只读，写不进去也无害）
+    if (home && home[0]) {
+        snprintf(dest, sizeof(dest), "%s/Documents/nebula_native", home);
+        int n = nebula_blob_extract_dir("native/", dest);
+        printf("[host][r60] native shim fallback -> %s（本次新写 %d）\n", dest, n);
+    }
+}
+
 // 探 IL2CPP 二进制 + global-metadata.dat，并落地纠偏
 /* [R53] 只探测、绝不调用 il2cpp C API。
    宿主 boot() 是阻塞式 constructor：主线程泵着 CFRunLoop 死等 boot_thread 结束，
@@ -900,16 +961,19 @@ static void nebula_fix_il2cpp_paths(const char *root) {
         if (neb_mkdir_p(cfgd) != 0) continue;
         neb_cfg_set(cfgp, "IL2CPP", "ScanMethodRefs", "false", 1);
 
-        // 3d) [R59] 设备端【不再生成】interop —— iOS 上跑 Cpp2IL 分析那颗 ~96MB 的
-        //     UnityFramework 二进制会卡死/超慢（R58 真机实测整夜跑不完，t+31700s 仍未结束），
-        //     彻底不可行。改为：interop 由 PC 端针对 17.3.1o 预生成后随包发布，设备只加载复用。
-        //     只要 BepInEx/interop/ 里有 dll，就强制 UpdateInteropAssemblies=false 直接复用；
-        //     绝不备份/移除/重生成（R58 的"备份到 interop.bak + 强制重生成"与 R52 的"删哈希"一并废除，
-        //     否则二次启动会把随包 interop 当外来搬走并重生成，再次卡死）。
-        //     哈希文件保留不动（仅供 BepInEx 做一致性提示，不影响复用）。
+        // 3d) [R60] 设备端【永不生成】interop —— iOS 上跑 Cpp2IL 分析那颗 ~96MB 的
+        //     UnityFramework 二进制会卡死/超慢（R58 真机实测整夜跑不完，t+31700s 仍未结束）。
+        //     R59 只做到"随包发布"，用户仍要手动放；且一旦 BepInEx/interop 为空，
+        //     Il2CppInteropManager 会无视 UpdateInteropAssemblies=false 触发现场生成
+        //     （用户实测"不手动放他还会生成"）。R60：interop 已由 dylib 内嵌，
+        //     boot 早期 nebula_r60_extract_bundle() 自动释放，这里再兜底补一次，
+        //     保证目录恒非空 → 用户零操作、设备端永不生成。
+        //     绝不备份/移除/重生成（R58 的"备份 + 强制重生成"与 R52 的"删哈希"一并废除）。
         {
             char ip[PATH_MAX];
             snprintf(ip, sizeof(ip), "%s/BepInEx/interop", bases[i]);
+            /* 幂等兜底：已存在且大小一致就跳过，不覆盖不删除 */
+            nebula_blob_extract_dir("interop/", ip);
             struct stat ist;
             int nip = 0;
             if (stat(ip, &ist) == 0 && S_ISDIR(ist.st_mode)) {
@@ -923,16 +987,16 @@ static void nebula_fix_il2cpp_paths(const char *root) {
                     closedir(dd);
                 }
             }
-            printf("[host][r59] interop 现状: %s （dll=%d）\n", ip, nip);
+            printf("[host][r60] interop 现状: %s （dll=%d）\n", ip, nip);
 
             if (neb_mkdir_p(cfgd) != 0) continue;
             if (nip > 0) {
-                // 预生成 interop 已随包发布：直接复用，绝不在设备端重新生成
+                // 预生成 interop 已就位：直接复用，绝不在设备端重新生成
                 neb_cfg_set(cfgp, "IL2CPP", "UpdateInteropAssemblies", "false", 1);
-                printf("[host][r59] interop 已随包发布(%d dll)，设 UpdateInteropAssemblies=false 直接复用（设备端不生成，黑屏占位不再出现）\n", nip);
+                printf("[host][r60] interop 已就位(%d dll)，设 UpdateInteropAssemblies=false 直接复用（设备端不生成、无需手动放）\n", nip);
             } else {
-                // 没有预生成 interop（安装漏带）：不生成（会卡死），明确报错，游戏以原版可玩
-                printf("[host][r59] 警告: BepInEx/interop 为空 —— 未随包发布预生成 interop，NOS 无法加载；请确认安装包含 BepInEx/interop/\n");
+                // 极端情况（blob 没带 interop）：仍不生成（会卡死），明确报错，游戏原版可玩
+                printf("[host][r60] 警告: BepInEx/interop 仍为空 —— 本 dylib 未内嵌 interop，NOS 无法加载\n");
                 neb_cfg_set(cfgp, "IL2CPP", "UpdateInteropAssemblies", "false", 1);
             }
         }
@@ -2205,20 +2269,45 @@ static void nebula_probe_map_jit(void) {
 }
 #endif
 
-/* [Nebula iOS 第二十轮 2026-10-29] 用 mono_dllmap_insert 把 .NET 8 CoreLib 的 P/Invoke
-   原生库名（libSystem.Native 等）重映射到 iOS 版 shim 的磁盘绝对路径。
-   .NET 8 CoreLib 的所有原生调用（getenv/文件IO/加密/压缩/TLS）都走这些 shim，由 .NET
-   运行时从 ios-arm64 包提供。我们自编译的 mono 没有内置 dllmap config（dotnet/runtime
-   的 mono_config_parse 是空函数），故用程序化 mono_dllmap_insert 注入。
-   shim 文件由构建从 ios-arm64 运行时包提取，落进 app bundle 的 native/（用户重签时一并
-   签名）。必须在 mono_jit_init 之前调用：首条 getenv P/Invoke 发生在 runtime init 期。 */
+/* [R60] 判断某个符号是否已经住进本 dylib（静态链成功）。
+   先查全局命名空间；查不到再 dlopen 自身路径拿 handle 精确查一次。 */
+static int nebula_r60_has_symbol(const char *sym) {
+    if (dlsym(RTLD_DEFAULT, sym)) return 1;
+    const char *self = nebula_r60_self_path();
+    if (!self) return 0;
+    void *h = dlopen(self, RTLD_NOW);
+    if (!h) return 0;
+    return dlsym(h, sym) != NULL;
+}
+
+/* [R60] NOS 改装包随包带的 BepInEx/core/dobby.dll 是 Windows x64 PE (153088B)，
+   iOS arm64 dlopen 不了 → DllNotFoundException: dobby。既然 R60 已把 iOS arm64
+   Dobby 静态并进主 dylib，就把这个 PE 挪开（改名，不删，便于回滚），杜绝误加载。 */
+static void nebula_r60_quarantine_win_dobby(void) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char p[PATH_MAX], bak[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/Documents/BepInEx/core/dobby.dll", home);
+    FILE *f = fopen(p, "rb");
+    if (!f) return;
+    unsigned char m[2] = {0, 0};
+    if (fread(m, 1, 2, f) != 2) { fclose(f); return; }
+    fclose(f);
+    if (m[0] != 'M' || m[1] != 'Z') return;   // 不是 PE，别动
+    snprintf(bak, sizeof(bak), "%s.win.bak", p);
+    remove(bak);
+    if (rename(p, bak) == 0)
+        printf("[host][r60] 已挪走 Windows x64 PE 的 core/dobby.dll -> .win.bak（改用主 dylib 内 arm64 Dobby）\n");
+}
+
+/* [Nebula iOS 第二十轮] 用 mono_dllmap_insert 把 .NET 8 CoreLib 的 P/Invoke
+   原生库名（libSystem.Native 等）重映射到 iOS 版 shim。
+   [R60] 改造：dobby + 5 个 libSystem.* 全部【静态链进主 dylib】，dllmap 一律
+   指向主 dylib 自身路径 → dlopen(自身) + dlsym 命中导出符号 → 成品只有一个 dylib。
+   若 CI 没带 libSystem.*.a（静态链失败），则回退到文件：app bundle 里现成的
+   shim，或启动时从 blob 释放到 Documents/nebula_native/ 的那份。 */
 static void nebula_setup_native_dllmaps(const char *appdir)
 {
-    // mono_dllmap_insert 正式声明在 mono-2.0 头 mono/metadata/details/loader-functions.h
-    // （MONO_API_FUNCTION，首参 MonoImage *assembly），本文件已包含该头。
-    // [第二十一轮教训] 勿在函数内再写本地 extern——void* 与 MonoImage* 冲突报
-    // "conflicting types for 'mono_dllmap_insert'"，CI host-dylib 编译失败。
-    // assembly=NULL 表示全局映射；文档注明可在 runtime 初始化前调用。
     static const char *shims[] = {
         "libSystem.Native.dylib",
         "libSystem.Globalization.Native.dylib",
@@ -2227,36 +2316,68 @@ static void nebula_setup_native_dllmaps(const char *appdir)
         "libSystem.Security.Cryptography.Native.Apple.dylib",
         NULL
     };
-    // 候选目录（按优先级）：app 根(平铺) / native/ 子目录 / Frameworks/ / Frameworks/native/
-    // 覆盖"整包平铺""native 子目录""iOS 惯例 Frameworks"等多种部署方式，
-    // 避免用户把 shim 放错位置导致 dllmap 整组跳过、再次 DllNotFoundException。
+
+    const char *self = nebula_r60_self_path();
+
+    /* ---- 1) dobby：修「播完 Innersloth 后崩」的根因 ---- */
+    nebula_r60_quarantine_win_dobby();
+    if (nebula_r60_has_symbol("DobbyHook") && self) {
+        static const char *dobby_names[] = { "dobby", "libdobby", "dobby.dll", NULL };
+        for (int i = 0; dobby_names[i]; i++)
+            mono_dllmap_insert(NULL, dobby_names[i], NULL, self, NULL);
+        hlog("[host][r60] dllmap: dobby -> %s（iOS arm64 Dobby 已静态并入主 dylib，chainloader 不再 DllNotFound）", self);
+    } else {
+        hlog("[host][r60] !! 主 dylib 未导出 DobbyHook —— BepInEx 仍会 DllNotFoundException: dobby");
+    }
+
+    /* ---- 2) CoreLib 的 5 个 P/Invoke shim ---- */
+    int static_shim = 0;
+    {
+        static const char *probes[] = {
+            "SystemNative_GetEnv", "SystemNative_GetPid", "SystemNative_Open",
+            "SystemNative_Stat", "GlobalizationNative_GetLocaleName", NULL
+        };
+        for (int i = 0; probes[i]; i++)
+            if (nebula_r60_has_symbol(probes[i])) { static_shim = 1; break; }
+    }
+    if (static_shim && self) {
+        for (int i = 0; shims[i]; i++) {
+            size_t L = strlen(shims[i]);
+            char name[256];
+            memcpy(name, shims[i], L - 6); name[L - 6] = '\0';  // 去 ".dylib"
+            mono_dllmap_insert(NULL, name, NULL, self, NULL);
+            hlog("[host][r60] dllmap: %s -> 主 dylib 自身（静态链，单文件）", name);
+        }
+        return;
+    }
+    hlog("[host][r60] 主 dylib 未含 SystemNative_*，CoreLib shim 走文件 fallback");
+
+    /* fallback：找磁盘上的 shim（原有逻辑 + R60 的 blob 释放目录） */
+    char nativedir[PATH_MAX] = {0};
+    const char *home = getenv("HOME");
+    if (home && home[0]) snprintf(nativedir, sizeof(nativedir), "%s/Documents/nebula_native", home);
     const char *dirs[] = { "", "native", "Frameworks", "Frameworks/native", NULL };
     char path[PATH_MAX];
     for (int i = 0; shims[i]; i++) {
         int found = 0;
-        for (int d = 0; dirs[d]; d++) {
+        if (nativedir[0]) {
+            snprintf(path, sizeof(path), "%s/%s", nativedir, shims[i]);
+            if (access(path, R_OK) == 0) found = 1;
+        }
+        for (int d = 0; dirs[d] && !found; d++) {
             if (dirs[d][0])
                 snprintf(path, sizeof(path), "%s/%s/%s", appdir, dirs[d], shims[i]);
             else
                 snprintf(path, sizeof(path), "%s/%s", appdir, shims[i]);
-            if (access(path, R_OK) == 0) { found = 1; break; }
+            if (access(path, R_OK) == 0) found = 1;
         }
         if (!found) {
             hlog("[host] native shim 未找到(跳过 dllmap): %s", shims[i]);
-            hlog("[host]   已查: %s/%s | %s/native/%s | %s/Frameworks/%s | %s/Frameworks/native/%s",
-                 appdir, shims[i], appdir, shims[i], appdir, shims[i], appdir, shims[i]);
             continue;
         }
-        // dll 键用不带 .dylib 的库名，匹配 CoreLib 的 [LibraryImport("libSystem.Native")]
         size_t L = strlen(shims[i]);
         char name[256];
-        if (L > 6 && strcmp(shims[i] + L - 6, ".dylib") == 0) {
-            memcpy(name, shims[i], L - 6);
-            name[L - 6] = '\0';
-        } else {
-            strncpy(name, shims[i], sizeof(name) - 1);
-            name[sizeof(name) - 1] = '\0';
-        }
+        memcpy(name, shims[i], L - 6); name[L - 6] = '\0';
         mono_dllmap_insert(NULL, name, NULL, path, NULL);
         hlog("[host] dllmap: %s -> %s", name, path);
     }
@@ -2313,37 +2434,13 @@ static void *boot_thread_impl(void *arg) {
     neb_install_mach_trap();   // [第十五轮] thread 级 mach 端口：先于 BSD signal 抓真实 fault 地址
 #endif
 
-    // 启动占位文本：Mono + BepInEx 初始化期间显示在屏幕正中，防黑屏误判死机。
-    // 窗口可能还没起来，内部带重试；Nebula.dll + Harmony 就绪后由托管侧
-    // nebula_signal_ready() 销毁，或此处兜底延时/安全超时销毁。
-    // 占位文字只在「真的要生成 interop」时才出现。
-    // interop 生成是一次性分钟级重活，生成过之后本次启动应当秒过且完全不显示，
-    // 否则每次启动都闪一下「正在生成interop」是对用户的误导。
-    {
-        int has_interop = 0;
-        char idir[PATH_MAX];
-        const char *home = getenv("HOME");
-        /* interop 可能在 app 根下的 BepInEx/interop，也可能在 Documents 下，两处都查 */
-        for (int k = 0; k < 2 && !has_interop; k++) {
-            if (k == 0) snprintf(idir, sizeof(idir), "%s/BepInEx/interop", root);
-            else if (home) snprintf(idir, sizeof(idir), "%s/Documents/BepInEx/interop", home);
-            else continue;
-            DIR *d = opendir(idir);
-            if (!d) continue;
-            struct dirent *de;
-            while ((de = readdir(d)) != NULL) {
-                size_t L = strlen(de->d_name);
-                if (L > 4 && strcasecmp(de->d_name + L - 4, ".dll") == 0) { has_interop = 1; break; }
-            }
-            closedir(d);
-        }
-        if (has_interop) {
-            hlog("[host] interop 已存在，跳过占位文字（本次启动无需生成，应直接放行）");
-        } else {
-            hlog("[host] interop 未生成：显示占位文字（黑屏 + 省略号动画，预计数分钟）");
-            nebula_show_boot_overlay();
-        }
-    }
+    // [R60] 启动画面：无条件强制播放 "AUI Mod Loader by Aiden" 满 3 秒。
+    //   ① 不再是「正在生成interop」占位 —— R60 设备端永不生成 interop，
+    //      那个文案会误导；② 用户明确要求每次启动强制播放 3s 品牌页；
+    //   ③ 最短展示时长由 boot_overlay.m 内部把关，Nebula 就绪信号也不得提前销毁。
+    //   窗口可能还没起来，内部带重试；30s 安全超时兜底销毁（绝不卡屏）。
+    hlog("[host][r60] 启动画面：强制播放 3s AUI Mod Loader by Aiden");
+    nebula_show_boot_overlay();
 
     // 大小写回退必须在知道游戏根目录后装（只对它生效），且默认关闭
     hlog("[host] step: cifs init");
@@ -2356,6 +2453,12 @@ static void *boot_thread_impl(void *arg) {
     hlog("[host] step: blob_load");
     blob_load();
     hlog("[host] step: blob ok, assemblies=%d", g_n);
+    // [R60] 立刻把内嵌的预生成 interop / native shim 释放到磁盘。
+    //   必须在 Doorstop.Entrypoint.Start() 之前：BepInEx 的 Il2CppInteropManager
+    //   见到空的 BepInEx/interop 会无视 UpdateInteropAssemblies=false 现场生成
+    //   （R58 真机整夜卡死）。释放后目录恒有 131 个 dll → 设备端永不生成，
+    //   用户也不必再手动放 zip。
+    nebula_r60_extract_bundle(root);
 
     // [第十三轮关键修复] 预加载钩子必须在 mono_jit_init【之前】装好！
     // mono 在 mono_init 阶段就要通过预加载钩子加载 corlib（System.Private.CoreLib），
@@ -2468,12 +2571,11 @@ static void *boot_thread_impl(void *arg) {
     }
     if (!ok) hlog("[host] !! 没有任何启动路径成功");
 
-    // 启动占位文本：BepInEx 已接管（或所有启动路径都失败）—— 把画面交还游戏。
-    // 精确时机由托管侧 nebula_signal_ready() 提前触发（Nebula.dll + Harmony 就绪）；
-    // 这里给一个兜底延时（NEBULA_BOOT_OVERLAY_HOLD_MS，默认 2000ms），让星云舰
-    // 自己的加载动画先就位，再销毁文字；安全超时(默认30s)在 boot_overlay.m 内兜底。
+    // [R60] 启动画面收尾：请求销毁即可，boot_overlay.m 内部按「首次显示时间戳」
+    //   强制满 3 秒才真正移除（Nebula 就绪信号也不得提前销毁）。这里默认 3000ms
+    //   与之对齐；安全超时(默认30s)在 boot_overlay.m 内兜底。
     {
-        int hold = 2000;
+        int hold = 3000;
         const char *he = getenv("NEBULA_BOOT_OVERLAY_HOLD_MS");
         if (he && *he) { int v = atoi(he); if (v >= 0) hold = v; }
         if (hold > 0) {
@@ -2662,7 +2764,24 @@ static void boot(void) {
            已登记，且 boot() 即将返回放行 Unity。从这一刻起算延迟，block 由主线程
            runloop 在 Unity 初始化完成后执行，天然对齐官方 detour「Unity 起来后触发」
            的语义。非阻塞分支（NEBULA_BLOCK_BOOT=0）只作对照实验，不派发。 */
-        nebula_r56_schedule_execute();
+        /* [R60] dobby 已静态并入主 dylib → chainloader 官方 detour
+           （INativeDetour 钩住 il2cpp_runtime_invoke）应当装得上，OnInvokeMethod
+           会在 Unity 首次切场景时正常触发 Instance.Execute()，无需 R56 兜底。
+           真机日志实证：R56 兜底的 NebulaManualExecute() 在播完 Innersloth 后
+           于 mono_jit_runtime_invoke SIGSEGV —— 正是「手动放了 interop、播完
+           innersloth 以后也崩」的直接原因，故 dobby 就绪时必须跳过它。
+           若设备端 dobby inline hook 因 code signing 失败导致 detour 没装上，
+           可设 NEBULA_FORCE_MANUAL_EXECUTE=1 恢复旧兜底做对照。 */
+        {
+            const char *fm = getenv("NEBULA_FORCE_MANUAL_EXECUTE");
+            int force_manual = (fm && !strcmp(fm, "1"));
+            if (nebula_r60_has_symbol("DobbyHook") && !force_manual) {
+                hlog("[host][r60] dobby 已就绪：跳过 R56 兜底 NebulaManualExecute（该兜底是播完 Innersloth 后 SIGSEGV 源头），交由 chainloader 官方 detour 触发 Execute()");
+            } else {
+                hlog("[host][r60] dobby 未就绪或强制兜底：仍派发 R56 NebulaManualExecute");
+                nebula_r56_schedule_execute();
+            }
+        }
     } else {
         pthread_detach(t);
     }

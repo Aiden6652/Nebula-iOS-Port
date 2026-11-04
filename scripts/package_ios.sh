@@ -87,8 +87,24 @@ if [ -d "$PREBUILT" ]; then
   N_DLL=$(ls "$OUT/BepInEx/interop/" | grep -c '\.dll$' || true)
   echo "    已植入预生成 interop: $N_DLL 个 dll（版本锁定 17.3.1o，勿替换为 PC 版）"
 else
-  echo "    ⚠ 未找到 $PREBUILT —— 未随包发布 interop，NOS 将无法加载（R59 设备端不生成）"
+  echo "    ⚠ 未找到 $PREBUILT —— 未随包发布 interop（R60 dylib 内已内嵌，仍可运行）"
 fi
+
+echo "=== [2.6/5] 服务器列表滑动补丁 + 单一 dylib 校验 ==="
+# [R60] 用户私服太多，原版下拉一屏只放得下 3 个、其余飞出屏幕。
+#   插件用 Harmony patch ServerDropdown.OpenServerDropdown，拉长 viewport/content 并
+#   强制竖向滚动；全 try/catch，失败也不影响 NOS。
+PLUGIN="$ROOT/src/plugins/ServerScroll/AUI.ServerScroll.dll"
+if [ -f "$PLUGIN" ]; then
+  mkdir -p "$OUT/BepInEx/plugins"
+  cp "$PLUGIN" "$OUT/BepInEx/plugins/"
+  echo "    已植入 AUI.ServerScroll.dll（服务器列表滑动/拉长）"
+else
+  echo "    ⚠ 未找到 $PLUGIN（可跑 bash src/plugins/ServerScroll/build.sh 重新编译）"
+fi
+NDYLIB="$(find "$OUT" -name '*.dylib' | wc -l | tr -d ' ')"
+echo "    包内原生 dylib 数: $NDYLIB（R60 必须 = 1：dobby + 5 个 libSystem shim 全静态并入主 dylib）"
+[ "$NDYLIB" = "1" ] || { echo "!! R60 要求只交付一个 dylib，实测 $NDYLIB 个" >&2; exit 1; }
 
 echo "=== [3/5] 配置 ==="
 cp "$ROOT/src/mono_host/nebula_host.standard.cfg" "$OUT/nebula_host.cfg"
@@ -117,22 +133,32 @@ echo "    已写入 entitlements.plist"
 
 echo "=== [5/5] 安装说明 ==="
 cat > "$OUT/INSTALL.md" <<EOF
-# 安装（iOS 版 Among Us）
+# 安装（iOS 版 Among Us）— R60
 
 1. 把本目录**整个内容**放进 Among Us 的可写根目录（与 \`AmongUs.app\` 同级或你 dylib 注入点同级）。
 2. 用你的注入方式加载 \`libnebula_standard.dylib\`。它会：
    - 起 MonoVM → 加载 \`BepInEx/core/BepInEx.Unity.IL2CPP.dll\` → 调 \`Doorstop.Entrypoint.Start()\`
    - 之后由 BepInEx 接管，加载 \`BepInEx/plugins/\` 里的插件（含星云舰）
-3. 单一编译器（JIT）版：解释器已废除，standard / pro 合并为一份。始终走 JIT，
-   需要 \`dynamic-codesigning\` 权限（由 StikDebug / 全能签 entitlements 提供），
-   否则 mono 初始化时会被内核秒杀。
+   - **启动强制播放 \`AUI Mod Loader by Aiden\` 满 3 秒**（品牌页，播完自动消失）
+3. 单一编译器（JIT）版：解释器已废除，始终走 JIT，需要 \`dynamic-codesigning\` 权限
+   （由 StikDebug / 全能签 entitlements 提供），否则 mono 初始化时会被内核秒杀。
+
+## R60 相对 R59 的变化
+- **只有一个 dylib**：iOS arm64 \`Dobby\` 与 5 个 \`libSystem.*\` CoreLib shim 全部
+  静态并入 \`libnebula_standard.dylib\`。修掉了真机 \`DllNotFoundException: dobby\`
+  （原 \`core/dobby.dll\` 是 Windows x64 PE）导致的 chainloader 中断与播完 Innersloth 后 SIGSEGV。
+- **interop 不用手动放**：131 个 iOS 桥接 dll 已烤进主 dylib，启动时自动释放到
+  \`BepInEx/interop/\`，目录恒非空 → 设备端**永不现场生成**（R58 整夜卡死黑屏的根因）。
+- **服务器列表滑动**：\`BepInEx/plugins/AUI.ServerScroll.dll\` 把原本一屏只放 3 个的
+  服务器下拉列表拉长并启用竖向滚动（全程 try/catch，不影响 NOS）。
+- 启动时若发现 Documents 里的 Windows 版 \`core/dobby.dll\`，会自动改名为 \`.win.bak\`。
 
 ## 目录
 | 目录/文件 | 作用 |
 |---|---|
-| \`libnebula_standard.dylib\` | 宿主（单一编译器/JIT 版，内含 MonoVM + BCL + BepInEx.core，自包含，无散 dll） |
-| \`BepInEx/plugins/\` | BepInEx 插件（星云舰加载器等）—— **新模组扔这里** |
-| \`BepInEx/interop/\` | Il2CppInterop 包装层（**已由 PC 针对 17.3.1o 预生成并随包发布（iOS 版），设备端不再生成**；勿替换为 PC 版） |
+| \`libnebula_standard.dylib\` | **唯一**原生库：内含 MonoVM + BCL + BepInEx.core + 预生成 interop + arm64 Dobby + CoreLib shim |
+| \`BepInEx/plugins/\` | BepInEx 插件（星云舰加载器 + AUI.ServerScroll.dll）—— **新模组扔这里** |
+| \`BepInEx/interop/\` | Il2CppInterop 桥接层（PC 针对 17.3.1o 预生成的 iOS 版；**dylib 内已内嵌，此份为双保险，无需手动放**；勿替换为 PC 版） |
 | \`BepInEx/config/\` | 配置 |
 | \`NebulaLibs/\` | 星云舰依赖 |
 | \`Addons/\` | 附加组件（职业定义在里面，默认全加载） |
@@ -141,6 +167,8 @@ cat > "$OUT/INSTALL.md" <<EOF
 ## 环境变量
 - \`NEBULA_GAME_DIR\`  游戏根目录（BepInEx 所在处）
 - \`NEBULA_BOOT\`      bepinex / mods / engine / auto（默认 auto）
+- \`NEBULA_BOOT_OVERLAY_MIN_MS\`  品牌页最短展示毫秒数（默认 3000）
+- \`NEBULA_FORCE_MANUAL_EXECUTE=1\`  设备端 dobby inline hook 失败时，恢复 R56 兜底触发 Execute（对照用）
 EOF
 echo "    已写入 INSTALL.md"
 
