@@ -175,13 +175,52 @@ echo "=== [R60] 原生 shim 处理：静态链进主 dylib（真·单一文件�
 #   备选路径：CI 若无 .a，宿主从 __nebulabcl 段里 "native/" 前缀的 dylib 字节释放到
 #           可写目录再 dllmap 过去（"表面一个、启动自动在内存里分裂回来"）。
 #   两条路都不需要在 app bundle 里放任何额外的 .dylib —— 用户重签只需签一个文件。
-NATIVE_A=()
+# CI 的 Mono prefix 只带 libSystem.*.dylib（build_mono_ios.sh 只提取了 dylib），
+# 但 .NET 8 iOS runtime nupkg 里同时提供 5 个 libSystem.*.a 静态库（实测：
+# Native 483KB / Globalization 424KB / IO.Compression 2.6MB / Net.Security 32KB /
+# Security.Cryptography.Apple 331KB）。这里直接下载 nupkg 提取 .a，真正静态链进
+# 主 dylib，避免运行时释放 dylib 在 iOS 上因 code signing 被拒的风险。
+# 下载失败也不致命：宿主仍可从 __nebulabcl 的 "native/" 前缀释放 .dylib 走 fallback。
+NATIVE_A_DIR="/tmp/nebula_native_a_$$"
+rm -rf "$NATIVE_A_DIR"
+mkdir -p "$NATIVE_A_DIR"
 for a in "$MONO_PREFIX"/lib/libSystem.*.a; do
+  [ -f "$a" ] || continue
+  cp "$a" "$NATIVE_A_DIR/"
+done
+N_A="$(ls "$NATIVE_A_DIR"/libSystem.*.a 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$N_A" -lt 5 ]; then
+  VM="${MONOVM_VERSION:-8.0.32}"
+  PKG_IOS="microsoft.netcore.app.runtime.mono.ios-arm64"
+  URL_IOS="https://api.nuget.org/v3-flatcontainer/$PKG_IOS/$VM/$PKG_IOS.$VM.nupkg"
+  echo "    下载 iOS runtime nupkg 提取 native .a ($VM) ..."
+  if curl -sSL --max-time 240 -o "$NATIVE_A_DIR/iosrt.nupkg" "$URL_IOS" && [ -s "$NATIVE_A_DIR/iosrt.nupkg" ]; then
+    python3 - "$NATIVE_A_DIR/iosrt.nupkg" "$NATIVE_A_DIR" <<'PY'
+import zipfile, sys, os
+z = zipfile.ZipFile(sys.argv[1]); out = sys.argv[2]
+n = 0
+for i in z.infolist():
+    fn = os.path.basename(i.filename)
+    if i.filename.startswith('runtimes/ios-arm64/native/') and fn.startswith('libSystem.') and fn.endswith('.a'):
+        open(os.path.join(out, fn), 'wb').write(z.read(i)); n += 1
+print("       nupkg 提取 %d 个 libSystem.*.a" % n)
+PY
+  else
+    echo "    ⚠ nupkg 下载失败 —— CoreLib shim 将走 blob 释放 fallback" >&2
+  fi
+  rm -f "$NATIVE_A_DIR/iosrt.nupkg"
+fi
+NATIVE_A=()
+for a in "$NATIVE_A_DIR"/libSystem.*.a; do
   [ -f "$a" ] || continue
   NATIVE_A+=("$a")
 done
 echo "    可静态链的 native .a: ${#NATIVE_A[@]} 个"
-for a in "${NATIVE_A[@]}"; do echo "      $(basename "$a")"; done
+# macOS 自带 bash 3.2 + set -u：空数组 " ${NATIVE_A[@]} " 展开会报 unbound variable
+# （本轮 CI 首次失败的根因），所有数组展开都必须用长度判断包起来。
+if [ ${#NATIVE_A[@]} -gt 0 ]; then
+  for a in "${NATIVE_A[@]}"; do echo "      $(basename "$a")"; done
+fi
 
 echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 
@@ -195,18 +234,25 @@ echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 #   ② libSystem.*.a —— CoreLib 的 P/Invoke shim，同样静态链进主 dylib，实现单文件。
 # 用 -force_load（而非普通列出 .a）：归档里未被 C 代码直接引用的目标文件也必须
 # 全部链入并导出，否则 dlsym 找不到 SystemNative_* / DobbyHook。
-FORCE_LOAD=()
+# [R60 教训] 不要把 force_load 放进独立数组再展开 —— macOS bash 3.2 + set -u
+# 下空数组展开会 unbound variable。直接 append 到 LIBS（LIBS 至少有 8 个 Mono .a，
+# 永不为空），clang 命令行只展开一个数组，最稳。
+N_FORCE=0
 DOBBY_A="$ROOT/dobby/libdobby.a"
 if [ -f "$DOBBY_A" ]; then
-  FORCE_LOAD+=(-Wl,-force_load,"$DOBBY_A")
+  LIBS+=("-Wl,-force_load,$DOBBY_A")
+  N_FORCE=$((N_FORCE+1))
   echo "    [R60] dobby 静态链: $(basename "$DOBBY_A") ($(wc -c < "$DOBBY_A") bytes)"
 else
   echo "    [R60] ⚠ 缺 dobby/libdobby.a —— BepInEx 仍会 DllNotFoundException: dobby" >&2
 fi
-for a in "${NATIVE_A[@]}"; do
-  FORCE_LOAD+=(-Wl,-force_load,"$a")
-done
-echo "    [R60] force_load 条目: ${#FORCE_LOAD[@]} 个"
+if [ ${#NATIVE_A[@]} -gt 0 ]; then
+  for a in "${NATIVE_A[@]}"; do
+    LIBS+=("-Wl,-force_load,$a")
+    N_FORCE=$((N_FORCE+1))
+  done
+fi
+echo "    [R60] force_load 条目: $N_FORCE 个"
 
 # 单一编译器（JIT）版：解释器已废除，standard / pro 合并为一份。
 # 宿主代码始终走 JIT（见 nebula_mono_host.c 的 mono_setmmapjit(1)），
@@ -223,7 +269,6 @@ echo "    [R60] force_load 条目: ${#FORCE_LOAD[@]} 个"
   "$ROOT/fishhook.c" \
   "$ROOT/boot_overlay.m" \
   "${LIBS[@]}" \
-  "${FORCE_LOAD[@]}" \
   -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
   -framework Foundation \
   -framework CoreFoundation \
