@@ -298,6 +298,7 @@ do_link() {
     "$ROOT/case_insensitive_fs.c" \
     "$ROOT/fishhook.c" \
     "$ROOT/boot_overlay.m" \
+    "$ROOT/nebula_dobby_shim.c" \
     "${LIBS[@]}" \
     "$@" \
     -Wl,-sectcreate,__DATA,__nebulabcl,"$BLOB" \
@@ -352,6 +353,13 @@ done
 case "$SYMS" in
   *DobbyHook*) echo "    ✓ DobbyHook（iOS arm64 dobby 已并入主 dylib）" ;;
   *) echo "    ✗ DobbyHook 缺失！dobby 静态链失败" >&2; exit 1 ;;
+esac
+# [R61] BepInEx6 IL2CPP 的 DobbyDetour 走两段式 DobbyPrepare/DobbyCommit，
+# 上游 jmpews/dobby 只有 DobbyHook；nebula_dobby_shim.c 已用 DobbyHook 包出这俩，
+# 这里校验它们真的并进主 dylib，否则仍会 EntryPointNotFoundException: DobbyPrepare。
+case "$SYMS" in
+  *DobbyPrepare*) echo "    ✓ DobbyPrepare/DobbyCommit（shim 已并入，BepInEx6 IL2CPP detour 可用）" ;;
+  *) echo "    ✗ DobbyPrepare 缺失！nebula_dobby_shim.c 未链入主 dylib" >&2; exit 1 ;;
 esac
 # [R60] 静态链 CoreLib shim 的证明（blob-fallback 模式不要求主 dylib 含 SystemNative_*）
 if [ "$R60_SHIM_MODE" = "static" ]; then
