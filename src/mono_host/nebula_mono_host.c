@@ -2333,8 +2333,11 @@ int nebula_jit_make_executable(void *addr, uint32_t size) {
     uintptr_t base = a & ~((uintptr_t)ps - 1);
     size_t len = (size_t)(a - base) + (size_t)size;
     len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
-    // 写完后刷新指令缓存（arm64 必须），再翻回 RX 才能执行
-    __builtin___clear_cache((char *)base, (char *)base + len);
+    // 写完后刷新指令缓存（arm64 必须），再翻回 RX 才能执行。
+    // 用 Apple 原生 sys_icache_invalidate（<libkern/OSCacheControl.h>），
+    // 勿用 __builtin___clear_cache——它在 iOS clang/arm64 会引用外部符号
+    // ___clear_cache，Apple 平台不提供，链接报 undefined symbol。
+    sys_icache_invalidate((void *)base, len);
     return (int)mprotect((void *)base, len, PROT_READ | PROT_EXEC);
 }
 
