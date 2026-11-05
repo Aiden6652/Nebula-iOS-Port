@@ -26,6 +26,7 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>    // mkdir（BepInEx 可写根目录）
+#include <sys/mman.h>    // mprotect（R62 detour 内存翻转）
 #include <strings.h>    // strcasecmp
 #include <errno.h>      // EEXIST（R47 配置目录幂等创建）
 
@@ -2306,6 +2307,37 @@ static void nebula_r60_quarantine_win_dobby(void) {
    指向主 dylib 自身路径 → dlopen(自身) + dlsym 命中导出符号 → 成品只有一个 dylib。
    若 CI 没带 libSystem.*.a（静态链失败），则回退到文件：app bundle 里现成的
    shim，或启动时从 blob 释放到 Documents/nebula_native/ 的那份。 */
+// [R62] iOS arm64 detour 内存翻转：MonoMod 的 DetourNativeLibcPlatform 走 mprotect 托管包装，
+// 在嵌入式 Mono 上 JIT 编译即崩（Invalid IL code）；DetourNativeARMPlatform 的 MakeWritable/
+// MakeExecutable 又是空操作（假设运行时自管可写性）。这里给 ARM 平台补上真正的内存翻转：
+// 写前 RW、写后 RX + icache 刷新，全部走 libc mprotect（冒烟 路线F 已证 RX 可行）。
+// 这两个符号由 .NET 侧通过 dllmap "nebula_jit" -> 主 dylib 解析（见 nebula_setup_native_dllmaps）。
+__attribute__((visibility("default")))
+int nebula_jit_make_writable(void *addr, uint32_t size) {
+    if (!addr || size == 0) return 0;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 16384;
+    uintptr_t a = (uintptr_t)addr;
+    uintptr_t base = a & ~((uintptr_t)ps - 1);
+    size_t len = (size_t)(a - base) + (size_t)size;
+    len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
+    return (int)mprotect((void *)base, len, PROT_READ | PROT_WRITE);
+}
+
+__attribute__((visibility("default")))
+int nebula_jit_make_executable(void *addr, uint32_t size) {
+    if (!addr || size == 0) return 0;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 16384;
+    uintptr_t a = (uintptr_t)addr;
+    uintptr_t base = a & ~((uintptr_t)ps - 1);
+    size_t len = (size_t)(a - base) + (size_t)size;
+    len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
+    // 写完后刷新指令缓存（arm64 必须），再翻回 RX 才能执行
+    __builtin___clear_cache((char *)base, (char *)base + len);
+    return (int)mprotect((void *)base, len, PROT_READ | PROT_EXEC);
+}
+
 static void nebula_setup_native_dllmaps(const char *appdir)
 {
     static const char *shims[] = {
@@ -2328,6 +2360,12 @@ static void nebula_setup_native_dllmaps(const char *appdir)
         hlog("[host][r60] dllmap: dobby -> %s（iOS arm64 Dobby 已静态并入主 dylib，chainloader 不再 DllNotFound）", self);
     } else {
         hlog("[host][r60] !! 主 dylib 未导出 DobbyHook —— BepInEx 仍会 DllNotFoundException: dobby");
+    }
+
+    /* ---- 1.5) nebula_jit：R62 detour 内存翻转原生函数（mprotect RW/RX + icache 刷新） ---- */
+    if (self) {
+        mono_dllmap_insert(NULL, "nebula_jit", NULL, self, NULL);
+        hlog("[host][r62] dllmap: nebula_jit -> %s（detour 内存翻转原生函数）", self);
     }
 
     /* ---- 2) CoreLib 的 5 个 P/Invoke shim ---- */

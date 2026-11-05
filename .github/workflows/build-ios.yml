@@ -75,10 +75,10 @@ jobs:
       - name: 交叉编译宿主 dylib
         run: bash src/mono_host/build_ios.sh "$HOME/mono-installs"
 
-      - name: 上传宿主 dylib
+      - name: 上传宿主 dylib（IL2CPP 版，非 Mono 版）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nebula-mono-host-ios
+          name: nebula-il2cpp-host-ios
           path: src/mono_host/out-ios/
           if-no-files-found: warn
