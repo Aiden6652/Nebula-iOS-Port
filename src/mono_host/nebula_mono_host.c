@@ -2303,12 +2303,17 @@ static void nebula_r60_quarantine_win_dobby(void) {
 
 /* [R62-4] iOS arm64 detour 内存翻转原生函数。
    MonoMod 的 DetourNativeARMPlatform.MakeWritable/MakeExecutable 原版是空操作（假设桌面
-   ARM 的 JIT 内存本身 RWX）；但本设备：① 原函数 JIT 代码页是 RX，Apply 写不进 ->
-   SIGSEGV；② trampoline 由 AllocHGlobal 返回 RW 内存且从未变可执行，执行必崩。
-   这两个函数用 vm_protect（Dobby 同款，能翻 APRR/APRR-JIT 页）为主、mprotect 兜底，
-   把页面在 RW<->RX 间翻转，并在变可执行前刷新 icache。
+   ARM 的 JIT 内存本身 RWX）；但本设备：原函数 JIT 代码页是 RX，Apply 写不进 -> 崩。
+   本设备实测（冒烟 路线F/G）：plain mmap + mprotect 的 W^X / RWX 翻转畅通，mono 的 JIT
+   代码区也是 RWX 起步（路线G 复刻 mono_valloc 序列执行 OK），故翻页用 RWX 可行。
+
+   【R62-5 关键修正——页粒度碰撞】：mono 把托管 MakeWritable 自身 JIT 编译出的代码（如
+   0x103f24e4c）和被 detour 的目标方法（0x103f248e8）编译进了【同一页】。若把该页翻成
+   RW（不可执行），紧接着要执行的 JIT MakeWritable 代码在 RW 页上取指 -> SIGSEGV（R62-4
+   真机实锤：fault IP 0x103f24e4c 落在目标页内）。故必须翻成 RWX（可写且可执行）：让 JIT
+   代码保持可执行、detour 写入也能进行。Dobby 不踩此坑（它是 dylib 原生 C 代码，不在目标页）。
    .NET 侧通过 dllmap "nebula_jit" -> 主 dylib 解析（见 nebula_setup_native_dllmaps）。 */
-static int nebula_jit_flip(void *addr, uint32_t size, int executable) {
+static int nebula_jit_flip(void *addr, uint32_t size) {
     if (!addr || size == 0) return 0;
     long ps = sysconf(_SC_PAGESIZE);
     if (ps <= 0) ps = 16384;
@@ -2316,31 +2321,29 @@ static int nebula_jit_flip(void *addr, uint32_t size, int executable) {
     uintptr_t base = ua & ~((uintptr_t)ps - 1);
     size_t len = (size_t)(ua - base) + (size_t)size;
     len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
-    vm_prot_t prot = executable ? (VM_PROT_READ | VM_PROT_EXECUTE)
-                                : (VM_PROT_READ | VM_PROT_WRITE);
-    // 主：vm_protect（Dobby 同款，可翻 APRR/APRR-JIT 锁定的 JIT 页）
+    // 翻成 RWX（可写且可执行）——R62-5 页碰撞修正，绝不能再翻成纯 RW
+    vm_prot_t prot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
     kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)base,
                                   (vm_size_t)len, FALSE, prot);
     if (kr == KERN_SUCCESS) return 0;
-    // 兜底：mprotect（路线F 已证 plain mmap 的 W^X 翻转可用）
-    int mp = executable ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_WRITE);
-    int r = mprotect((void *)base, len, mp);
+    // 兜底：mprotect RWX（路线F/G 已证 plain mmap 的 RWX 可用）
+    int r = mprotect((void *)base, len, PROT_READ | PROT_WRITE | PROT_EXEC);
     if (r != 0)
-        hlog("[host][r62] !! jit_flip(%s) 双路均失败 kr=%d mprotect=%d errno=%d @%p",
-             executable ? "RX" : "RW", (int)kr, r, errno, (void *)base);
+        hlog("[host][r62] !! jit_flip(RWX) 双路均失败 kr=%d mprotect=%d errno=%d @%p",
+             (int)kr, r, errno, (void *)base);
     return r;
 }
 
 __attribute__((visibility("default")))
 int nebula_jit_make_writable(void *addr, uint32_t size) {
-    int r = nebula_jit_flip(addr, size, 0);
-    hlog("[host][r62] make_writable %p/%u -> %d", addr, size, r);
+    int r = nebula_jit_flip(addr, size);
+    hlog("[host][r62] make_writable(RWX) %p/%u -> %d", addr, size, r);
     return r;
 }
 
 __attribute__((visibility("default")))
 int nebula_jit_make_executable(void *addr, uint32_t size) {
-    // 变可执行前先刷新 icache（此时页面仍 RW，数据缓存需写回）
+    // 变可执行前先刷新 icache（此时页面仍 RWX，数据缓存需写回）
     long ps = sysconf(_SC_PAGESIZE);
     if (ps <= 0) ps = 16384;
     uintptr_t ua = (uintptr_t)addr;
@@ -2348,8 +2351,8 @@ int nebula_jit_make_executable(void *addr, uint32_t size) {
     size_t len = (size_t)(ua - base) + (size_t)size;
     len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
     sys_icache_invalidate((void *)base, len);
-    int r = nebula_jit_flip(addr, size, 1);
-    hlog("[host][r62] make_executable %p/%u -> %d", addr, size, r);
+    int r = nebula_jit_flip(addr, size);
+    hlog("[host][r62] make_executable(RWX) %p/%u -> %d", addr, size, r);
     return r;
 }
 
