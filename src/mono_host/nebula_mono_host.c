@@ -794,6 +794,32 @@ static void nebula_r60_extract_bundle(const char *root) {
     }
 }
 
+/* [R62] 把 blob 内嵌的【已 IL 修补】MonoMod.RuntimeDetour.dll 强制覆盖写回
+   <root>/BepInEx/core/MonoMod.RuntimeDetour.dll。
+
+   原因：BepInEx 预加载器用 Assembly.LoadFrom 从磁盘 core 目录加载程序集，而该目录里
+   可能残留旧的未修补 DLL（112640 字节，get_Native 仍走 Libc mprotect 的 calli 托管包装，
+   在嵌入式 Mono 上 JIT 编译即崩 InvalidProgramException）。blob 里这份是 IL 修补过的
+   （111616 字节：get_Native 强制 DetourNativeARMPlatform + MakeWritable/MakeExecutable
+   改走 nebula_jit 原生 mprotect）。这里强制覆盖，保证"磁盘加载"也拿到修补版——无论
+   BepInEx 是从 blob 内存加载还是从磁盘 LoadFrom，最终执行的都是同一份修补 DLL。
+
+   必须【无条件覆盖】（不像 nebula_blob_extract_dir 那样"大小一致就跳过"），因为磁盘那份
+   可能恰好大小不同或已存在但旧，必须保证被替换。 */
+static void nebula_r62_patch_core_dll(const char *root) {
+    if (!g_n || !root || !root[0]) return;
+    const blob_entry *e = blob_find("MonoMod.RuntimeDetour");
+    if (!e) { fprintf(stderr, "[host][r62] 找不到 MonoMod.RuntimeDetour blob，无法覆盖写磁盘 core\n"); return; }
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/BepInEx/core/MonoMod.RuntimeDetour.dll", root);
+    FILE *f = fopen(p, "wb");
+    if (!f) { fprintf(stderr, "[host][r62] 无法打开 %s 写（权限？）\n", p); return; }
+    size_t w = fwrite(e->data, 1, e->size, f);
+    fclose(f);
+    if (w != e->size) { remove(p); fprintf(stderr, "[host][r62] 写 %s 不完整(%zu/%u)\n", p, w, e->size); return; }
+    printf("[host][r62] 已用 blob 内已修补 MonoMod.RuntimeDetour.dll 覆盖写 %s (%u bytes)\n", p, e->size);
+}
+
 // 探 IL2CPP 二进制 + global-metadata.dat，并落地纠偏
 /* [R53] 只探测、绝不调用 il2cpp C API。
    宿主 boot() 是阻塞式 constructor：主线程泵着 CFRunLoop 死等 boot_thread 结束，
@@ -2500,6 +2526,11 @@ static void *boot_thread_impl(void *arg) {
     //   （R58 真机整夜卡死）。释放后目录恒有 131 个 dll → 设备端永不生成，
     //   用户也不必再手动放 zip。
     nebula_r60_extract_bundle(root);
+
+    // [R62] 把已 IL 修补的 MonoMod.RuntimeDetour.dll 强制覆盖写回磁盘 core 目录，
+    // 保证 BepInEx 预加载器从磁盘 LoadFrom 时也拿到修补版（否则残留旧 DLL 仍走
+    // Libc mprotect calli 崩）。必须在 Doorstop.Entrypoint.Start() 之前完成。
+    nebula_r62_patch_core_dll(root);
 
     // [第十三轮关键修复] 预加载钩子必须在 mono_jit_init【之前】装好！
     // mono 在 mono_init 阶段就要通过预加载钩子加载 corlib（System.Private.CoreLib），
