@@ -62,7 +62,7 @@ extern void mono_setmmapjit (int flag);
 #include <CoreFoundation/CoreFoundation.h>   // CFRunLoopRunInMode：boot 阻塞等待期泵浦主运行循环
 #include <sys/mman.h>              // mmap / MAP_JIT（JIT 冒烟测试）
 #include <mach/mach.h>              // vm_protect / mach_task_self（detour 翻页）
-#include <mach/mach_vm.h>           // mach_vm_remap / VM_FLAGS_ANYWHERE（双映射别名）
+#include <mach/vm_map.h>             // vm_remap / VM_FLAGS_ANYWHERE（双映射别名；iOS SDK 无 mach_vm.h）
 #include <libkern/OSCacheControl.h> // sys_icache_invalidate（指令缓存刷新）
 #include <errno.h>
 #include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
@@ -70,20 +70,22 @@ extern void mono_setmmapjit (int flag);
 // sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
 // 故手动声明 csops 及其常量。csops 是 libSystem 真实导出的符号，运行/链接均可用。
 extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersize);
-// mach_vm.h 在 iOS SDK 带 #error unsupported（Apple 剥离），但 mach_vm_write /
-// mach_vm_region 是 libsystem_kernel 真实导出的符号（.ips 可见），手动声明。
-// 用途：JIT 冒烟的调试态写入原语（debugserver 同款）与真实保护位校验。
-extern kern_return_t mach_vm_write(vm_map_t target_task,
-                                   mach_vm_address_t address,
-                                   vm_offset_t data,
-                                   mach_msg_type_number_t dataCnt);
-extern kern_return_t mach_vm_region(vm_map_t target_task,
-                                    mach_vm_address_t *address,
-                                    mach_vm_size_t *size,
-                                    vm_region_flavor_t flavor,
-                                    vm_region_info_t info,
-                                    mach_msg_type_number_t *infoCnt,
-                                    mach_port_t *object_name);
+// mach_vm.h 在 iOS SDK 带 #error unsupported（Apple 剥离），且 mach_vm_remap 在 iOS
+// 上根本不导出（链接期 undefined symbol）。改用 iOS SDK 确定可用的经典 vm_* API：
+// vm_remap / vm_region_64 / vm_write（均在 <mach/vm_map.h>，64 位 Darwin 下等价）。
+// 手动声明 vm_region_64 / vm_write 以绕开头文件屏蔽；用途：JIT 冒烟调试态写入原语
+// （debugserver 同款）与真实保护位校验。
+extern kern_return_t vm_write(vm_map_t target_task,
+                              vm_address_t address,
+                              vm_offset_t data,
+                              mach_msg_type_number_t dataCnt);
+extern kern_return_t vm_region_64(vm_map_t target_task,
+                                  vm_address_t *address,
+                                  vm_size_t *size,
+                                  vm_region_flavor_t flavor,
+                                  vm_region_info_t info,
+                                  mach_msg_type_number_t *infoCnt,
+                                  mach_port_t *object_name);
 #ifndef CS_OPS_STATUS
 #define CS_OPS_STATUS 0          // 查询进程代码签名状态
 #endif
@@ -1886,14 +1888,14 @@ static int nebula_wait_for_jit(void) {
 // codesigning monitor 拦截），必须以这里的结果为准再决定是否写入/执行。
 static int nebula_page_prot(void *addr, vm_prot_t *cur, vm_prot_t *mx)
 {
-    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
-    mach_vm_size_t sz = 0;
+    vm_address_t a = (vm_address_t)(uintptr_t)addr;
+    vm_size_t sz = 0;
     vm_region_basic_info_data_64_t bi;
     mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz,
-                                      VM_REGION_BASIC_INFO_64,
-                                      (vm_region_info_t)&bi, &cnt, &obj);
+    kern_return_t kr = vm_region_64(mach_task_self(), &a, &sz,
+                                    VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&bi, &cnt, &obj);
     if (kr != KERN_SUCCESS) return -1;
     if (cur) *cur = bi.protection;
     if (mx)  *mx  = bi.max_protection;
@@ -2117,22 +2119,22 @@ static int nebula_jit_smoke(void)
             hlog("[host] 冒烟: 路线A MAP_JIT mmap 被拒 errno=%d（进程无 JIT 能力）", errno);
         } else {
             nebula_page_prot(p, &cur, &mx);
-            hlog("[host] 冒烟: 路线A MAP_JIT mmap OK %p (cur=%x max=%x), 试 mach_vm_write ...",
+            hlog("[host] 冒烟: 路线A MAP_JIT mmap OK %p (cur=%x max=%x), 试 vm_write ...",
                  p, cur, mx);
-            kern_return_t kr = mach_vm_write(mach_task_self(),
-                                             (mach_vm_address_t)(uintptr_t)p,
-                                             (vm_offset_t)(uintptr_t)&ret_insn,
-                                             (mach_msg_type_number_t)sizeof(ret_insn));
+            kern_return_t kr = vm_write(mach_task_self(),
+                                        (vm_address_t)(uintptr_t)p,
+                                        (vm_offset_t)(uintptr_t)&ret_insn,
+                                        (mach_msg_type_number_t)sizeof(ret_insn));
             if (kr != KERN_SUCCESS) {
-                hlog("[host] 冒烟: 路线A mach_vm_write 失败 kr=%d", kr);
+                hlog("[host] 冒烟: 路线A vm_write 失败 kr=%d", kr);
             } else if (*(volatile unsigned int *)p != ret_insn) {
-                hlog("[host] 冒烟: 路线A mach_vm_write 报成功但读回不符 —— 假写入");
+                hlog("[host] 冒烟: 路线A vm_write 报成功但读回不符 —— 假写入");
             } else {
-                hlog("[host] 冒烟: 路线A mach_vm_write 写入 OK（读回一致）, 刷 icache, 试执行 ...");
+                hlog("[host] 冒烟: 路线A vm_write 写入 OK（读回一致）, 刷 icache, 试执行 ...");
                 sys_icache_invalidate(p, 4096);
                 if (sigsetjmp(g_smoke_jmp, 1) == 0) {
                     ((void (*)(void))p)();
-                    hlog("[host] 冒烟: 路线A 执行 OK —— MAP_JIT+mach_vm_write 路线畅通!");
+                    hlog("[host] 冒烟: 路线A 执行 OK —— MAP_JIT+vm_write 路线畅通!");
                     ok = 1;
                 } else {
                     hlog("[host] 冒烟: 路线A 执行段错误 signal=%d fault=%p（页不可执行）",
@@ -2246,7 +2248,7 @@ static int nebula_jit_smoke(void)
         hlog("[host] 冒烟: JIT 链路畅通, 放行 mono_jit_init");
         return 1;
     }
-    hlog("[host] !! 冒烟失败: 四条 JIT 路线（mach_vm_write / mprotect+WRITE / 翻转函数 / RWX直配）均不可用");
+    hlog("[host] !! 冒烟失败: 四条 JIT 路线（vm_write / mprotect+WRITE / 翻转函数 / RWX直配）均不可用");
     hlog("[host] !! 放弃 mono 初始化（保游戏可玩）。日志上方各路线的失败点即内核给出的精确边界。");
     return 0;
 #else
@@ -2310,7 +2312,7 @@ static void nebula_r60_quarantine_win_dobby(void) {
    APRR 只许 W^X（同 VA 不能同时可写+可执行），而页粒度又让"目标页"和"JIT helper 页"相撞。
    双映射绕开二者：
      · 代码页(detour 目标，mono JIT 页)：不翻原页(保持 RX，JIT helper 安全)，
-       mach_vm_remap 出 RW 别名(同物理页)；托管 Write 走别名写跳转，原 RX VA 立即可见；
+       vm_remap 出 RW 别名(同物理页，iOS SDK 无 mach_vm.h 故用经典 vm_* API)；
        执行仍从原 RX 取指。
      · trampoline：MemAlloc 改用 mmap 隔离页(RW)，写完后 make_executable 翻 RW->RX(W^X)，
        与 mono 自身 JIT 同款，且页隔离避免踩相邻堆。
@@ -2340,11 +2342,11 @@ static uintptr_t nebula_jit_alias_base(uintptr_t base) {
     for (int i = 0; i < g_nebula_alias_n; i++)
         if (g_nebula_alias[i].orig == base) return g_nebula_alias[i].alias;
     if (g_nebula_alias_n >= NEBULA_ALIAS_MAX) return base;
-    mach_vm_address_t ali = 0;
-    mach_vm_size_t sz = (mach_vm_size_t)ps;
+    vm_address_t ali = 0;
+    vm_size_t sz = (vm_size_t)ps;
     vm_prot_t curp = 0, maxp = 0;
-    kern_return_t kr = mach_vm_remap(mach_task_self(), &ali, sz, 0,
-        VM_FLAGS_ANYWHERE, mach_task_self(), (mach_vm_address_t)base,
+    kern_return_t kr = vm_remap(mach_task_self(), &ali, sz, 0,
+        VM_FLAGS_ANYWHERE, mach_task_self(), (vm_address_t)base,
         FALSE, &curp, &maxp, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) {
         hlog("[host][r63] !! dual-map remap 失败 kr=%d @%p（回退原页，可能崩）", (int)kr, (void *)base);
