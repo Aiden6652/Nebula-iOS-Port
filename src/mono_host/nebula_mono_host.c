@@ -62,7 +62,7 @@ extern void mono_setmmapjit (int flag);
 #include <CoreFoundation/CoreFoundation.h>   // CFRunLoopRunInMode：boot 阻塞等待期泵浦主运行循环
 #include <sys/mman.h>              // mmap / MAP_JIT（JIT 冒烟测试）
 #include <mach/mach.h>              // vm_protect / mach_task_self（detour 翻页）
-#include <mach/vm_map.h>            // mach_vm_remap / VM_FLAGS_ANYWHERE（双映射别名）
+#include <mach/mach_vm.h>           // mach_vm_remap / VM_FLAGS_ANYWHERE（双映射别名）
 #include <libkern/OSCacheControl.h> // sys_icache_invalidate（指令缓存刷新）
 #include <errno.h>
 #include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
@@ -2309,18 +2309,31 @@ static void nebula_r60_quarantine_win_dobby(void) {
        翻成 RW 后该页 JIT 代码无法取指 -> SIGSEGV。
    APRR 只许 W^X（同 VA 不能同时可写+可执行），而页粒度又让"目标页"和"JIT helper 页"相撞。
    双映射绕开二者：
-     · 代码页(EXEC, detour 目标)：不翻原页(保持 RX，JIT helper 安全)，mach_vm_remap 出 RW
-       别名(同物理页)；托管 Write 走别名写跳转，原 RX VA 立即可见；执行仍从原 RX 取指。
+     · 代码页(detour 目标，mono JIT 页)：不翻原页(保持 RX，JIT helper 安全)，
+       mach_vm_remap 出 RW 别名(同物理页)；托管 Write 走别名写跳转，原 RX VA 立即可见；
+       执行仍从原 RX 取指。
      · trampoline：MemAlloc 改用 mmap 隔离页(RW)，写完后 make_executable 翻 RW->RX(W^X)，
        与 mono 自身 JIT 同款，且页隔离避免踩相邻堆。
-   .NET 侧通过 dllmap "nebula_jit" -> 主 dylib 解析（见 nebula_setup_native_dllmaps）。 */
+   判别：MemAlloc 的 mmap 页记入 g_nebula_tramp；make_writable 对其不动、对其余(代码页)建别名；
+   make_executable 对别名页只刷 icache、对 trampoline 翻 RW->RX。 */
 #define NEBULA_ALIAS_MAX 64
 static struct { uintptr_t orig; uintptr_t alias; } g_nebula_alias[NEBULA_ALIAS_MAX];
 static int g_nebula_alias_n = 0;
 
+/* MemAlloc 的 mmap 隔离页基址+大小，用于判别 trampoline（需翻 RX）vs 代码页（双映射） */
+#define NEBULA_TRAMP_MAX 64
+static struct { uintptr_t base; size_t size; } g_nebula_tramp[NEBULA_TRAMP_MAX];
+static int g_nebula_tramp_n = 0;
+
 static long nebula_ps(void) { long ps = sysconf(_SC_PAGESIZE); return ps > 0 ? ps : 16384; }
 
-/* 查/建 某代码页(EXEC) 的 RW 别名（与原页同物理）；无则回原基址 */
+static int nebula_is_tramp(uintptr_t base) {
+    for (int i = 0; i < g_nebula_tramp_n; i++)
+        if (g_nebula_tramp[i].base == base) return 1;
+    return 0;
+}
+
+/* 查/建 某代码页 的 RW 别名（与原页同物理）；无则回原基址 */
 static uintptr_t nebula_jit_alias_base(uintptr_t base) {
     long ps = nebula_ps();
     base &= ~((uintptr_t)ps - 1);
@@ -2358,27 +2371,18 @@ void *nebula_jit_alias(void *addr) {
     return addr;
 }
 
-static int nebula_jit_page_has_exec(uintptr_t base) {
-    vm_prot_t curp = 0, maxp = 0;
-    mach_vm_address_t ra = base;
-    mach_vm_size_t rsz = 0;
-    uint32_t depth = 0;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &ra, &rsz, &depth, &curp, &maxp);
-    if (kr != KERN_SUCCESS) return 0;
-    return (curp & VM_PROT_EXECUTE) ? 1 : 0;
-}
-
 __attribute__((visibility("default")))
 int nebula_jit_make_writable(void *addr, uint32_t size) {
     long ps = nebula_ps();
     uintptr_t ua = (uintptr_t)addr;
     uintptr_t base = ua & ~((uintptr_t)ps - 1);
-    if (nebula_jit_page_has_exec(base)) {
-        uintptr_t ali = nebula_jit_alias_base(base);
-        hlog("[host][r63] make_writable: 代码页 @%p 别名=%p", (void *)base, (void *)ali);
-    } else {
-        hlog("[host][r63] make_writable: 堆/数据页(已可写, 不动) @%p", (void *)base);
+    if (nebula_is_tramp(base)) {
+        hlog("[host][r63] make_writable: trampoline 页(已 RW, 不动) @%p", (void *)base);
+        return 0;
     }
+    /* 代码页：建 RW 别名，原页保持 RX（JIT helper 安全、APRR 合规） */
+    uintptr_t ali = nebula_jit_alias_base(base);
+    hlog("[host][r63] make_writable: 代码页 @%p 别名=%p", (void *)base, (void *)ali);
     return 0;
 }
 
@@ -2396,20 +2400,26 @@ int nebula_jit_make_executable(void *addr, uint32_t size) {
             return 0;
         }
     }
-    /* 堆页(trampoline)：W^X 翻 RW->RX，再刷 icache */
+    /* 其余(trampoline)：W^X 翻 RW->RX，再刷 icache */
     int r = vm_protect(mach_task_self(), base, (vm_size_t)ps, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     sys_icache_invalidate((void *)base, ps);
-    hlog("[host][r63] make_executable: 堆页 RW->RX @%p -> %d", (void *)base, r);
+    hlog("[host][r63] make_executable: 翻 RW->RX @%p -> %d", (void *)base, r);
     return r;
 }
 
-/* [R63] trampoline 用 mmap 隔离页(RW)，避免与相邻堆同页被翻 RX 踩踏 */
+/* [R63] trampoline 用 mmap 隔离页(RW)，避免与相邻堆同页被翻 RX 踩踏；并记录基址/大小用于判别 */
 __attribute__((visibility("default")))
 void *nebula_jit_mem_alloc(uint32_t size) {
     long ps = nebula_ps();
     size_t sz = (size_t)((size + (size_t)ps - 1) & ~((size_t)ps - 1));
     void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) { hlog("[host][r63] !! mem_alloc mmap 失败 errno=%d", errno); return NULL; }
+    uintptr_t base = (uintptr_t)p & ~((uintptr_t)ps - 1);
+    if (g_nebula_tramp_n < NEBULA_TRAMP_MAX) {
+        g_nebula_tramp[g_nebula_tramp_n].base = base;
+        g_nebula_tramp[g_nebula_tramp_n].size = sz;
+        g_nebula_tramp_n++;
+    }
     hlog("[host][r63] mem_alloc %u -> %p (mmap RW 隔离页)", size, p);
     return p;
 }
@@ -2417,17 +2427,18 @@ void *nebula_jit_mem_alloc(uint32_t size) {
 __attribute__((visibility("default")))
 int nebula_jit_mem_free(void *ptr) {
     if (!ptr) return 0;
-    mach_vm_address_t a = (mach_vm_address_t)ptr;
-    mach_vm_size_t sz = 0;
-    uint32_t depth = 0;
-    vm_prot_t c = 0, m = 0;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz, &depth, &c, &m);
-    if (kr == KERN_SUCCESS && sz > 0) {
-        munmap((void *)a, sz);
-        hlog("[host][r63] mem_free %p (munmap %llu)", ptr, (unsigned long long)sz);
-    } else {
-        hlog("[host][r63] mem_free %p 非 mmap 区域, 跳过", ptr);
+    uintptr_t base = (uintptr_t)ptr & ~((uintptr_t)nebula_ps() - 1);
+    for (int i = 0; i < g_nebula_tramp_n; i++) {
+        if (g_nebula_tramp[i].base == base) {
+            size_t freed = g_nebula_tramp[i].size;
+            munmap((void *)g_nebula_tramp[i].base, freed);
+            /* 从记录中摘除（用末项覆盖，保持顺序无关） */
+            g_nebula_tramp[i] = g_nebula_tramp[--g_nebula_tramp_n];
+            hlog("[host][r63] mem_free %p (munmap %zu)", ptr, freed);
+            return 0;
+        }
     }
+    hlog("[host][r63] mem_free %p 不在 mmap 记录, 跳过", ptr);
     return 0;
 }
 
