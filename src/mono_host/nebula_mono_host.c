@@ -62,6 +62,7 @@ extern void mono_setmmapjit (int flag);
 #include <CoreFoundation/CoreFoundation.h>   // CFRunLoopRunInMode：boot 阻塞等待期泵浦主运行循环
 #include <sys/mman.h>              // mmap / MAP_JIT（JIT 冒烟测试）
 #include <mach/mach.h>              // vm_protect / mach_task_self（detour 翻页）
+#include <mach/vm_map.h>            // mach_vm_remap / VM_FLAGS_ANYWHERE（双映射别名）
 #include <libkern/OSCacheControl.h> // sys_icache_invalidate（指令缓存刷新）
 #include <errno.h>
 #include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
@@ -2301,59 +2302,133 @@ static void nebula_r60_quarantine_win_dobby(void) {
         printf("[host][r60] 已挪走 Windows x64 PE 的 core/dobby.dll -> .win.bak（改用主 dylib 内 arm64 Dobby）\n");
 }
 
-/* [R62-4] iOS arm64 detour 内存翻转原生函数。
-   MonoMod 的 DetourNativeARMPlatform.MakeWritable/MakeExecutable 原版是空操作（假设桌面
-   ARM 的 JIT 内存本身 RWX）；但本设备：原函数 JIT 代码页是 RX，Apply 写不进 -> 崩。
-   本设备实测（冒烟 路线F/G）：plain mmap + mprotect 的 W^X / RWX 翻转畅通，mono 的 JIT
-   代码区也是 RWX 起步（路线G 复刻 mono_valloc 序列执行 OK），故翻页用 RWX 可行。
-
-   【R62-5 关键修正——页粒度碰撞】：mono 把托管 MakeWritable 自身 JIT 编译出的代码（如
-   0x103f24e4c）和被 detour 的目标方法（0x103f248e8）编译进了【同一页】。若把该页翻成
-   RW（不可执行），紧接着要执行的 JIT MakeWritable 代码在 RW 页上取指 -> SIGSEGV（R62-4
-   真机实锤：fault IP 0x103f24e4c 落在目标页内）。故必须翻成 RWX（可写且可执行）：让 JIT
-   代码保持可执行、detour 写入也能进行。Dobby 不踩此坑（它是 dylib 原生 C 代码，不在目标页）。
+/* [R63] iOS arm64 detour 内存翻转 —— 双映射(dual-map) + 隔离 trampoline。
+   根因（R62-4/5 两版真机都崩，本版解决）：
+     · RWX（R62-5）：iOS APRR/PPL 下 W+X 页不能取指 -> 执行 trampoline 即 SIGSEGV。
+     · 纯 RW（R62-4）：mono 把托管 MakeWritable 的 JIT 代码和 detour 目标编译进同一页，
+       翻成 RW 后该页 JIT 代码无法取指 -> SIGSEGV。
+   APRR 只许 W^X（同 VA 不能同时可写+可执行），而页粒度又让"目标页"和"JIT helper 页"相撞。
+   双映射绕开二者：
+     · 代码页(EXEC, detour 目标)：不翻原页(保持 RX，JIT helper 安全)，mach_vm_remap 出 RW
+       别名(同物理页)；托管 Write 走别名写跳转，原 RX VA 立即可见；执行仍从原 RX 取指。
+     · trampoline：MemAlloc 改用 mmap 隔离页(RW)，写完后 make_executable 翻 RW->RX(W^X)，
+       与 mono 自身 JIT 同款，且页隔离避免踩相邻堆。
    .NET 侧通过 dllmap "nebula_jit" -> 主 dylib 解析（见 nebula_setup_native_dllmaps）。 */
-static int nebula_jit_flip(void *addr, uint32_t size) {
-    if (!addr || size == 0) return 0;
-    long ps = sysconf(_SC_PAGESIZE);
-    if (ps <= 0) ps = 16384;
+#define NEBULA_ALIAS_MAX 64
+static struct { uintptr_t orig; uintptr_t alias; } g_nebula_alias[NEBULA_ALIAS_MAX];
+static int g_nebula_alias_n = 0;
+
+static long nebula_ps(void) { long ps = sysconf(_SC_PAGESIZE); return ps > 0 ? ps : 16384; }
+
+/* 查/建 某代码页(EXEC) 的 RW 别名（与原页同物理）；无则回原基址 */
+static uintptr_t nebula_jit_alias_base(uintptr_t base) {
+    long ps = nebula_ps();
+    base &= ~((uintptr_t)ps - 1);
+    for (int i = 0; i < g_nebula_alias_n; i++)
+        if (g_nebula_alias[i].orig == base) return g_nebula_alias[i].alias;
+    if (g_nebula_alias_n >= NEBULA_ALIAS_MAX) return base;
+    mach_vm_address_t ali = 0;
+    mach_vm_size_t sz = (mach_vm_size_t)ps;
+    vm_prot_t curp = 0, maxp = 0;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &ali, sz, 0,
+        VM_FLAGS_ANYWHERE, mach_task_self(), (mach_vm_address_t)base,
+        FALSE, &curp, &maxp, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) {
+        hlog("[host][r63] !! dual-map remap 失败 kr=%d @%p（回退原页，可能崩）", (int)kr, (void *)base);
+        return base;
+    }
+    /* 别名页强制 RW（remap 默认可能沿用源 RX），写跳转用 */
+    vm_protect(mach_task_self(), ali, sz, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    g_nebula_alias[g_nebula_alias_n].orig = base;
+    g_nebula_alias[g_nebula_alias_n].alias = (uintptr_t)ali;
+    g_nebula_alias_n++;
+    hlog("[host][r63] dual-map + @%p -> %p (RW 别名, 同物理页)", (void *)base, (void *)ali);
+    return (uintptr_t)ali;
+}
+
+/* 给定任意地址，返回应写入的 VA（代码页走 RW 别名，其余原样） */
+__attribute__((visibility("default")))
+void *nebula_jit_alias(void *addr) {
+    long ps = nebula_ps();
     uintptr_t ua = (uintptr_t)addr;
     uintptr_t base = ua & ~((uintptr_t)ps - 1);
-    size_t len = (size_t)(ua - base) + (size_t)size;
-    len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
-    // 翻成 RWX（可写且可执行）——R62-5 页碰撞修正，绝不能再翻成纯 RW
-    vm_prot_t prot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)base,
-                                  (vm_size_t)len, FALSE, prot);
-    if (kr == KERN_SUCCESS) return 0;
-    // 兜底：mprotect RWX（路线F/G 已证 plain mmap 的 RWX 可用）
-    int r = mprotect((void *)base, len, PROT_READ | PROT_WRITE | PROT_EXEC);
-    if (r != 0)
-        hlog("[host][r62] !! jit_flip(RWX) 双路均失败 kr=%d mprotect=%d errno=%d @%p",
-             (int)kr, r, errno, (void *)base);
-    return r;
+    for (int i = 0; i < g_nebula_alias_n; i++)
+        if (g_nebula_alias[i].orig == base)
+            return (void *)(g_nebula_alias[i].alias + (ua - base));
+    return addr;
+}
+
+static int nebula_jit_page_has_exec(uintptr_t base) {
+    vm_prot_t curp = 0, maxp = 0;
+    mach_vm_address_t ra = base;
+    mach_vm_size_t rsz = 0;
+    uint32_t depth = 0;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &ra, &rsz, &depth, &curp, &maxp);
+    if (kr != KERN_SUCCESS) return 0;
+    return (curp & VM_PROT_EXECUTE) ? 1 : 0;
 }
 
 __attribute__((visibility("default")))
 int nebula_jit_make_writable(void *addr, uint32_t size) {
-    int r = nebula_jit_flip(addr, size);
-    hlog("[host][r62] make_writable(RWX) %p/%u -> %d", addr, size, r);
-    return r;
+    long ps = nebula_ps();
+    uintptr_t ua = (uintptr_t)addr;
+    uintptr_t base = ua & ~((uintptr_t)ps - 1);
+    if (nebula_jit_page_has_exec(base)) {
+        uintptr_t ali = nebula_jit_alias_base(base);
+        hlog("[host][r63] make_writable: 代码页 @%p 别名=%p", (void *)base, (void *)ali);
+    } else {
+        hlog("[host][r63] make_writable: 堆/数据页(已可写, 不动) @%p", (void *)base);
+    }
+    return 0;
 }
 
 __attribute__((visibility("default")))
 int nebula_jit_make_executable(void *addr, uint32_t size) {
-    // 变可执行前先刷新 icache（此时页面仍 RWX，数据缓存需写回）
-    long ps = sysconf(_SC_PAGESIZE);
-    if (ps <= 0) ps = 16384;
+    long ps = nebula_ps();
     uintptr_t ua = (uintptr_t)addr;
     uintptr_t base = ua & ~((uintptr_t)ps - 1);
-    size_t len = (size_t)(ua - base) + (size_t)size;
-    len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
-    sys_icache_invalidate((void *)base, len);
-    int r = nebula_jit_flip(addr, size);
-    hlog("[host][r62] make_executable(RWX) %p/%u -> %d", addr, size, r);
+    /* 代码页(已双映射)：只刷 icache，绝不翻原页（保持 RX，JIT helper 安全） */
+    for (int i = 0; i < g_nebula_alias_n; i++) {
+        if (g_nebula_alias[i].orig == base) {
+            sys_icache_invalidate((void *)g_nebula_alias[i].alias, ps);
+            sys_icache_invalidate((void *)base, ps);
+            hlog("[host][r63] make_executable: 代码页 flush(不翻) @%p", (void *)base);
+            return 0;
+        }
+    }
+    /* 堆页(trampoline)：W^X 翻 RW->RX，再刷 icache */
+    int r = vm_protect(mach_task_self(), base, (vm_size_t)ps, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate((void *)base, ps);
+    hlog("[host][r63] make_executable: 堆页 RW->RX @%p -> %d", (void *)base, r);
     return r;
+}
+
+/* [R63] trampoline 用 mmap 隔离页(RW)，避免与相邻堆同页被翻 RX 踩踏 */
+__attribute__((visibility("default")))
+void *nebula_jit_mem_alloc(uint32_t size) {
+    long ps = nebula_ps();
+    size_t sz = (size_t)((size + (size_t)ps - 1) & ~((size_t)ps - 1));
+    void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) { hlog("[host][r63] !! mem_alloc mmap 失败 errno=%d", errno); return NULL; }
+    hlog("[host][r63] mem_alloc %u -> %p (mmap RW 隔离页)", size, p);
+    return p;
+}
+
+__attribute__((visibility("default")))
+int nebula_jit_mem_free(void *ptr) {
+    if (!ptr) return 0;
+    mach_vm_address_t a = (mach_vm_address_t)ptr;
+    mach_vm_size_t sz = 0;
+    uint32_t depth = 0;
+    vm_prot_t c = 0, m = 0;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz, &depth, &c, &m);
+    if (kr == KERN_SUCCESS && sz > 0) {
+        munmap((void *)a, sz);
+        hlog("[host][r63] mem_free %p (munmap %llu)", ptr, (unsigned long long)sz);
+    } else {
+        hlog("[host][r63] mem_free %p 非 mmap 区域, 跳过", ptr);
+    }
+    return 0;
 }
 
 /* [Nebula iOS 第二十轮] 用 mono_dllmap_insert 把 .NET 8 CoreLib 的 P/Invoke
