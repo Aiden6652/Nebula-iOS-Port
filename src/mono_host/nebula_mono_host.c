@@ -61,6 +61,7 @@ extern void mono_setmmapjit (int flag);
 #include <dispatch/dispatch.h>     // 启动占位文本的延时/主线程销毁
 #include <CoreFoundation/CoreFoundation.h>   // CFRunLoopRunInMode：boot 阻塞等待期泵浦主运行循环
 #include <sys/mman.h>              // mmap / MAP_JIT（JIT 冒烟测试）
+#include <mach/mach.h>              // vm_protect / mach_task_self（detour 翻页）
 #include <libkern/OSCacheControl.h> // sys_icache_invalidate（指令缓存刷新）
 #include <errno.h>
 #include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
@@ -2300,6 +2301,58 @@ static void nebula_r60_quarantine_win_dobby(void) {
         printf("[host][r60] 已挪走 Windows x64 PE 的 core/dobby.dll -> .win.bak（改用主 dylib 内 arm64 Dobby）\n");
 }
 
+/* [R62-4] iOS arm64 detour 内存翻转原生函数。
+   MonoMod 的 DetourNativeARMPlatform.MakeWritable/MakeExecutable 原版是空操作（假设桌面
+   ARM 的 JIT 内存本身 RWX）；但本设备：① 原函数 JIT 代码页是 RX，Apply 写不进 ->
+   SIGSEGV；② trampoline 由 AllocHGlobal 返回 RW 内存且从未变可执行，执行必崩。
+   这两个函数用 vm_protect（Dobby 同款，能翻 APRR/APRR-JIT 页）为主、mprotect 兜底，
+   把页面在 RW<->RX 间翻转，并在变可执行前刷新 icache。
+   .NET 侧通过 dllmap "nebula_jit" -> 主 dylib 解析（见 nebula_setup_native_dllmaps）。 */
+static int nebula_jit_flip(void *addr, uint32_t size, int executable) {
+    if (!addr || size == 0) return 0;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 16384;
+    uintptr_t ua = (uintptr_t)addr;
+    uintptr_t base = ua & ~((uintptr_t)ps - 1);
+    size_t len = (size_t)(ua - base) + (size_t)size;
+    len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
+    vm_prot_t prot = executable ? (VM_PROT_READ | VM_PROT_EXECUTE)
+                                : (VM_PROT_READ | VM_PROT_WRITE);
+    // 主：vm_protect（Dobby 同款，可翻 APRR/APRR-JIT 锁定的 JIT 页）
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)base,
+                                  (vm_size_t)len, FALSE, prot);
+    if (kr == KERN_SUCCESS) return 0;
+    // 兜底：mprotect（路线F 已证 plain mmap 的 W^X 翻转可用）
+    int mp = executable ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_WRITE);
+    int r = mprotect((void *)base, len, mp);
+    if (r != 0)
+        hlog("[host][r62] !! jit_flip(%s) 双路均失败 kr=%d mprotect=%d errno=%d @%p",
+             executable ? "RX" : "RW", (int)kr, r, errno, (void *)base);
+    return r;
+}
+
+__attribute__((visibility("default")))
+int nebula_jit_make_writable(void *addr, uint32_t size) {
+    int r = nebula_jit_flip(addr, size, 0);
+    hlog("[host][r62] make_writable %p/%u -> %d", addr, size, r);
+    return r;
+}
+
+__attribute__((visibility("default")))
+int nebula_jit_make_executable(void *addr, uint32_t size) {
+    // 变可执行前先刷新 icache（此时页面仍 RW，数据缓存需写回）
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 16384;
+    uintptr_t ua = (uintptr_t)addr;
+    uintptr_t base = ua & ~((uintptr_t)ps - 1);
+    size_t len = (size_t)(ua - base) + (size_t)size;
+    len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
+    sys_icache_invalidate((void *)base, len);
+    int r = nebula_jit_flip(addr, size, 1);
+    hlog("[host][r62] make_executable %p/%u -> %d", addr, size, r);
+    return r;
+}
+
 /* [Nebula iOS 第二十轮] 用 mono_dllmap_insert 把 .NET 8 CoreLib 的 P/Invoke
    原生库名（libSystem.Native 等）重映射到 iOS 版 shim。
    [R60] 改造：dobby + 5 个 libSystem.* 全部【静态链进主 dylib】，dllmap 一律
@@ -2328,6 +2381,12 @@ static void nebula_setup_native_dllmaps(const char *appdir)
         hlog("[host][r60] dllmap: dobby -> %s（iOS arm64 Dobby 已静态并入主 dylib，chainloader 不再 DllNotFound）", self);
     } else {
         hlog("[host][r60] !! 主 dylib 未导出 DobbyHook —— BepInEx 仍会 DllNotFoundException: dobby");
+    }
+
+    /* ---- 1.5) nebula_jit：R62 detour 内存翻转原生函数（vm_protect/mprotect + icache）---- */
+    if (self) {
+        mono_dllmap_insert(NULL, "nebula_jit", NULL, self, NULL);
+        hlog("[host][r62] dllmap: nebula_jit -> %s（detour 内存翻转原生函数）", self);
     }
 
     /* ---- 2) CoreLib 的 5 个 P/Invoke shim ---- */
