@@ -2680,6 +2680,12 @@ static void *boot_thread_impl(void *arg) {
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
     g_mono_ready = 1;   // 看门狗自此起可安全 GC
+    // [R63] boot 线程是 mono 主线程，但 coop 挂起要求线程显式 mono_thread_attach 登记
+    // safepoint 状态；否则本线程上隐式 GC（JIT 编译期 mono_ldstr 等分配触发）sgen 分配器
+    // 状态不一致 -> sgen_try_alloc_obj_nolock 里 str x19,[x21,#0x40] 段错误。
+    // 看门狗线程已在 watchdog 内 attach；这里补 boot 线程自身（幂等，mono_jit_init 后调用）。
+    extern void mono_thread_attach(MonoDomain *d);
+    mono_thread_attach(domain);
     hlog("[host] step: mono_jit_init OK, RSS=%ldMB", rss_mb());
 
     hlog("[host] step: Mono 就绪, RSS=%ldMB", rss_mb());
