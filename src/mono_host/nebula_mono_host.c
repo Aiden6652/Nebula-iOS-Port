@@ -26,7 +26,6 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>    // mkdir（BepInEx 可写根目录）
-#include <sys/mman.h>    // mprotect（R62 detour 内存翻转）
 #include <strings.h>    // strcasecmp
 #include <errno.h>      // EEXIST（R47 配置目录幂等创建）
 
@@ -792,32 +791,6 @@ static void nebula_r60_extract_bundle(const char *root) {
         int n = nebula_blob_extract_dir("native/", dest);
         printf("[host][r60] native shim fallback -> %s（本次新写 %d）\n", dest, n);
     }
-}
-
-/* [R62] 把 blob 内嵌的【已 IL 修补】MonoMod.RuntimeDetour.dll 强制覆盖写回
-   <root>/BepInEx/core/MonoMod.RuntimeDetour.dll。
-
-   原因：BepInEx 预加载器用 Assembly.LoadFrom 从磁盘 core 目录加载程序集，而该目录里
-   可能残留旧的未修补 DLL（112640 字节，get_Native 仍走 Libc mprotect 的 calli 托管包装，
-   在嵌入式 Mono 上 JIT 编译即崩 InvalidProgramException）。blob 里这份是 IL 修补过的
-   （111616 字节：get_Native 强制 DetourNativeARMPlatform + MakeWritable/MakeExecutable
-   改走 nebula_jit 原生 mprotect）。这里强制覆盖，保证"磁盘加载"也拿到修补版——无论
-   BepInEx 是从 blob 内存加载还是从磁盘 LoadFrom，最终执行的都是同一份修补 DLL。
-
-   必须【无条件覆盖】（不像 nebula_blob_extract_dir 那样"大小一致就跳过"），因为磁盘那份
-   可能恰好大小不同或已存在但旧，必须保证被替换。 */
-static void nebula_r62_patch_core_dll(const char *root) {
-    if (!g_n || !root || !root[0]) return;
-    const blob_entry *e = blob_find("MonoMod.RuntimeDetour");
-    if (!e) { fprintf(stderr, "[host][r62] 找不到 MonoMod.RuntimeDetour blob，无法覆盖写磁盘 core\n"); return; }
-    char p[PATH_MAX];
-    snprintf(p, sizeof(p), "%s/BepInEx/core/MonoMod.RuntimeDetour.dll", root);
-    FILE *f = fopen(p, "wb");
-    if (!f) { fprintf(stderr, "[host][r62] 无法打开 %s 写（权限？）\n", p); return; }
-    size_t w = fwrite(e->data, 1, e->size, f);
-    fclose(f);
-    if (w != e->size) { remove(p); fprintf(stderr, "[host][r62] 写 %s 不完整(%zu/%u)\n", p, w, e->size); return; }
-    printf("[host][r62] 已用 blob 内已修补 MonoMod.RuntimeDetour.dll 覆盖写 %s (%u bytes)\n", p, e->size);
 }
 
 // 探 IL2CPP 二进制 + global-metadata.dat，并落地纠偏
@@ -2333,40 +2306,6 @@ static void nebula_r60_quarantine_win_dobby(void) {
    指向主 dylib 自身路径 → dlopen(自身) + dlsym 命中导出符号 → 成品只有一个 dylib。
    若 CI 没带 libSystem.*.a（静态链失败），则回退到文件：app bundle 里现成的
    shim，或启动时从 blob 释放到 Documents/nebula_native/ 的那份。 */
-// [R62] iOS arm64 detour 内存翻转：MonoMod 的 DetourNativeLibcPlatform 走 mprotect 托管包装，
-// 在嵌入式 Mono 上 JIT 编译即崩（Invalid IL code）；DetourNativeARMPlatform 的 MakeWritable/
-// MakeExecutable 又是空操作（假设运行时自管可写性）。这里给 ARM 平台补上真正的内存翻转：
-// 写前 RW、写后 RX + icache 刷新，全部走 libc mprotect（冒烟 路线F 已证 RX 可行）。
-// 这两个符号由 .NET 侧通过 dllmap "nebula_jit" -> 主 dylib 解析（见 nebula_setup_native_dllmaps）。
-__attribute__((visibility("default")))
-int nebula_jit_make_writable(void *addr, uint32_t size) {
-    if (!addr || size == 0) return 0;
-    long ps = sysconf(_SC_PAGESIZE);
-    if (ps <= 0) ps = 16384;
-    uintptr_t a = (uintptr_t)addr;
-    uintptr_t base = a & ~((uintptr_t)ps - 1);
-    size_t len = (size_t)(a - base) + (size_t)size;
-    len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
-    return (int)mprotect((void *)base, len, PROT_READ | PROT_WRITE);
-}
-
-__attribute__((visibility("default")))
-int nebula_jit_make_executable(void *addr, uint32_t size) {
-    if (!addr || size == 0) return 0;
-    long ps = sysconf(_SC_PAGESIZE);
-    if (ps <= 0) ps = 16384;
-    uintptr_t a = (uintptr_t)addr;
-    uintptr_t base = a & ~((uintptr_t)ps - 1);
-    size_t len = (size_t)(a - base) + (size_t)size;
-    len = (len + (size_t)ps - 1) & ~((size_t)ps - 1);
-    // 写完后刷新指令缓存（arm64 必须），再翻回 RX 才能执行。
-    // 用 Apple 原生 sys_icache_invalidate（<libkern/OSCacheControl.h>），
-    // 勿用 __builtin___clear_cache——它在 iOS clang/arm64 会引用外部符号
-    // ___clear_cache，Apple 平台不提供，链接报 undefined symbol。
-    sys_icache_invalidate((void *)base, len);
-    return (int)mprotect((void *)base, len, PROT_READ | PROT_EXEC);
-}
-
 static void nebula_setup_native_dllmaps(const char *appdir)
 {
     static const char *shims[] = {
@@ -2389,12 +2328,6 @@ static void nebula_setup_native_dllmaps(const char *appdir)
         hlog("[host][r60] dllmap: dobby -> %s（iOS arm64 Dobby 已静态并入主 dylib，chainloader 不再 DllNotFound）", self);
     } else {
         hlog("[host][r60] !! 主 dylib 未导出 DobbyHook —— BepInEx 仍会 DllNotFoundException: dobby");
-    }
-
-    /* ---- 1.5) nebula_jit：R62 detour 内存翻转原生函数（mprotect RW/RX + icache 刷新） ---- */
-    if (self) {
-        mono_dllmap_insert(NULL, "nebula_jit", NULL, self, NULL);
-        hlog("[host][r62] dllmap: nebula_jit -> %s（detour 内存翻转原生函数）", self);
     }
 
     /* ---- 2) CoreLib 的 5 个 P/Invoke shim ---- */
@@ -2526,11 +2459,6 @@ static void *boot_thread_impl(void *arg) {
     //   （R58 真机整夜卡死）。释放后目录恒有 131 个 dll → 设备端永不生成，
     //   用户也不必再手动放 zip。
     nebula_r60_extract_bundle(root);
-
-    // [R62] 把已 IL 修补的 MonoMod.RuntimeDetour.dll 强制覆盖写回磁盘 core 目录，
-    // 保证 BepInEx 预加载器从磁盘 LoadFrom 时也拿到修补版（否则残留旧 DLL 仍走
-    // Libc mprotect calli 崩）。必须在 Doorstop.Entrypoint.Start() 之前完成。
-    nebula_r62_patch_core_dll(root);
 
     // [第十三轮关键修复] 预加载钩子必须在 mono_jit_init【之前】装好！
     // mono 在 mono_init 阶段就要通过预加载钩子加载 corlib（System.Private.CoreLib），
