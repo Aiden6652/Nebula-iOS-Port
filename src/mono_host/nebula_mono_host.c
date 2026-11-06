@@ -406,9 +406,10 @@ static void *watchdog_thread(void *arg) {
     // 变成"看门狗参与 GC 导致主线程分配崩"）。
     //
     // 实测崩时 RSS≈145MB，远低于软/硬顶(1100/1500MB)，看门狗从未真正触发过回收——
-    // 它的 mono_thread_attach 纯属副作用。删掉 attach/collect 后：boot 线程自身的
-    // phase1/phase2 mono_gc_collect 仍保留（此时扫描面只剩 boot 主线程自己，安全），
-    // 托管代码运行期 mono 自带的代际 GC 也照常工作，jetsam 防护不缺失。
+    // 它的 mono_thread_attach 纯属副作用。删掉 attach/collect 后：boot 线程自身也
+    // 不再调任何 mono_gc_collect（[R67] phase1 那次裸 C 线程上的 coop stop-the-world
+    // 才是损坏 sgen 线程信息的元凶），托管代码运行期 mono 自带的代际 GC 在 Unity
+    // 主线程(R56 实证安全)自然发生，jetsam 防护不缺失。
     clock_gettime(CLOCK_MONOTONIC, &g_wd_t0);
     while (watchdog_run) {
         long mb = rss_mb();
@@ -2714,11 +2715,16 @@ static void *boot_thread_impl(void *arg) {
     hlog("[host] step: Mono 就绪, RSS=%ldMB", rss_mb());
     start_watchdog();
 
-    // 分阶段：先把虚拟机本身跑稳并回收一次，再进入模组加载，
-    // 不让 VM 初始化和全部模组/资源在同一时刻一起压进来。
-    hlog("[host] phase1: VM 就绪，先 GC 回收一次, RSS=%ldMB", rss_mb());
-    mono_gc_collect(mono_gc_max_generation());
-    hlog("[host] phase1: GC 完成, RSS=%ldMB", rss_mb());
+    // 分阶段：先把虚拟机本身跑稳，再进入模组加载。
+    // [R67 关键] 绝不在 boot 线程(裸 pthread)上调 mono_gc_collect：coop GC 模式下本线程
+    // 还停在纯 C 代码里、未通过 MONO_PREPARE_GC 进入 coop 安全区，此时 stop-the-world
+    // 无法让其到达 safe point -> 强制 suspend 损坏本线程的 sgen 线程信息与 TLAB ->
+    // 后续 boot_bepinex 密集 JIT(ldstr 分配) 在 sgen_try_alloc_obj_nolock 的
+    // str x19,[x21,#0x40] 崩（R64e 起实锤崩点）。R56 主线程实证：mono_thread_attach
+    // + mono_runtime_invoke 组合安全，唯独多出来的 mono_gc_collect 是元凶。
+    // boot 期 RSS 峰值 ~160MB << 512MB nursery，零 GC 窗口安全，回收交给后续
+    // Unity 主线程(R56 实证)自然发生。
+    hlog("[host] phase1: VM 就绪（boot 线程不 GC，避开 coop stop-the-world 损坏）");
 
     // NEBULA_BOOT: bepinex | mods | engine | auto（默认）
     // auto 的顺序：BepInEx → Mods 目录 → Engine POC
