@@ -9,7 +9,7 @@
  * 根本没有 DobbyPrepare / DobbyCommit 这两个符号。于是 IL2CPPChainloader.Initialize
  * 在 DobbyDetour.PrepareImpl() 里 P/Invoke "DobbyPrepare" 时抛：
  *     System.EntryPointNotFoundException: DobbyPrepare
- * BepInEx 随即整个退出，游戏直接进原版、NOS 不加载（真机 preloader.log / nebula_host.log 实锤）。
+ * BepInEx 随即整个退出，游戏直接进原版、NOS 不加载（真机 preloader.log / nebula_host.txt 实锤）。
  *
  * 宿主之前只探测 DobbyHook 是否存在就判定 dobby「已就绪」并跳过 R56 兜底，结果官方 detour
  * 路径在 DobbyPrepare 这步崩。这里用 DobbyHook 包出 DobbyPrepare / DobbyCommit，让官方

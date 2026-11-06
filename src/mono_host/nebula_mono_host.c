@@ -406,7 +406,7 @@ static void *watchdog_thread(void *arg) {
             long el = (now.tv_sec - g_wd_t0.tv_sec) * 1000 + (now.tv_nsec - g_wd_t0.tv_nsec) / 1000000;
             // mono 未就绪前只记录 RSS（GC 尚未初始化，不能调 mono_gc_collect，否则崩）；
             // 就绪后依软/硬顶强制 GC，防 jetsam 杀。内存日志一律写文件（fflush）——
-            // 旧版写 stderr 不进 nebula_host.log，导致 OOM 时彻底失明。
+            // 旧版写 stderr 不进 nebula_host.txt，导致 OOM 时彻底失明。
             if (g_mono_ready && CFG.gc_hard_limit_mb > 0 && mb > CFG.gc_hard_limit_mb) {
                 fprintf(g_logfp, "[host][mem][t+%ldms] !! RSS %ldMB 超过硬顶 %dMB，激进全量 GC！\n", el, mb, CFG.gc_hard_limit_mb);
                 fflush(g_logfp);
@@ -1596,7 +1596,7 @@ static void neb_crash(int sig)
  *   2) 旧 neb_crash 在 mono_jit_init【之后】才装，jit_init 内部崩溃时
  *      根本没有处理器，且无 PC/LR 现场信息。
  * 对策：
- *   A. stderr/stdout 重定向进管道，专职线程逐行回写 nebula_host.log（fflush），
+ *   A. stderr/stdout 重定向进管道，专职线程逐行回写 nebula_host.txt（fflush），
  *      mono 的遗言（断言消息）第一次可见；
  *   B. SA_SIGINFO 崩溃处理器（在 mono_jit_init 之前安装）：打出 信号号/si_addr/
  *      PC/LR/SP + dladdr 符号化；PC 无模块归属即 JIT 生成代码，直接实锤
@@ -1867,7 +1867,7 @@ static int nebula_wait_for_jit(void) {
 // —— JIT 冒烟测试（仅 iOS）：mono_jit_init 之前多路线真实预演
 //   「分配 → 写入 ret → sys_icache_invalidate → 执行」 ——
 // 内核对非法 JIT 操作的惩罚是 SIGKILL（CODESIGNING / Invalid Page），不可捕获、
-// 往往不生成 .ips（2026-10-25 真机实测多轮）。只能靠 nebula_host.log 定位死因。
+// 往往不生成 .ips（2026-10-25 真机实测多轮）。只能靠 nebula_host.txt 定位死因。
 // 写入的是 arm64 ret（0xD65F03C0）：跳入后立即返回，不会落到页内零字节。
 //
 // 2026-10-25 定案背景（Apple 官方文档 + 社区实测交叉证实）：
@@ -2571,10 +2571,10 @@ static void *boot_thread_impl(void *arg) {
     {   // 尽早开日志（早到能覆盖后面每一步），并依次试多个可写位置
         char p[PATH_MAX];
         const char *home = getenv("HOME");
-        if (home) { snprintf(p, sizeof(p), "%s/Documents/nebula_host.log", home); log_try(p); }
+        if (home) { snprintf(p, sizeof(p), "%s/Documents/nebula_host.txt", home); log_try(p); }
         const char *gd = getenv("NEBULA_GAME_DIR");
-        if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.log", gd);             log_try(p); }
-        log_try("/var/mobile/nebula_host.log");
+        if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.txt", gd);             log_try(p); }
+        log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
     }
 
@@ -2594,8 +2594,8 @@ static void *boot_thread_impl(void *arg) {
 
     if (!g_logfp) {   // 前面候选都没成功，再试游戏根目录 / dylib 同目录
         char p[PATH_MAX];
-        snprintf(p, sizeof(p), "%s/nebula_host.log", root); log_try(p);
-        snprintf(p, sizeof(p), "%s/nebula_host.log", dir);  log_try(p);
+        snprintf(p, sizeof(p), "%s/nebula_host.txt", root); log_try(p);
+        snprintf(p, sizeof(p), "%s/nebula_host.txt", dir);  log_try(p);
     }
     if (!g_logfp) hlog("[host] !! 日志无法创建：所有候选路径都不可写");
 

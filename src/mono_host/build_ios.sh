@@ -252,7 +252,7 @@ echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 #   ① libdobby.a —— BepInEx 的 [DllImport("dobby")] 原本在设备上命中
 #      core/dobby.dll（Windows x64 PE, 153088B），iOS arm64 dlopen 不了 →
 #      DllNotFoundException: dobby → IL2CPPChainloader.Initialize 中断 →
-#      宿主 R56 兜底强扫 plugins 时 SIGSEGV（真机 preloader.log / nebula_host.log 实锤）。
+#      宿主 R56 兜底强扫 plugins 时 SIGSEGV（真机 preloader.log / nebula_host.txt 实锤）。
 #      这里把 iOS arm64 版 Dobby 静态链进来，宿主把 "dobby" dllmap 到主 dylib
 #      自身路径，dlopen 自身 + dlsym("DobbyHook") 即可命中，彻底修掉崩溃根因。
 #   ② libSystem.*.a —— CoreLib 的 P/Invoke shim，同样静态链进主 dylib，实现单文件。
@@ -307,7 +307,8 @@ do_link() {
     -framework Security \
     -framework UIKit \
     -lobjc -lc++ -lpthread -lz -lm \
-    -Wl,-U,_pthread_jit_write_protect_np
+    -Wl,-U,_pthread_jit_write_protect_np \
+    -Wl,-exported_symbol,_SystemNative_IsATty
 }
 
 R60_SHIM_MODE="static"
@@ -370,6 +371,15 @@ if [ "$R60_SHIM_MODE" = "static" ]; then
 else
   echo "    - CoreLib shim 走 blob 释放 fallback（宿主 dllmap 到 Documents/nebula_native）"
 fi
+
+# [R64c] IsATty 强制导出校验：静态链时 libSystem.Native.a 里的 IsATty 可能是隐藏可见性
+# 的强符号，会盖掉宿主的 weak stub 且不导出 -> 设备端 CoreLib P/Invoke 报
+# EntryPointNotFoundException。上面 -Wl,-exported_symbol 强制导出；这里校验它确实进了
+# 导出表，没进就直接 fail（绝不发一个会崩的版本）。
+case "$SYMS" in
+  *_SystemNative_IsATty*) echo "    ✓ SystemNative_IsATty（强制导出，CoreLib IsATty P/Invoke 可命中）" ;;
+  *) echo "    ✗ SystemNative_IsATty 未导出！设备端 IsATty P/Invoke 将 EntryPointNotFound" >&2; exit 1 ;;
+esac
 
 echo "--- [R60] 单一文件校验：产物目录里只应有 1 个 .dylib ---"
 find "$OUT" -name '*.dylib' -print | sed 's|^|    |'
