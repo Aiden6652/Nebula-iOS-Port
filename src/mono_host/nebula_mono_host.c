@@ -2456,6 +2456,19 @@ int nebula_jit_mem_free(void *ptr) {
     return 0;
 }
 
+/* [R64c] CoreLib P/Invoke shim 补全：主 dylib 静态链入的 System.Native 缺
+   SystemNative_IsATty 符号；libSystem.Native 被 dllmap 到主 dylib 自身后，
+   Console.IsOutputRedirected -> Interop.Sys.IsATty 解析失败抛
+   EntryPointNotFoundException（BepInEx 初始化期 DetourRuntimeILPlatform..ctor
+   即触发），并污染 MonoMod detour runtime 初始化态。此处导出同名 stub 供
+   mono 解析命中。iOS 无交互式终端，stdout/stderr 已重定向到日志文件，返回 0
+   （非 tty）使 Console 走重定向路径正常输出，不再抛异常。 */
+__attribute__((visibility("default")))
+int SystemNative_IsATty(int fd) {
+    (void)fd;
+    return 0;   /* 非 tty：Console 认为输出已重定向，写文件/空设备不崩 */
+}
+
 /* [Nebula iOS 第二十轮] 用 mono_dllmap_insert 把 .NET 8 CoreLib 的 P/Invoke
    原生库名（libSystem.Native 等）重映射到 iOS 版 shim。
    [R60] 改造：dobby + 5 个 libSystem.* 全部【静态链进主 dylib】，dllmap 一律
