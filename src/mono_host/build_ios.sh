@@ -27,6 +27,14 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 echo "已清空并重建产物目录: $OUT"
 
+# [R64d] 导出清单：ld64 一旦看到 -exported_symbol(s_list) 就切换成"仅导出清单内符号"模式，
+# 会把默认导出的 mono_* 等全砍掉（R64d 首版踩过：mono_jit_init 全部缺失）。所以这里用
+# 通配 '*' 保留默认全导出，再单独追加 _SystemNative_IsATty 强制导出（该符号在静态链入的
+# libSystem.Native.a 里是隐藏可见性强符号，默认不导出，导致设备端 IsATty P/Invoke 报
+# EntryPointNotFoundException）。
+printf '*\n_SystemNative_IsATty\n' > "$OUT/export_list.txt"
+echo "    导出清单: $OUT/export_list.txt (* + _SystemNative_IsATty)"
+
 # 定位 Mono 头文件目录（找到 .../include/mono，再往上取 include）
 MONO_INC_DIR="$(find "$MONO_PREFIX" -type d -name mono -path "*include*" 2>/dev/null | head -1 || true)"
 if [ -z "$MONO_INC_DIR" ]; then
@@ -308,7 +316,7 @@ do_link() {
     -framework UIKit \
     -lobjc -lc++ -lpthread -lz -lm \
     -Wl,-U,_pthread_jit_write_protect_np \
-    -Wl,-exported_symbol,_SystemNative_IsATty
+    -Wl,-exported_symbols_list,"$OUT/export_list.txt"
 }
 
 R60_SHIM_MODE="static"
