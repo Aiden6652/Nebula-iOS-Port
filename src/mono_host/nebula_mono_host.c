@@ -2963,6 +2963,24 @@ static void boot(void) {
         }
         pthread_join(t, NULL);
         hlog("[host] boot 阻塞结束，放行 Unity 继续加载（游戏与 NOS 一同加载）");
+
+        /* [R68] 主线程登记到 mono 域：dobby detour 钩住的 il2cpp_runtime_invoke 由 Unity
+           主线程首次调用（didFinishLaunching → UniversalDeepLink → UnitySendMessage →
+           il2cpp_runtime_invoke），其托管钩子(BepInEx)必须在【已 attach 的 mono 线程】上跑，
+           否则托管堆/GC 线程表损坏 → 级联原生堆损坏 → UnitySendMessage 内 operator delete
+           拿到坏指针 SIGBUS（R67 实锤崩点）。本 on_load 构造器本身运行在 Unity 主线程，故此处
+           attach 的正是主线程，且早于 Unity 启动、时机正确。
+           对照：R56 手动执行路径(2874 行)同样先 mono_thread_attach 主线程，能跑到 Innersloth，
+           实证安全——主线程跑原生/CFRunLoop 时处于 coop 空闲安全点，coop stop-the-world 可正常
+           挂起（此前崩的是卡 usleep 的看门狗，非此类线程）。 */
+        if (g_r56_domain) {
+            extern void mono_thread_attach(MonoDomain *d);
+            mono_thread_attach(g_r56_domain);
+            hlog("[host][r68] 主线程已 mono_thread_attach（dobby 首调 il2cpp 前登记，规避托管堆/GC 损坏）");
+        } else {
+            hlog("[host][r68] 主线程 attach 跳过：g_r56_domain 为空（无 BepInEx，无 detour）");
+        }
+
         /* [R56] 派发点必须在 pthread_join 之后：此时 boot_thread 已结束、domain/image
            已登记，且 boot() 即将返回放行 Unity。从这一刻起算延迟，block 由主线程
            runloop 在 Unity 初始化完成后执行，天然对齐官方 detour「Unity 起来后触发」
