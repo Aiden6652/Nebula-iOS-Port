@@ -2730,8 +2730,20 @@ static void *boot_thread_impl(void *arg) {
         mono_gc_collect(mono_gc_max_generation());
         hlog("[host] phase2: 进入模组加载(BepInEx/星云), RSS=%ldMB", rss_mb());
         hlog("[host] step: boot_bepinex enter");
-        ok = boot_bepinex(domain, root);
-        hlog("[host] step: boot_bepinex -> %d", ok);
+        // [R66] boot 线程是裸 pthread（mono 主线程），其栈边界对 sgen 的 stop-the-world
+        // 栈扫描不可靠：boot_bepinex 期间密集 JIT 编译某方法(ldstr)触发 sgen minor GC，
+        // GC 扫描本线程栈越界 -> 踩坏 sgen 分配器状态 -> 后续分配 SIGSEGV。
+        // 这里在 boot_bepinex 全程关闭 GC，让 JIT 编译/分配在无 GC 干扰下跑完，
+        // boot 结束再开 GC 并强制回收一次。boot 期 RSS 峰值 ~200MB 远低于 jetsam，安全。
+        {
+            extern void mono_gc_disable(void);
+            extern void mono_gc_enable(void);
+            mono_gc_disable();
+            ok = boot_bepinex(domain, root);
+            mono_gc_enable();
+            mono_gc_collect(mono_gc_max_generation());
+        }
+        hlog("[host] step: boot_bepinex -> %d (GC 已恢复)", ok);
     }
     if (!ok && (auto_mode || !strcmp(bm, "mods"))) {
         hlog("[host] step: boot_mods_dir enter");
@@ -2919,7 +2931,18 @@ static void boot(void) {
     int block = !(blk && strcmp(blk, "0") == 0);
 
     pthread_t t;
-    if (pthread_create(&t, NULL, boot_thread, NULL) != 0) return;
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        // [R66] 裸 pthread 默认栈仅 ~512KB，mono JIT 递归编译（mono_method_to_ir 等）
+        // 极易栈溢出 / 踩坏 GC 栈扫描边界。放大到 8MB（标准主线程量级）规避。
+        if (pthread_attr_setstacksize(&attr, 8 * 1024 * 1024) == 0) {
+            if (pthread_create(&t, &attr, boot_thread, NULL) != 0) { pthread_attr_destroy(&attr); return; }
+        } else {
+            if (pthread_create(&t, NULL, boot_thread, NULL) != 0) return;
+        }
+        pthread_attr_destroy(&attr);
+    }
 
     if (block) {
         // 关键：绝不能用 pthread_join 纯死等 —— 主线程一卡死，主队列上的占位文字
