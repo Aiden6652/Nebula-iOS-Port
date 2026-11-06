@@ -345,25 +345,23 @@ static void apply_gc_env(void) {
     setenv("MONO_GC_PARAMS", buf, 1);
     printf("[host] MONO_GC_PARAMS=%s\n", buf);
     // 单一编译器（JIT）版：不再有解释器分支，统一走 JIT（见下方 mono_setmmapjit）。
-    // [R64] GC 线程挂起模式（按平台分流）：
-    //  · iOS：默认 preempt（标准嵌入模式），对"手动 pthread + JIT + 隐式 GC"最稳。
-    //    coop 在手动线程上做 JIT 编译+隐式 GC 会触发 sgen 分配器状态错乱
-    //    (sgen_try_alloc_obj_nolock: str x19,[x21,#0x40] SIGSEGV) —— 真机实证崩。
-    //  · macOS：保留 coop（桌面 verify 在 coop 下通过；macOS 无 iOS 侧载/ptrace 约束）。
-    //  coop 本为绕 StikDebug 的 ptrace 信号抢占而设；现 iOS 侧载方案
-    //  (SideStore/LiveContainer+本地 Anisette) 已无 StikDebug，且上方 major=marksweep
-    //  串行 GC 已关掉并发标记 RO 页 SIGSEGV 写屏障，故 iOS 改回 preempt 无信号冲突。
-    //  保留 env 开关 NEBULA_SUSPEND，可免重编在 coop/preempt 间强制切换定位。
-#if TARGET_OS_IPHONE
-    const char *susp_dflt = "preempt";
-#else
+    // [R64b] GC 线程挂起模式（本机构建仅支持 coop）：
+    //  本内嵌 mono 构建只编译了 coop 挂起后端：preempt(抢占) 后端缺失，
+    //  mono_threads_suspend_policy_init 会 g_error -> abort，直接死在 mono_jit_init
+    //  最早期（真机实证：native 栈 mono_threads_suspend_policy_init -> abort）。
+    //  故 iOS/macOS 默认一律 coop。coop 当初仅为绕 StikDebug 的 ptrace 信号抢占而设，
+    //  现侧载方案(SideStore/LiveContainer+本地 Anisette) 已无 StikDebug，且上方
+    //  major=marksweep 串行 GC 已关掉并发标记 RO 页 SIGSEGV 写屏障，coop 可正常工作。
+    //  coop 下 MonoMod 的 _HookSelftest 在 BepInEx 初始化最脆弱时刻触发"目标方法首编
+    //  +隐式 GC"会 sgen SIGSEGV，已在 MonoMod.RuntimeDetour.dll 里把该方法打成 no-op
+    //  （仅为自检、不影响真实 detour）。保留 NEBULA_SUSPEND 环境变量可强制 preempt
+    //  做对照实验（iOS 上会 init 失败，仅用于定位）。
     const char *susp_dflt = "coop";
-#endif
     const char *susp = getenv("NEBULA_SUSPEND");
     if (!susp || !*susp) susp = susp_dflt;
     setenv("MONO_THREADS_SUSPEND", susp, 1);
     printf("[host] MONO_THREADS_SUSPEND=%s（%s）\n", susp,
-           strcmp(susp, "coop") == 0 ? "协作挂起" : "抢占挂起(标准嵌入)");
+           strcmp(susp, "coop") == 0 ? "协作挂起(本机 mono 仅支持 coop)" : "抢占挂起(本机后端缺失, iOS 会 init 失败)");
 }
 
 // ---------------------------------------------------------------- RSS + 看门狗
