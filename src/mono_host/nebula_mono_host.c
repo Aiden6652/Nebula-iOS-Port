@@ -2463,7 +2463,7 @@ int nebula_jit_mem_free(void *ptr) {
    即触发），并污染 MonoMod detour runtime 初始化态。此处导出同名 stub 供
    mono 解析命中。iOS 无交互式终端，stdout/stderr 已重定向到日志文件，返回 0
    （非 tty）使 Console 走重定向路径正常输出，不再抛异常。 */
-__attribute__((visibility("default")))
+__attribute__((visibility("default"), weak))
 int SystemNative_IsATty(int fd) {
     (void)fd;
     return 0;   /* 非 tty：Console 认为输出已重定向，写文件/空设备不崩 */
