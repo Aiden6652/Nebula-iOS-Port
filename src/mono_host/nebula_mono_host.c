@@ -354,7 +354,7 @@ static void apply_gc_env(void) {
     //  (SideStore/LiveContainer+本地 Anisette) 已无 StikDebug，且上方 major=marksweep
     //  串行 GC 已关掉并发标记 RO 页 SIGSEGV 写屏障，故 iOS 改回 preempt 无信号冲突。
     //  保留 env 开关 NEBULA_SUSPEND，可免重编在 coop/preempt 间强制切换定位。
-#ifdef TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE
     const char *susp_dflt = "preempt";
 #else
     const char *susp_dflt = "coop";
