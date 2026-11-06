@@ -345,11 +345,18 @@ static void apply_gc_env(void) {
     setenv("MONO_GC_PARAMS", buf, 1);
     printf("[host] MONO_GC_PARAMS=%s\n", buf);
     // 单一编译器（JIT）版：不再有解释器分支，统一走 JIT（见下方 mono_setmmapjit）。
-    // [Nebula iOS 第九轮] 全协作挂起：mono 默认 full preemptive 挂起靠线程信号
-    // （pthread_kill suspend signal），StikDebug 的 ptrace 会先抢走信号 → 挂起
-    // 机制废 → 死锁/KILL。coop 模式纯靠 safepoint 自挂，无信号依赖。
-    setenv("MONO_THREADS_SUSPEND", "coop", 1);
-    printf("[host] MONO_THREADS_SUSPEND=coop（全协作挂起，规避 ptrace 信号抢占）\n");
+    // [R64] 默认抢占式挂起（preempt）——标准嵌入模式，对"手动 pthread + JIT + 隐式 GC"
+    // 最稳。coop 仅为绕开 StikDebug 的 ptrace 信号抢占而设；当前侧载方案
+    // (SideStore/LiveContainer+本地 Anisette) 已无 StikDebug，且上方 major=marksweep
+    // (串行、无并发标记、无 RO 页 SIGSEGV 写屏障) 已消除 coop 当初要规避的写屏障冲突。
+    // coop 在手动线程上做 JIT 编译+隐式 GC 会触发 sgen 分配器状态错乱
+    // (sgen_try_alloc_obj_nolock: str x19,[x21,#0x40] SIGSEGV)，故改回 preempt。
+    // 保留 env 开关 NEBULA_SUSPEND，便于不重编即在 coop/preempt 间切换定位。
+    const char *susp = getenv("NEBULA_SUSPEND");
+    if (!susp || !*susp) susp = "preempt";
+    setenv("MONO_THREADS_SUSPEND", susp, 1);
+    printf("[host] MONO_THREADS_SUSPEND=%s（%s）\n", susp,
+           strcmp(susp, "coop") == 0 ? "协作挂起(绕 ptrace)" : "抢占挂起(标准嵌入)");
 }
 
 // ---------------------------------------------------------------- RSS + 看门狗
