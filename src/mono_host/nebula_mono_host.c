@@ -390,38 +390,31 @@ static struct timespec g_wd_t0;         // 看门狗启动时刻，心跳打相�
 
 static void *watchdog_thread(void *arg) {
     (void)arg;
-    // [R34] iOS 自定义 mono 头可能未声明这些 API，函数内 extern 前向声明避免隐式声明告警
-    extern void mono_thread_attach(MonoDomain *domain);
-    extern MonoDomain *mono_get_root_domain(void);
+    // [R65] 看门狗改为【纯 RSS 监控 + 文件记录】，不再参与 mono GC。
+    //
+    // 根因（R64e 真机崩溃定位）：本线程是裸 pthread，常驻 usleep（非 coop GC 安全点）。
+    // 旧版在 g_mono_ready 后置位后 mono_thread_attach 把自己登记成 GC 参与线程；
+    // boot 线程在 boot_bepinex 里 JIT 编译 MonoMod 代理方法（ldstr 取字符串常量）触发
+    // sgen 分配 / 小GC 时，coop 的 stop-the-world 永远无法让常驻 usleep 的看门狗就范，
+    // 扫描其栈越界 → 堆损坏 → 后续任意 sgen 分配在 sgen_try_alloc_obj_nolock 里
+    // str x19,[x21,#0x40] SIGSEGV（R34 注释警告的同类问题，只是从"看门狗自己 collect 崩"
+    // 变成"看门狗参与 GC 导致主线程分配崩"）。
+    //
+    // 实测崩时 RSS≈145MB，远低于软/硬顶(1100/1500MB)，看门狗从未真正触发过回收——
+    // 它的 mono_thread_attach 纯属副作用。删掉 attach/collect 后：boot 线程自身的
+    // phase1/phase2 mono_gc_collect 仍保留（此时扫描面只剩 boot 主线程自己，安全），
+    // 托管代码运行期 mono 自带的代际 GC 也照常工作，jetsam 防护不缺失。
     clock_gettime(CLOCK_MONOTONIC, &g_wd_t0);
     while (watchdog_run) {
         long mb = rss_mb();
-        // [R34 修复] 本线程是裸 pthread，从未向 mono 注册。若直接调 mono_gc_collect，
-        // mono 在 GC 栈扫描（copy_stack_data）阶段拿不到本线程栈边界 → 读越界 SIGSEGV。
-        // 首次进入 GC 前 mono_thread_attach 注册本线程，使其栈可被 GC 正确枚举。
-        static int wd_attached = 0;
-        if (g_mono_ready && !wd_attached) { mono_thread_attach(mono_get_root_domain()); wd_attached = 1; }
         if (mb > 0 && g_logfp) {
             struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
             long el = (now.tv_sec - g_wd_t0.tv_sec) * 1000 + (now.tv_nsec - g_wd_t0.tv_nsec) / 1000000;
-            // mono 未就绪前只记录 RSS（GC 尚未初始化，不能调 mono_gc_collect，否则崩）；
-            // 就绪后依软/硬顶强制 GC，防 jetsam 杀。内存日志一律写文件（fflush）——
-            // 旧版写 stderr 不进 nebula_host.txt，导致 OOM 时彻底失明。
-            if (g_mono_ready && CFG.gc_hard_limit_mb > 0 && mb > CFG.gc_hard_limit_mb) {
-                fprintf(g_logfp, "[host][mem][t+%ldms] !! RSS %ldMB 超过硬顶 %dMB，激进全量 GC！\n", el, mb, CFG.gc_hard_limit_mb);
-                fflush(g_logfp);
-                mono_gc_collect(mono_gc_max_generation());
-                long after = rss_mb();
-                fprintf(g_logfp, "[host][mem][t+%ldms]     GC 后 RSS=%ldMB\n", el, after); fflush(g_logfp);
-            } else if (g_mono_ready && CFG.gc_soft_limit_mb > 0 && mb > CFG.gc_soft_limit_mb) {
-                fprintf(g_logfp, "[host][mem][t+%ldms] RSS %ldMB 超过软顶 %dMB，强制 GC\n", el, mb, CFG.gc_soft_limit_mb);
-                fflush(g_logfp);
-                mono_gc_collect(mono_gc_max_generation());
-            } else {
-                fprintf(g_logfp, "[host][mem][t+%ldms] RSS=%ldMB soft=%d hard=%d ready=%d\n",
-                        el, mb, CFG.gc_soft_limit_mb, CFG.gc_hard_limit_mb, g_mono_ready);
-                fflush(g_logfp);
-            }
+            // [R65] 只记录 RSS（写文件 + fflush），不再调 mono_gc_collect：本线程不登记
+            // 为 GC 参与线程，boot 线程触发的任何 GC 扫描面里就没有这个"永不在安全点"的线程。
+            fprintf(g_logfp, "[host][mem][t+%ldms] RSS=%ldMB soft=%d hard=%d ready=%d\n",
+                    el, mb, CFG.gc_soft_limit_mb, CFG.gc_hard_limit_mb, g_mono_ready);
+            fflush(g_logfp);
         }
         long ms = CFG.gc_watchdog_interval_ms > 0 ? CFG.gc_watchdog_interval_ms : 500;
         usleep((useconds_t)(ms * 1000));
