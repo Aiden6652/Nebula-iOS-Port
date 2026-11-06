@@ -238,7 +238,12 @@ typedef struct {
 // 内置默认 = Standard 档
 static host_cfg CFG = {
     .runtime_mode = "jit",
-    .gc_nursery_mb = 16,
+    // [R66] 默认 512MB（原 16MB）。根因：boot 线程是裸 pthread(mono 主线程)，其栈边界
+    // 对 sgen 的 stop-the-world 栈扫描不可靠；boot 期 BepInEx 密集 JIT 编译触发 minor GC
+    // 扫描本线程栈越界 -> 踩坏 sgen 分配器 -> SIGSEGV。放大 nursery 使 boot 期(~120MB 新分配)
+    // 全落在 nursery 内不触发 minor -> 无晋升 -> 老生代不增长 -> major 也不触发，
+    // 彻底避开 boot 期 GC 扫描窗口。后续 GC 在 Unity 主线程(R56 实证安全)自然发生。
+    .gc_nursery_mb = 512,
     .gc_soft_limit_mb = 1100,
     .gc_hard_limit_mb = 1500,   // [R50] 原 700/900：interop 生成期 Cpp2IL 峰值轻松破 900MB，
                               // 硬顶贴着峰值会让看门狗一直在触发激进全量 GC，表现为
@@ -2724,26 +2729,21 @@ static void *boot_thread_impl(void *arg) {
     int ok = 0;
 
     if (auto_mode || !strcmp(bm, "bepinex")) {
-        // #5 防 Interop 生成 OOM：BepInEx 现场解析原版二进制生成 Il2CppInterop 桥接类，
-        // 一次性吃掉大量托管内存。进入前先强制全量 GC 腾出空间，降低 jetsam 风险。
-        hlog("[host] phase2 前强制 GC（防 Interop 生成 OOM）, RSS=%ldMB", rss_mb());
-        mono_gc_collect(mono_gc_max_generation());
+        // [R66] 不再在 boot 线程(裸 pthread)上显式 GC：其栈边界对 sgen 栈扫描不可靠，
+        // 任何 stop-the-world 扫描本线程栈都可能越界踩坏 sgen 分配器 -> SIGSEGV。
+        // 原「phase2 前强制 GC(防 Interop 生成 OOM)」不再需要：R60 已改为预生成
+        // interop，boot 期不再现场生成；且 nursery 已放大到 512MB，boot 期新分配
+        // 全落 nursery 内不触发 minor GC -> 无晋升 -> 老生代不增长 -> major 也不触发。
         hlog("[host] phase2: 进入模组加载(BepInEx/星云), RSS=%ldMB", rss_mb());
         hlog("[host] step: boot_bepinex enter");
-        // [R66] boot 线程是裸 pthread（mono 主线程），其栈边界对 sgen 的 stop-the-world
-        // 栈扫描不可靠：boot_bepinex 期间密集 JIT 编译某方法(ldstr)触发 sgen minor GC，
-        // GC 扫描本线程栈越界 -> 踩坏 sgen 分配器状态 -> 后续分配 SIGSEGV。
-        // 这里在 boot_bepinex 全程关闭 GC，让 JIT 编译/分配在无 GC 干扰下跑完，
-        // boot 结束再开 GC 并强制回收一次。boot 期 RSS 峰值 ~200MB 远低于 jetsam，安全。
-        {
-            extern void mono_gc_disable(void);
-            extern void mono_gc_enable(void);
-            mono_gc_disable();
-            ok = boot_bepinex(domain, root);
-            mono_gc_enable();
-            mono_gc_collect(mono_gc_max_generation());
-        }
-        hlog("[host] step: boot_bepinex -> %d (GC 已恢复)", ok);
+        // [R66] 不在本裸 pthread 上触发任何 GC：其栈边界对 sgen 栈扫描不可靠，一旦
+        // stop-the-world 扫描本线程栈越界 -> 踩坏 sgen 分配器 -> SIGSEGV（实锤崩点）。
+        // 规避策略：nursery 已放大到 512MB(见 CFG.gc_nursery_mb)，boot 期(~120MB 新分配)
+        // 全落 nursery 内不触发 minor -> 无晋升 -> 老生代不增长 -> major 也不触发。
+        // 故 boot_bepinex 期间天然无 GC；boot 完成后线程退出，后续 GC 在 Unity 主线程
+        // (R56 实证安全)自然发生。此处刻意不在 boot_bepinex 后调 mono_gc_collect。
+        ok = boot_bepinex(domain, root);
+        hlog("[host] step: boot_bepinex -> %d", ok);
     }
     if (!ok && (auto_mode || !strcmp(bm, "mods"))) {
         hlog("[host] step: boot_mods_dir enter");
