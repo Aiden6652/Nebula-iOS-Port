@@ -2964,19 +2964,16 @@ static void boot(void) {
         pthread_join(t, NULL);
         hlog("[host] boot 阻塞结束，放行 Unity 继续加载（游戏与 NOS 一同加载）");
 
-        /* [R68] 主线程登记到 mono 域：dobby detour 钩住的 il2cpp_runtime_invoke 由 Unity
-           主线程首次调用（didFinishLaunching → UniversalDeepLink → UnitySendMessage →
-           il2cpp_runtime_invoke），其托管钩子(BepInEx)必须在【已 attach 的 mono 线程】上跑，
-           否则托管堆/GC 线程表损坏 → 级联原生堆损坏 → UnitySendMessage 内 operator delete
-           拿到坏指针 SIGBUS（R67 实锤崩点）。本 on_load 构造器本身运行在 Unity 主线程，故此处
-           attach 的正是主线程，且早于 Unity 启动、时机正确。
-           对照：R56 手动执行路径(2874 行)同样先 mono_thread_attach 主线程，能跑到 Innersloth，
-           实证安全——主线程跑原生/CFRunLoop 时处于 coop 空闲安全点，coop stop-the-world 可正常
-           挂起（此前崩的是卡 usleep 的看门狗，非此类线程）。 */
+        /* [R68] 主线程登记到 mono 域：本 on_load 构造器运行在 Unity 主线程，此处 attach 的正是
+           主线程，且早于 Unity 启动、时机正确。对 R56 手动执行路径（后续 dispatch_after 在主线程
+           跑 mono_runtime_invoke）有益——主线程提前登记，避免未登记线程跑托管代码损坏 GC 线程表。
+           注意：R67/R68 实测 dobby 官方 detour 路径的 didFinishLaunching 后崩（UnitySendMessage →
+           operator delete）在补完此 attach 后【崩点一字不差】，证明 dobby 路径的崩与线程登记无关，
+           是 Execute() 触发时机过早（didFinishLaunching 极早期）所致；该路径已由 R69 降级为可选项。 */
         if (g_r56_domain) {
             extern void mono_thread_attach(MonoDomain *d);
             mono_thread_attach(g_r56_domain);
-            hlog("[host][r68] 主线程已 mono_thread_attach（dobby 首调 il2cpp 前登记，规避托管堆/GC 损坏）");
+            hlog("[host][r68] 主线程已 mono_thread_attach（R56 手动路径提前登记，规避未登记线程跑托管代码）");
         } else {
             hlog("[host][r68] 主线程 attach 跳过：g_r56_domain 为空（无 BepInEx，无 detour）");
         }
@@ -2994,12 +2991,25 @@ static void boot(void) {
            若设备端 dobby inline hook 因 code signing 失败导致 detour 没装上，
            可设 NEBULA_FORCE_MANUAL_EXECUTE=1 恢复旧兜底做对照。 */
         {
-            const char *fm = getenv("NEBULA_FORCE_MANUAL_EXECUTE");
-            int force_manual = (fm && !strcmp(fm, "1"));
-            if (nebula_r60_has_symbol("DobbyHook") && !force_manual) {
-                hlog("[host][r60] dobby 已就绪：跳过 R56 兜底 NebulaManualExecute（该兜底是播完 Innersloth 后 SIGSEGV 源头），交由 chainloader 官方 detour 触发 Execute()");
+            /* [R69] 切回默认 R56 手动执行路径。根因校准：R67/R68 的 didFinishLaunching
+               后 SIGSEGV（UnitySendMessage → operator delete，mono fault address 为空）
+               在 R68 给主线程补 mono_thread_attach 后【崩点一字不差】，证明根因非线程
+               登记、而是 dobby 官方 detour 让 chainloader 的 Execute() 在 didFinishLaunching
+               极早期（il2cpp_runtime_invoke 首调）就触发，此时 Unity 子系统未就绪，
+               Execute/插件初始化污染了 Unity 启动状态 → 后续 UnitySendMessage 拿坏指针。
+               R56 手动路径用 dispatch_after 延迟 4000ms（主线程、已 attach）派发 Execute，
+               天然推到 Unity 就绪之后，规避该时机崩（R56 历史实测能跑到 Innersloth）。
+               dobby 官方 detour 路径降级为可选项：仅当 NEBULA_USE_DOBBY=1 且 DobbyHook
+               符号存在时启用；其余情况走 R56 兜底。 */
+            const char *ud = getenv("NEBULA_USE_DOBBY");
+            int use_dobby = (ud && !strcmp(ud, "1"));
+            if (use_dobby && nebula_r60_has_symbol("DobbyHook")) {
+                hlog("[host][r69] NEBULA_USE_DOBBY=1 且 dobby 就绪：走官方 detour 路径触发 Execute()");
             } else {
-                hlog("[host][r60] dobby 未就绪或强制兜底：仍派发 R56 NebulaManualExecute");
+                if (use_dobby)
+                    hlog("[host][r69] NEBULA_USE_DOBBY=1 但 DobbyHook 符号缺失，回退 R56 兜底");
+                else
+                    hlog("[host][r69] 默认走 R56 手动执行路径（延迟到 Unity 就绪后触发，规避 didFinishLaunching 早期崩）");
                 nebula_r56_schedule_execute();
             }
         }
