@@ -2965,23 +2965,34 @@ static void boot(void) {
         pthread_join(t, NULL);
         hlog("[host] boot 阻塞结束，放行 Unity 继续加载（游戏与 NOS 一同加载）");
 
-        /* [R70] bepinex 路径：主线程先 mono_thread_attach 到域，再跑 Start()
-           （GC root，规避裸 pthread 上 MonoMod trampoline 生成引发的 coop sgen 崩；
-           R56 已验证「主线程 attach + mono_runtime_invoke」组合能跑到 Innersloth）。
-           attach 必须在 boot_bepinex 之前。非 bepinex 路径沿用 R68：仅登记主线程。 */
+        /* [R71] 关键修复：Start() 绝不能在 on_load 调用栈里同步跑。
+           当前(及 R70)崩点 = boot_bepinex←boot←on_load←dyld，证明 Start() 仍在 dyld
+           加载线程上同步执行；而 mono_jit_init 在另一条 boot_thread 跑且已被 pthread_join
+           退出，加载线程在 block 期反复泵 CFRunLoop（coop GC 被带入 GC-safe 态），再
+           attach 上来的 sgen 上下文处于不一致态 → 首次 trampoline JIT 的 ldstr 即在
+           sgen_try_alloc_obj_nolock 的 str x19,[x21,#0x40] SIGSEGV。
+           修法：把 boot_bepinex(Start) 派发到主队列，等 on_load 返回、Unity 起来后由
+           真实主线程跑（post-load + 已 attach，正是 R56 跑到 Innersloth 的安全上下文，
+           与 nebula_r56_schedule_execute 同款 dispatch_after 机制）。
+           attach 必须在 boot_bepinex 之前的同线程（派发块内）完成。 */
+        int bepinex_dispatched = 0;
         if (g_boot_setup_done && g_boot_domain) {
             extern void mono_thread_attach(MonoDomain *d);
-            mono_thread_attach(g_boot_domain);
-            hlog("[host][r70] 主线程已 mono_thread_attach（准备在主线程跑 Start()）");
-            int ok = boot_bepinex(g_boot_domain, g_boot_root);
-            hlog("[host][r70] 主线程 boot_bepinex -> %d", ok);
-            if (ok) {
-                hlog("[host] BepInEx 已起(主线程)：保留 Mono 域常驻（不 cleanup）");
-            } else {
-                hlog("[host] BepInEx 未成功(主线程)：清理 Mono 域");
-                mono_jit_cleanup(g_boot_domain);
-            }
-            free(g_boot_root); g_boot_root = NULL;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)nebula_r56_delay_ms() * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                mono_thread_attach(g_boot_domain);
+                hlog("[host][r71] 主队列跑 Start()（真实主线程 post-load，规避 on_load 阶段 sgen 崩）");
+                int ok = boot_bepinex(g_boot_domain, g_boot_root);
+                hlog("[host][r71] 主队列 boot_bepinex -> %d", ok);
+                if (ok) {
+                    hlog("[host] BepInEx 已起(主队列)：保留 Mono 域常驻（不 cleanup）");
+                } else {
+                    hlog("[host] BepInEx 未成功(主队列)：清理 Mono 域");
+                    mono_jit_cleanup(g_boot_domain);
+                }
+                free(g_boot_root); g_boot_root = NULL;
+            });
+            bepinex_dispatched = 1;
         } else if (g_r56_domain) {
             extern void mono_thread_attach(MonoDomain *d);
             mono_thread_attach(g_r56_domain);
@@ -3003,6 +3014,13 @@ static void boot(void) {
            若设备端 dobby inline hook 因 code signing 失败导致 detour 没装上，
            可设 NEBULA_FORCE_MANUAL_EXECUTE=1 恢复旧兜底做对照。 */
         {
+            /* [R71] bepinex 路径已通过上方主队列派发接管 Start()（chainloader 官方路径，
+               含 trampoline 装钩），这里不能再跑 R56 手动 NebulaManualExecute，否则
+               BepInEx 双重初始化。仅当 bepinex 未接管（mods/engine 等无 BepInEx 域路径）
+               时才走下方手动/R69 派发兜底。 */
+            if (bepinex_dispatched) {
+                hlog("[host][r71] bepinex 已接管 Start()，跳过 R56/R69 手动派发兜底（避免双重初始化）");
+            } else {
             /* [R69] 切回默认 R56 手动执行路径。根因校准：R67/R68 的 didFinishLaunching
                后 SIGSEGV（UnitySendMessage → operator delete，mono fault address 为空）
                在 R68 给主线程补 mono_thread_attach 后【崩点一字不差】，证明根因非线程
@@ -3023,6 +3041,7 @@ static void boot(void) {
                 else
                     hlog("[host][r69] 默认走 R56 手动执行路径（延迟到 Unity 就绪后触发，规避 didFinishLaunching 早期崩）");
                 nebula_r56_schedule_execute();
+            }
             }
         }
     } else {
