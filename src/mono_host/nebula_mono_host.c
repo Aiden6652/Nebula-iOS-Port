@@ -2834,14 +2834,16 @@ static void *boot_thread_impl(void *arg) {
 }
 
 /* 包装层：不论 impl 从哪条 return 退出都置完成标志，避免逐条返回点去改。
-   [R74] bepinex 路径(g_boot_setup_done==1)的放行权【不再】在这里给：
-   交给主队列 Start 块（Start()+JIT 预热完成后才置位），保证 on_load 返回
-   （Unity 起来）前 Start() 与 JIT 预热已全部完成。
-   非 bepinex 路径(R56/R68)保持旧行为：boot_thread 结束即可放行。 */
+   [R75] 回退 R74 死锁：R74 把放行权挪到主队列 Start 块(预热后置 g_boot_complete=1)，
+   但派发 Start 块的 dispatch_after 位于 boot() 的 while(!g_boot_complete) 之后 →
+   while 永远等不到生产者、on_load 卡死（用户实锤「卡死」，日志停在占位文字那行）。
+   架构铁律：on_load(dyld ctor) 必须返回，dyld 才完成加载、iOS 才起 Unity(UIApplicationMain)；
+   而 Start() 又必须 post-load 在主队列跑（on_load 内同步跑=R70 coop sgen 崩）。
+   故「预热在 Unity 启动前完成」不可能实现 —— 放行只能在 boot_thread 结束时由这里
+   无条件置位；预热只能排在放行后、阶段B 装插件前（R73 原时序本就正确）。 */
 static void *boot_thread(void *arg) {
     void *r = boot_thread_impl(arg);
-    if (!g_boot_setup_done)
-        g_boot_complete = 1;
+    g_boot_complete = 1;
     return r;
 }
 
@@ -2877,11 +2879,10 @@ static void *boot_thread(void *arg) {
  *     mono_thread_attach() 再 mono_runtime_invoke()。
  *
  * 【延迟】默认 4000ms（NEBULA_EXEC_DELAY_MS 可调，0~60000）。
- *   [R74 语义] 这是「Start() 主队列派发」的延迟，期间 on_load 仍被 boot() 的
- *   while(g_boot_complete) 卡住、Unity 尚未放行。故延迟越大 = on_load 卡越久 =
- *   给 Start()+JIT 预热越充裕的时间，且保证「Unity 起来前 Start 与预热必已完成」
- *   （g_boot_complete 现改在预热后于主队列块内置位，见下）。旧注释「等 Unity 起来后
- *   跑」已失效——R74 后 Unity 是在预热完成后才被放行的。
+ *   [R75 恢复 R56/R73 语义] 这是「Start() 主队列派发」的延迟，从 boot() 放行
+ *   Unity、on_load 返回起算，覆盖 didFinishLaunching / il2cpp_init / 首个场景加载。
+ *   g_boot_complete 由 boot_thread 结束时无条件置位（放行 Unity），Start() 随后
+ *   post-load 在主队列跑。R74 曾把放行权改到预热之后导致 on_load 死锁卡死，已回退。
  * ==========================================================================*/
 static int64_t nebula_r56_delay_ms(void) {
     const char *e = getenv("NEBULA_EXEC_DELAY_MS");
@@ -2915,7 +2916,10 @@ static int64_t nebula_r56_delay_ms(void) {
  *   只遍历少量关键类、限量（默认 1500 方法，几百 ms 完成），不会卡主线程触发看门狗。
  *   所有预热用到的新 API 用函数内 extern 声明，不 include 任何新头（R70 教训：
  *   debug-helpers.h 引入 typedef 冲突 / undeclared / 不完整结构体 → CI 编译失败）。
- * 开关：NEBULA_PREWARM_JIT=0 关闭（回到 R72 基线做对照）；NEBULA_PREWARM_MAX 限量。
+ * 开关 [R75]：NEBULA_PREWARM_JIT 未设/其它 = 安全模式（默认，跳过会踩 mono 断言的
+ *   批量编译，只做 runtime_invoke trampoline 预热）；=0 完全关闭（R72 基线对照）；
+ *   =full 强制全量 mono_compile_method 循环（实验，R73 实测会 abort，仅供取证）。
+ *   NEBULA_PREWARM_MAX 限量（默认 1500，仅 full 模式生效）。
  * ==========================================================================*/
 static void nebula_prewarm_jit(void) {
     const char *off = getenv("NEBULA_PREWARM_JIT");
@@ -2947,9 +2951,18 @@ static void nebula_prewarm_jit(void) {
     };
     const int ntg = (int)(sizeof(tg) / sizeof(tg[0]));
 
+    /* [R75] R73 真机实锤（nebula_host.txt 991~998）：批量 mono_compile_method 遍历
+       类里全部方法时，某个特殊方法（泛型/抽象/无 IL 体）让 JIT 走到 mono_method_to_ir
+       的 mono_assertion_message_unreachable 断言并 abort。故默认【不跑批量编译循环】，
+       只保留下方安全的 runtime_invoke trampoline 预热（Start() 已实证主线程 invoke
+       海量方法不崩）；仅 NEBULA_PREWARM_JIT=full 时强制跑全量循环（实验/对照，已知会崩）。*/
+    const char *pm = getenv("NEBULA_PREWARM_JIT");
+    int do_full = (pm && !strcmp(pm, "full"));
+
     int total = 0, ok = 0, fail = 0;
-    hlog("[host][r73] ===== 主线程 JIT 预热开始（上限 %d 方法，dobby 未挂 / GC 主线程一致态）=====", maxn);
-    for (int i = 0; i < ntg && total < maxn; i++) {
+    hlog("[host][r75] ===== 主线程 JIT 预热开始（批量编译=%s，上限 %d）=====",
+         do_full ? "full(实验)" : "关闭(R73 踩 mono 断言崩, 仅做 trampoline 预热)", maxn);
+    for (int i = 0; do_full && i < ntg && total < maxn; i++) {
         MonoImage *img = tg[i].use_il2cpp ? g_r56_il2cpp_img : corlib;
         if (!img) continue;
         MonoClass *k = mono_class_from_name(img, tg[i].ns, tg[i].name);
@@ -3129,14 +3142,10 @@ static void boot(void) {
                    必须在下面阶段B（挂 dobby + NebulaManualExecute 起线程池 worker）之前
                    完成，让新线程执行已编译代码、不再首次 JIT 崩。 */
                 nebula_prewarm_jit();
-                /* [R74] 关键修正：JIT 预热完成后才放行 Unity（置 g_boot_complete=1）。
-                   此刻仍在 on_load 返回前的主线程安全窗口，boot() 的 while 随即退出
-                   → on_load 返回 → iOS 启动 Unity。从而保证「Unity 执行任何托管代码之前，
-                   Start() 与 JIT 预热已全部完成」，彻底消除旧实现「Unity 早放行数秒、
-                   预热迟到失效」的窗口（用户实锤：水印显示期间已能听见 Innersloth 声音，
-                   说明 Unity 裸奔时预热还没跑）。阶段B 装插件仍在放行后（Unity 已起）跑。 */
-                g_boot_complete = 1;
-                hlog("[host][r74] JIT 预热完成，放行 Unity（on_load 即将返回，Unity 启动前已预热）");
+                /* [R75] 不再在这里置 g_boot_complete（R74 死锁根源，见 boot_thread 注释）。
+                   放行早已由 boot_thread 结束触发、on_load 已返回、Unity 已起；这里只是
+                   在「Start() 之后、阶段B 装插件之前」的同一主线程安全窗口做 JIT 预热，
+                   让阶段B 新起的托管线程执行已编译代码、不再首次 JIT 崩。 */
                 /* [R72] 阶段B：Start() 已返回、chainloader Instance 已建立、Unity 已就绪，
                    真正要【装插件】了 —— 这一刻才【手动启动 dobby】：补上 dllmap，让插件 /
                    Il2CppInterop 若需要 detour 能装上。用户方案：dobby 只在装插件阶段可用，
