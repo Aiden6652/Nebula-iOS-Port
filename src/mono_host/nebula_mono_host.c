@@ -33,6 +33,7 @@
 #include <mono/metadata/assembly.h>
 #include <mono/metadata/appdomain.h>   // mono_domain_assembly_open
 #include <mono/metadata/class.h>       // mono_class_from_name / mono_class_get_method_from_name
+#include <mono/metadata/debug-helpers.h> // mono_method_signature（R70 托管线程 ctor 参数匹配）
 #include <mono/metadata/object.h>      // mono_runtime_invoke
 #include <mono/metadata/mono-config.h>
 #include <mono/metadata/image.h>      // mono_image_open_from_data_with_name
@@ -1230,6 +1231,51 @@ static MonoDomain *g_r56_domain     = NULL;   // Mono 根域（boot_thread 里 i
 static MonoImage  *g_r56_il2cpp_img = NULL;   // BepInEx.Unity.IL2CPP 的 image
 
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
+/* [R70] 在真正的「托管线程」上跑 Doorstop.Entrypoint.Start()（及其引发的
+   MonoMod trampoline 生成），而非裸 pthread。
+   根因校准：boot 线程虽在 mono_jit_init 后调了 mono_thread_attach，但它是
+   「外来」pthread；MonoMod 生成 trampoline 时要在本线程 JIT 编译
+   FlushICache 等方法（含 ldstr 取字符串常量），首次分配即触发
+   sgen_try_alloc_obj_nolock 的 str x19,[x21,#0x40] SIGSEGV —— 外来线程的
+   sgen 线程信息/TLAB 在 coop GC 下处于不一致态。System.Threading.Thread
+   起的托管线程由 mono 完整登记 sgen，与已验证可跑通的主线程路径等价。 */
+static void nebula_run_start_on_managed_thread(MonoDomain *domain, MonoMethod *start) {
+    MonoClass *ts = mono_class_from_name(mono_get_corlib(), "System.Threading", "ThreadStart");
+    if (!ts) { fprintf(stderr, "[host][r70] !! 找不到 ThreadStart\n"); fflush(NULL); return; }
+    MonoObject *del = mono_create_delegate(domain, ts, NULL, start);
+    if (!del) { fprintf(stderr, "[host][r70] !! 创建 ThreadStart 委托失败\n"); fflush(NULL); return; }
+
+    MonoClass *tc = mono_class_from_name(mono_get_corlib(), "System.Threading", "Thread");
+    if (!tc) { fprintf(stderr, "[host][r70] !! 找不到 Thread\n"); fflush(NULL); return; }
+    /* 找 .ctor(ThreadStart)：不能用 get_method_from_name(.ctor,1)（会与
+       ParameterizedThreadStart 重载歧义），这里显式按参数类型匹配。 */
+    MonoMethod *ctor = NULL;
+    void *iter = NULL;
+    MonoMethod *m;
+    while ((m = mono_class_get_methods(tc, &iter))) {
+        if (strcmp(mono_method_get_name(m), ".ctor")) continue;
+        MonoMethodSignature *sig = mono_method_signature(m);
+        if (!sig || sig->param_count != 1) continue;
+        MonoClass *pt = mono_class_from_mono_type(sig->params[0]);
+        if (pt && strcmp(mono_class_get_name(pt), "ThreadStart") == 0) { ctor = m; break; }
+    }
+    if (!ctor) { fprintf(stderr, "[host][r70] !! 找不到 Thread(ThreadStart) 构造\n"); fflush(NULL); return; }
+
+    MonoObject *thr = mono_object_new(domain, tc);
+    if (!thr) { fprintf(stderr, "[host][r70] !! new Thread 失败\n"); fflush(NULL); return; }
+    void *args[1] = { del };
+    MonoObject *exc = NULL;
+    mono_runtime_invoke(ctor, thr, args, &exc);
+    if (exc) { fprintf(stderr, "[host][r70] !! Thread 构造抛异常\n"); nebula_log_exception(exc); return; }
+
+    MonoMethod *startm = mono_class_get_method_from_name(tc, "Start", 0);
+    MonoMethod *joinm  = mono_class_get_method_from_name(tc, "Join", 0);
+    if (startm) mono_runtime_invoke(startm, thr, NULL, &exc);  // 托管线程跑 Start()（trampoline 生成）
+    if (joinm)  mono_runtime_invoke(joinm,  thr, NULL, &exc);  // 等托管线程跑完（保持 boot 阻塞语义）
+    fprintf(stderr, "[host][r70] 托管线程上的 Start() 已完成（Join 返回）\n");
+    fflush(NULL);
+}
+
 static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 记录 LogOutput.log 的起始大小，Start() 之后只 grep 这一段增量
     const long log_offset = nebula_file_size(boot_logoutput_path());
@@ -1298,9 +1344,14 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
         if (pthread_create(&rt, NULL, nebula_r54_tail_thread, NULL) == 0) pthread_detach(rt);
     }
 
-    printf("[host] 调用 Doorstop.Entrypoint.Start() —— 之后交给 BepInEx chainloader\n");
+    printf("[host] 调用 Doorstop.Entrypoint.Start()（经托管线程，规避裸 pthread coop sgen 崩）\n");
+    /* [R70] 不再直接在裸 pthread 上跑 Start()：MonoMod 生成 trampoline 时要在本线程
+       JIT 编译 FlushICache 等方法（含 ldstr 取字符串常量），首次分配即触发
+       sgen_try_alloc_obj_nolock 的 str x19,[x21,#0x40] SIGSEGV（外来线程 sgen 状态
+       不一致）。改用 System.Threading.Thread 起的真正托管线程跑（mono 完整登记 sgen），
+       等价已验证可跑通的主线程路径。 */
     MonoObject *exc = NULL;
-    mono_runtime_invoke(start, NULL, NULL, &exc);
+    nebula_run_start_on_managed_thread(domain, start);
     nebula_log_paths(domain);   // 诊断：打印 Paths 真实落点，判定平台/MacOS/Data 问题
     // 诊断（R35）：枚举 BepInEx 目录，确认 Preloader/Chainloader 是否生成产物
     // （preloader.log / LogOutput.log / plugins 缓存），定位 NOS 初始化失败原因
@@ -2704,10 +2755,13 @@ static void *boot_thread_impl(void *arg) {
     MonoDomain *domain = mono_jit_init("NebulaHost");
     if (!domain) { hlog("[host] !! mono_jit_init failed"); free(dir); return NULL; }
     g_mono_ready = 1;   // 看门狗自此起可安全 GC
-    // [R63] boot 线程是 mono 主线程，但 coop 挂起要求线程显式 mono_thread_attach 登记
-    // safepoint 状态；否则本线程上隐式 GC（JIT 编译期 mono_ldstr 等分配触发）sgen 分配器
-    // 状态不一致 -> sgen_try_alloc_obj_nolock 里 str x19,[x21,#0x40] 段错误。
-    // 看门狗线程已在 watchdog 内 attach；这里补 boot 线程自身（幂等，mono_jit_init 后调用）。
+    // [R63] boot 线程是 mono 主线程，coop 挂起要求线程显式 mono_thread_attach 登记
+    // safepoint 状态；否则本线程上轻量分配也易出问题。这里补 boot 线程自身
+    // （幂等，mono_jit_init 后调用），对 boot 期的轻量分配（mono_jit_init/程序集加载）有益。
+    // [R70] 但实测：外来 pthread 即便 attach，MonoMod 生成 trampoline 的 JIT(ldstr) 仍会在
+    //   sgen_try_alloc_obj_nolock 崩（sgen 线程信息/TLAB 在该线程上不一致）。真正解法是
+    //   Start() 改在「托管线程」上跑（见 boot_bepinex -> nebula_run_start_on_managed_thread），
+    //   由 mono 完整登记 sgen，等价已验证可跑通的主线程路径。
     extern void mono_thread_attach(MonoDomain *d);
     mono_thread_attach(domain);
     hlog("[host] step: mono_jit_init OK, RSS=%ldMB", rss_mb());
