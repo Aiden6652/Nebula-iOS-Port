@@ -33,7 +33,6 @@
 #include <mono/metadata/assembly.h>
 #include <mono/metadata/appdomain.h>   // mono_domain_assembly_open
 #include <mono/metadata/class.h>       // mono_class_from_name / mono_class_get_method_from_name
-#include <mono/metadata/debug-helpers.h> // mono_method_signature（R70 托管线程 ctor 参数匹配）
 #include <mono/metadata/object.h>      // mono_runtime_invoke
 #include <mono/metadata/mono-config.h>
 #include <mono/metadata/image.h>      // mono_image_open_from_data_with_name
@@ -1230,52 +1229,14 @@ static void *nebula_r54_tail_thread(void *arg) {
 static MonoDomain *g_r56_domain     = NULL;   // Mono 根域（boot_thread 里 init，主线程需 attach）
 static MonoImage  *g_r56_il2cpp_img = NULL;   // BepInEx.Unity.IL2CPP 的 image
 
+// [R70] boot 线程 → 主线程 交接：boot 线程只做 mono_jit_init + 环境准备，把 domain/root
+// 交给主线程（先 mono_thread_attach 再跑 Start()），规避裸 pthread 上 MonoMod trampoline
+// 生成引发的 coop sgen 崩。主线程已验证可跑通（R56 靠它跑到 Innersloth）。
+static MonoDomain *g_boot_domain      = NULL;
+static char       *g_boot_root        = NULL;
+static int         g_boot_setup_done  = 0;    // boot 线程已完成 mono 初始化+环境，主线程可跑 Start()
+
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
-/* [R70] 在真正的「托管线程」上跑 Doorstop.Entrypoint.Start()（及其引发的
-   MonoMod trampoline 生成），而非裸 pthread。
-   根因校准：boot 线程虽在 mono_jit_init 后调了 mono_thread_attach，但它是
-   「外来」pthread；MonoMod 生成 trampoline 时要在本线程 JIT 编译
-   FlushICache 等方法（含 ldstr 取字符串常量），首次分配即触发
-   sgen_try_alloc_obj_nolock 的 str x19,[x21,#0x40] SIGSEGV —— 外来线程的
-   sgen 线程信息/TLAB 在 coop GC 下处于不一致态。System.Threading.Thread
-   起的托管线程由 mono 完整登记 sgen，与已验证可跑通的主线程路径等价。 */
-static void nebula_run_start_on_managed_thread(MonoDomain *domain, MonoMethod *start) {
-    MonoClass *ts = mono_class_from_name(mono_get_corlib(), "System.Threading", "ThreadStart");
-    if (!ts) { fprintf(stderr, "[host][r70] !! 找不到 ThreadStart\n"); fflush(NULL); return; }
-    MonoObject *del = mono_create_delegate(domain, ts, NULL, start);
-    if (!del) { fprintf(stderr, "[host][r70] !! 创建 ThreadStart 委托失败\n"); fflush(NULL); return; }
-
-    MonoClass *tc = mono_class_from_name(mono_get_corlib(), "System.Threading", "Thread");
-    if (!tc) { fprintf(stderr, "[host][r70] !! 找不到 Thread\n"); fflush(NULL); return; }
-    /* 找 .ctor(ThreadStart)：不能用 get_method_from_name(.ctor,1)（会与
-       ParameterizedThreadStart 重载歧义），这里显式按参数类型匹配。 */
-    MonoMethod *ctor = NULL;
-    void *iter = NULL;
-    MonoMethod *m;
-    while ((m = mono_class_get_methods(tc, &iter))) {
-        if (strcmp(mono_method_get_name(m), ".ctor")) continue;
-        MonoMethodSignature *sig = mono_method_signature(m);
-        if (!sig || sig->param_count != 1) continue;
-        MonoClass *pt = mono_class_from_mono_type(sig->params[0]);
-        if (pt && strcmp(mono_class_get_name(pt), "ThreadStart") == 0) { ctor = m; break; }
-    }
-    if (!ctor) { fprintf(stderr, "[host][r70] !! 找不到 Thread(ThreadStart) 构造\n"); fflush(NULL); return; }
-
-    MonoObject *thr = mono_object_new(domain, tc);
-    if (!thr) { fprintf(stderr, "[host][r70] !! new Thread 失败\n"); fflush(NULL); return; }
-    void *args[1] = { del };
-    MonoObject *exc = NULL;
-    mono_runtime_invoke(ctor, thr, args, &exc);
-    if (exc) { fprintf(stderr, "[host][r70] !! Thread 构造抛异常\n"); nebula_log_exception(exc); return; }
-
-    MonoMethod *startm = mono_class_get_method_from_name(tc, "Start", 0);
-    MonoMethod *joinm  = mono_class_get_method_from_name(tc, "Join", 0);
-    if (startm) mono_runtime_invoke(startm, thr, NULL, &exc);  // 托管线程跑 Start()（trampoline 生成）
-    if (joinm)  mono_runtime_invoke(joinm,  thr, NULL, &exc);  // 等托管线程跑完（保持 boot 阻塞语义）
-    fprintf(stderr, "[host][r70] 托管线程上的 Start() 已完成（Join 返回）\n");
-    fflush(NULL);
-}
-
 static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 记录 LogOutput.log 的起始大小，Start() 之后只 grep 这一段增量
     const long log_offset = nebula_file_size(boot_logoutput_path());
@@ -1344,14 +1305,9 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
         if (pthread_create(&rt, NULL, nebula_r54_tail_thread, NULL) == 0) pthread_detach(rt);
     }
 
-    printf("[host] 调用 Doorstop.Entrypoint.Start()（经托管线程，规避裸 pthread coop sgen 崩）\n");
-    /* [R70] 不再直接在裸 pthread 上跑 Start()：MonoMod 生成 trampoline 时要在本线程
-       JIT 编译 FlushICache 等方法（含 ldstr 取字符串常量），首次分配即触发
-       sgen_try_alloc_obj_nolock 的 str x19,[x21,#0x40] SIGSEGV（外来线程 sgen 状态
-       不一致）。改用 System.Threading.Thread 起的真正托管线程跑（mono 完整登记 sgen），
-       等价已验证可跑通的主线程路径。 */
+    printf("[host] 调用 Doorstop.Entrypoint.Start()（本函数现由主线程调用，GC root，规避裸 pthread coop sgen 崩）\n");
     MonoObject *exc = NULL;
-    nebula_run_start_on_managed_thread(domain, start);
+    mono_runtime_invoke(start, NULL, NULL, &exc);
     nebula_log_paths(domain);   // 诊断：打印 Paths 真实落点，判定平台/MacOS/Data 问题
     // 诊断（R35）：枚举 BepInEx 目录，确认 Preloader/Chainloader 是否生成产物
     // （preloader.log / LogOutput.log / plugins 缓存），定位 NOS 初始化失败原因
@@ -2760,8 +2716,8 @@ static void *boot_thread_impl(void *arg) {
     // （幂等，mono_jit_init 后调用），对 boot 期的轻量分配（mono_jit_init/程序集加载）有益。
     // [R70] 但实测：外来 pthread 即便 attach，MonoMod 生成 trampoline 的 JIT(ldstr) 仍会在
     //   sgen_try_alloc_obj_nolock 崩（sgen 线程信息/TLAB 在该线程上不一致）。真正解法是
-    //   Start() 改在「托管线程」上跑（见 boot_bepinex -> nebula_run_start_on_managed_thread），
-    //   由 mono 完整登记 sgen，等价已验证可跑通的主线程路径。
+    //   Start() 改在「已登记 GC 的主线程」上跑（见 boot() 主线程分支 + boot_bepinex 移交），
+    //   即 R56 已验证可跑到 Innersloth 的「主线程 attach + mono_runtime_invoke」组合。
     extern void mono_thread_attach(MonoDomain *d);
     mono_thread_attach(domain);
     hlog("[host] step: mono_jit_init OK, RSS=%ldMB", rss_mb());
@@ -2789,33 +2745,29 @@ static void *boot_thread_impl(void *arg) {
     int ok = 0;
 
     if (auto_mode || !strcmp(bm, "bepinex")) {
-        // [R66] 不再在 boot 线程(裸 pthread)上显式 GC：其栈边界对 sgen 栈扫描不可靠，
-        // 任何 stop-the-world 扫描本线程栈都可能越界踩坏 sgen 分配器 -> SIGSEGV。
-        // 原「phase2 前强制 GC(防 Interop 生成 OOM)」不再需要：R60 已改为预生成
-        // interop，boot 期不再现场生成；且 nursery 已放大到 512MB，boot 期新分配
-        // 全落 nursery 内不触发 minor GC -> 无晋升 -> 老生代不增长 -> major 也不触发。
-        hlog("[host] phase2: 进入模组加载(BepInEx/星云), RSS=%ldMB", rss_mb());
-        hlog("[host] step: boot_bepinex enter");
-        // [R66] 不在本裸 pthread 上触发任何 GC：其栈边界对 sgen 栈扫描不可靠，一旦
-        // stop-the-world 扫描本线程栈越界 -> 踩坏 sgen 分配器 -> SIGSEGV（实锤崩点）。
-        // 规避策略：nursery 已放大到 512MB(见 CFG.gc_nursery_mb)，boot 期(~120MB 新分配)
-        // 全落 nursery 内不触发 minor -> 无晋升 -> 老生代不增长 -> major 也不触发。
-        // 故 boot_bepinex 期间天然无 GC；boot 完成后线程退出，后续 GC 在 Unity 主线程
-        // (R56 实证安全)自然发生。此处刻意不在 boot_bepinex 后调 mono_gc_collect。
-        ok = boot_bepinex(domain, root);
-        hlog("[host] step: boot_bepinex -> %d", ok);
+        // [R70] Start()（含 MonoMod trampoline 生成）必须在「已登记 GC 的主线程」上跑，
+        // 不能在裸 boot pthread 上跑——外来 pthread 即便 mono_thread_attach，coop sgen
+        // 的线程信息/TLAB 仍不一致，首次 ldstr 分配即 sgen_try_alloc_obj_nolock 崩
+        // （R64e 起实锤崩点，R63/R67 的 attach/去GC 假设都没覆盖这条重活路径）。
+        // 这里只做环境准备，把 domain/root 交给 boot() 主线程（先 mono_thread_attach
+        // 再 mono_runtime_invoke，R56 已验证可跑到 Innersloth）执行 Start()。
+        hlog("[host] phase2: 进入模组加载(BepInEx/星云) 准备，Start() 移交主线程");
+        hlog("[host] step: boot_bepinex 环境准备（实际 Start() 由主线程调用）");
+        g_boot_domain = domain;
+        g_boot_root   = strdup(root);
+        g_boot_setup_done = 1;
     }
-    if (!ok && (auto_mode || !strcmp(bm, "mods"))) {
+    if (!ok && !g_boot_setup_done && (auto_mode || !strcmp(bm, "mods"))) {
         hlog("[host] step: boot_mods_dir enter");
         ok = boot_mods_dir(domain, root);
         hlog("[host] step: boot_mods_dir -> %d", ok);
     }
-    if (!ok && (auto_mode || !strcmp(bm, "engine"))) {
+    if (!ok && !g_boot_setup_done && (auto_mode || !strcmp(bm, "engine"))) {
         hlog("[host] step: boot_engine_poc enter");
         ok = boot_engine_poc(domain, dir);
         hlog("[host] step: boot_engine_poc -> %d", ok);
     }
-    if (!ok) hlog("[host] !! 没有任何启动路径成功");
+    if (!ok && !g_boot_setup_done) hlog("[host] !! 没有任何启动路径成功");
 
     // [R60] 启动画面收尾：请求销毁即可，boot_overlay.m 内部按「首次显示时间戳」
     //   强制满 3 秒才真正移除（Nebula 就绪信号也不得提前销毁）。这里默认 3000ms
@@ -2836,29 +2788,24 @@ static void *boot_thread_impl(void *arg) {
 
     watchdog_run = 0;
 
-    // [R43 关键] BepInEx 起来后【绝不】mono_jit_cleanup。
-    // BepInEx 6 IL2CPP 的插件加载根本不在 Preloader 里发生：IL2CPPChainloader.Initialize()
-    // 只做一件事——用 INativeDetour 钩住 il2cpp_runtime_invoke；真正的 chainloader.Start()
-    //（扫 plugins/ 加载 NOS、打 Harmony 补丁）要等 Unity 跑起来、首次切场景时
-    // IL2CPP 调 il2cpp_runtime_invoke 命中那个方法名才触发（IL 实证，见 Preloader.Run 末尾
-    // 只有 Initialize 没有 Start）。也就是插件加载发生在 Unity 之后，Mono 域必须活到那时。
-    // 旧实现在这里无条件 cleanup，等于把 BepInEx 连同刚生成的一切一起拆掉 ——
-    // 这正是「boot_bepinex -> 1、游戏正常进、NOS 永远不出现」的直接原因。
-    if (ok) {
-        hlog("[host] BepInEx 已起：保留 Mono 域常驻（不 cleanup —— 插件要等 Unity 切场景才加载）");
-        /* [R56] 只有真的加载了 BepInEx.Unity.IL2CPP（有 image）才登记 domain：
-           dobby detour 失败不影响 chainloader 实例（Initialize 里 set_Instance 在
-           TryLoad/detour 之前已完成，R55 真机已打印 Chainloader initialized）。
-           放行 Unity 后由主线程主动调 NebulaManualExecute() 顶替 detour 的延迟触发。 */
-        if (g_r56_il2cpp_img) {
-            g_r56_domain = domain;
-            hlog("[host][r56] 已登记 Mono domain + BepInEx image，准备主线程主动触发 Execute()");
+    // [R43 关键] BepInEx 起来后【绝不】mono_jit_cleanup：BepInEx 6 IL2CPP 的插件加载
+    // 不在 Preloader 里发生，要等 Unity 跑起来、首次切场景时 il2cpp_runtime_invoke 命中
+    // 才触发，Mono 域必须活到那时（详见上方 R43 注释）。
+    // [R70] bepinex 路径：domain 保留、keep/cleanup 与 Start() 一起移交 boot() 主线程处理，
+    //   此处不做 cleanup（否则主线程还没跑 Start 就把域拆了）。mods/engine 路径沿用旧逻辑。
+    if (!g_boot_setup_done) {
+        if (ok) {
+            hlog("[host] 模组路径已起：保留 Mono 域常驻（不 cleanup）");
+            if (g_r56_il2cpp_img) {
+                g_r56_domain = domain;
+                hlog("[host][r56] 已登记 Mono domain + BepInEx image，准备主线程主动触发 Execute()");
+            } else {
+                hlog("[host][r56] !! 无 BepInEx image（走的不是 BepInEx 路径），跳过主动触发");
+            }
         } else {
-            hlog("[host][r56] !! 无 BepInEx image（走的不是 BepInEx 路径），跳过主动触发");
+            hlog("[host] 模组未成功：清理 Mono 域，交还游戏");
+            mono_jit_cleanup(domain);
         }
-    } else {
-        hlog("[host] BepInEx 未成功：清理 Mono 域，交还游戏");
-        mono_jit_cleanup(domain);
     }
     free(dir);
     return NULL;
@@ -3018,18 +2965,29 @@ static void boot(void) {
         pthread_join(t, NULL);
         hlog("[host] boot 阻塞结束，放行 Unity 继续加载（游戏与 NOS 一同加载）");
 
-        /* [R68] 主线程登记到 mono 域：本 on_load 构造器运行在 Unity 主线程，此处 attach 的正是
-           主线程，且早于 Unity 启动、时机正确。对 R56 手动执行路径（后续 dispatch_after 在主线程
-           跑 mono_runtime_invoke）有益——主线程提前登记，避免未登记线程跑托管代码损坏 GC 线程表。
-           注意：R67/R68 实测 dobby 官方 detour 路径的 didFinishLaunching 后崩（UnitySendMessage →
-           operator delete）在补完此 attach 后【崩点一字不差】，证明 dobby 路径的崩与线程登记无关，
-           是 Execute() 触发时机过早（didFinishLaunching 极早期）所致；该路径已由 R69 降级为可选项。 */
-        if (g_r56_domain) {
+        /* [R70] bepinex 路径：主线程先 mono_thread_attach 到域，再跑 Start()
+           （GC root，规避裸 pthread 上 MonoMod trampoline 生成引发的 coop sgen 崩；
+           R56 已验证「主线程 attach + mono_runtime_invoke」组合能跑到 Innersloth）。
+           attach 必须在 boot_bepinex 之前。非 bepinex 路径沿用 R68：仅登记主线程。 */
+        if (g_boot_setup_done && g_boot_domain) {
+            extern void mono_thread_attach(MonoDomain *d);
+            mono_thread_attach(g_boot_domain);
+            hlog("[host][r70] 主线程已 mono_thread_attach（准备在主线程跑 Start()）");
+            int ok = boot_bepinex(g_boot_domain, g_boot_root);
+            hlog("[host][r70] 主线程 boot_bepinex -> %d", ok);
+            if (ok) {
+                hlog("[host] BepInEx 已起(主线程)：保留 Mono 域常驻（不 cleanup）");
+            } else {
+                hlog("[host] BepInEx 未成功(主线程)：清理 Mono 域");
+                mono_jit_cleanup(g_boot_domain);
+            }
+            free(g_boot_root); g_boot_root = NULL;
+        } else if (g_r56_domain) {
             extern void mono_thread_attach(MonoDomain *d);
             mono_thread_attach(g_r56_domain);
-            hlog("[host][r68] 主线程已 mono_thread_attach（R56 手动路径提前登记，规避未登记线程跑托管代码）");
+            hlog("[host][r68] 主线程已 mono_thread_attach（非 bepinex 路径）");
         } else {
-            hlog("[host][r68] 主线程 attach 跳过：g_r56_domain 为空（无 BepInEx，无 detour）");
+            hlog("[host][r68] 主线程 attach 跳过：无 BepInEx 域");
         }
 
         /* [R56] 派发点必须在 pthread_join 之后：此时 boot_thread 已结束、domain/image
