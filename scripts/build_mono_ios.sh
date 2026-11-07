@@ -38,7 +38,7 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-32}"
+CACHE_VERSION="${CACHE_VERSION:-33}"   # R76: 全程 RWX 诊断（注入 mono-mmap.c 的 set_write noflip 分支变了，强制重编）
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -348,6 +348,13 @@ if mm:
         'typedef void (*neb_jit_toggle_fn) (int);\n'
         'static neb_jit_toggle_fn neb_jit_toggle = NULL;  /* pthread_jit_write_protect_np */\n'
         'static int neb_wx_level = 0;             /* 嵌套层级（镜像上游 write_level_tls_id） */\n'
+        '/* [R76 诊断] 全程 RWX：1=不翻转（页面恒 R/W/X，消除多线程进程级翻转竞态），\n'
+        '   0=回 R75 基线（set_write 在 RW <-> R-X 间翻）。环境变量 NEBULA_WX_NOFLIP 覆盖。\n'
+        '   动机：阶段B NebulaManualExecute 起线程池 worker（Task:Start ->\n'
+        '   PortableThreadPool:RequestWorker）时崩在 mono_jit_runtime_invoke，栈顶\n'
+        '   libsystem_platform(写/执行 JIT 码)。进程级 mprotect 翻掉 EXEC 的窗口里，\n'
+        '   另一线程执行该页即 SIGSEGV。全程 RWX 是判断「翻转是否元凶」的对照实验。*/\n'
+        'static int neb_wx_noflip = 1;\n'
         '\n'
         '/* [Nebula iOS] 内存操作追踪：mono 侧 JIT 页 mmap/mprotect/翻转全部落盘，\n'
         '   进程被 SIGKILL（无 .ips 无 signal handler 输出）时，本文件最后一行即死前\n'
@@ -416,7 +423,9 @@ if mm:
         '\t}\n'
         '\tint _flags = 0;\n'
         '\tneb_wx_debugger = (csops (getpid (), CS_OPS_STATUS, &_flags, sizeof (_flags)) == 0 && (_flags & CS_DEBUGGED)) ? 1 : 0;\n'
-        '\tneb_wx_log ("wx-init jit_toggle=%s dbg=%d", neb_jit_toggle ? "yes" : "no", neb_wx_debugger);\n'
+        '\t/* [R76 诊断] NEBULA_WX_NOFLIP 默认 1（全程 RWX 实验）；设 0 回 R75 翻转基线对照 */\n'
+        '\t{ const char *_nf = getenv ("NEBULA_WX_NOFLIP"); if (_nf && *_nf) neb_wx_noflip = atoi (_nf) ? 1 : 0; }\n'
+        '\tneb_wx_log ("wx-init jit_toggle=%s dbg=%d noflip=%d", neb_jit_toggle ? "yes" : "no", neb_wx_debugger, neb_wx_noflip);\n'
         '}\n'
         '\n'
         'static void\n'
@@ -489,6 +498,23 @@ if mm:
         '\t   秒杀（16 轮 set_write 只是写代码没真执行，真正执行即崩）。host 冒烟已实证\n'
         '\t   路线 F（mprotect R-X + icache 后执行 OK，循环折磨 OK），故不再区分调试态，\n'
         '\t   全线每页 mprotect 翻转。 */\n'
+        '\t/* [R76 诊断] 全程 RWX：JIT 页在 mono_valloc 时已按 prot=RWX(7) 分配，\n'
+        '\t   这里【完全不翻转】——不 mprotect 掉 EXEC、也不 mprotect 掉 WRITE，\n'
+        '\t   消除「一线程编译时把全局 JIT 区翻 RW(无 EXEC) / 另一线程同时执行\n'
+        '\t   该页代码」的进程级竞态（阶段B 起线程池 worker 时最易触发）。\n'
+        '\t   writable=0(disable) 时仅 sys_icache_invalidate 保证新写码可见。\n'
+        '\t   NEBULA_WX_NOFLIP=0 可回下方 R75 翻转基线做对照。 */\n'
+        '\tif (neb_wx_noflip) {\n'
+        '\t\tif (!writable) {\n'
+        '\t\t\tfor (int i = 0; i < neb_wx_nregions; i++) {\n'
+        '\t\t\t\tif (!neb_wx_regions [i].active) continue;\n'
+        '\t\t\t\tsys_icache_invalidate (neb_wx_regions [i].addr, neb_wx_regions [i].len);\n'
+        '\t\t\t}\n'
+        '\t\t}\n'
+        '\t\tneb_wx_log ("set_write(%d) [R76 noflip] skip mprotect n=%d", writable, neb_wx_nregions);\n'
+        '\t\tpthread_mutex_unlock (&neb_wx_mutex);\n'
+        '\t\treturn;\n'
+        '\t}\n'
         '\tif (writable) {\n'
         '\t\tneb_wx_wc++;\n'
         '\t\tif (neb_wx_wc == 1) {\n'
