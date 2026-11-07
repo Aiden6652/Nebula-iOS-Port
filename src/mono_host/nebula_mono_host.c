@@ -2757,12 +2757,12 @@ static void *boot_thread_impl(void *arg) {
         g_boot_root   = strdup(root);
         g_boot_setup_done = 1;
     }
-    if (!ok && !g_boot_setup_done && (auto_mode || !strcmp(bm, "mods"))) {
+    if (!ok && (auto_mode || !strcmp(bm, "mods"))) {
         hlog("[host] step: boot_mods_dir enter");
         ok = boot_mods_dir(domain, root);
         hlog("[host] step: boot_mods_dir -> %d", ok);
     }
-    if (!ok && !g_boot_setup_done && (auto_mode || !strcmp(bm, "engine"))) {
+    if (!ok && (auto_mode || !strcmp(bm, "engine"))) {
         hlog("[host] step: boot_engine_poc enter");
         ok = boot_engine_poc(domain, dir);
         hlog("[host] step: boot_engine_poc -> %d", ok);
