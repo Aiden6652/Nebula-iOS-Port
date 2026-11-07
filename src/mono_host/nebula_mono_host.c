@@ -2833,10 +2833,15 @@ static void *boot_thread_impl(void *arg) {
     return NULL;
 }
 
-/* 包装层：不论 impl 从哪条 return 退出都置完成标志，避免逐条返回点去改 */
+/* 包装层：不论 impl 从哪条 return 退出都置完成标志，避免逐条返回点去改。
+   [R74] bepinex 路径(g_boot_setup_done==1)的放行权【不再】在这里给：
+   交给主队列 Start 块（Start()+JIT 预热完成后才置位），保证 on_load 返回
+   （Unity 起来）前 Start() 与 JIT 预热已全部完成。
+   非 bepinex 路径(R56/R68)保持旧行为：boot_thread 结束即可放行。 */
 static void *boot_thread(void *arg) {
     void *r = boot_thread_impl(arg);
-    g_boot_complete = 1;
+    if (!g_boot_setup_done)
+        g_boot_complete = 1;
     return r;
 }
 
@@ -2871,8 +2876,12 @@ static void *boot_thread(void *arg) {
  *   - Mono 域是 boot_thread 里 mono_jit_init 的，主线程默认未 attach，故先
  *     mono_thread_attach() 再 mono_runtime_invoke()。
  *
- * 【延迟】默认 4000ms（NEBULA_EXEC_DELAY_MS 可调，0~60000），从 boot() 放行
- *   Unity 起算，覆盖 didFinishLaunching / il2cpp_init / 首个场景加载。
+ * 【延迟】默认 4000ms（NEBULA_EXEC_DELAY_MS 可调，0~60000）。
+ *   [R74 语义] 这是「Start() 主队列派发」的延迟，期间 on_load 仍被 boot() 的
+ *   while(g_boot_complete) 卡住、Unity 尚未放行。故延迟越大 = on_load 卡越久 =
+ *   给 Start()+JIT 预热越充裕的时间，且保证「Unity 起来前 Start 与预热必已完成」
+ *   （g_boot_complete 现改在预热后于主队列块内置位，见下）。旧注释「等 Unity 起来后
+ *   跑」已失效——R74 后 Unity 是在预热完成后才被放行的。
  * ==========================================================================*/
 static int64_t nebula_r56_delay_ms(void) {
     const char *e = getenv("NEBULA_EXEC_DELAY_MS");
@@ -3120,6 +3129,14 @@ static void boot(void) {
                    必须在下面阶段B（挂 dobby + NebulaManualExecute 起线程池 worker）之前
                    完成，让新线程执行已编译代码、不再首次 JIT 崩。 */
                 nebula_prewarm_jit();
+                /* [R74] 关键修正：JIT 预热完成后才放行 Unity（置 g_boot_complete=1）。
+                   此刻仍在 on_load 返回前的主线程安全窗口，boot() 的 while 随即退出
+                   → on_load 返回 → iOS 启动 Unity。从而保证「Unity 执行任何托管代码之前，
+                   Start() 与 JIT 预热已全部完成」，彻底消除旧实现「Unity 早放行数秒、
+                   预热迟到失效」的窗口（用户实锤：水印显示期间已能听见 Innersloth 声音，
+                   说明 Unity 裸奔时预热还没跑）。阶段B 装插件仍在放行后（Unity 已起）跑。 */
+                g_boot_complete = 1;
+                hlog("[host][r74] JIT 预热完成，放行 Unity（on_load 即将返回，Unity 启动前已预热）");
                 /* [R72] 阶段B：Start() 已返回、chainloader Instance 已建立、Unity 已就绪，
                    真正要【装插件】了 —— 这一刻才【手动启动 dobby】：补上 dllmap，让插件 /
                    Il2CppInterop 若需要 detour 能装上。用户方案：dobby 只在装插件阶段可用，
