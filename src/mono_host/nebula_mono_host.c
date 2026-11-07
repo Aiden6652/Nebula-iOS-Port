@@ -2602,6 +2602,7 @@ static void *boot_thread_impl(void *arg) {
         if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.txt", gd);             log_try(p); }
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
+        hlog("[host][r78] ===== 版本标记 R78：BepInEx IL 补丁已装（Parallel.ForEach -> NebulaSequential.ForEach 顺序加载，零 worker）=====");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -3004,6 +3005,7 @@ static void nebula_prewarm_jit(void) {
 
 static void nebula_r56_invoke_manual_execute(void) {
     printf("[host][r56] ===== Unity 主线程触发开始 =====\n");
+    printf("[host][r78] 阶段B：应为【顺序预加载】（Il2CppInteropManager.PreloadInteropAssemblies 已打 IL 补丁，无 Parallel.ForEach / 无线程池 worker）\n");
     fflush(NULL);
     if (!g_r56_domain || !g_r56_il2cpp_img) {
         printf("[host][r56] !! domain/image 为空，放弃触发\n");
@@ -3016,6 +3018,17 @@ static void nebula_r56_invoke_manual_execute(void) {
     mono_thread_attach(g_r56_domain);
     printf("[host][r56] mono_thread_attach 完成\n");
     fflush(NULL);
+
+    /* [R78] 运行时校验：确认补丁版 BepInEx DLL 真被加载（而不是 app bundle 里
+       的旧散文件盖掉了 blob）。NebulaSequential 是 R78 IL 补丁新注入的类型。 */
+    {
+        MonoClass *seqchk = mono_class_from_name(g_r56_il2cpp_img,
+            "BepInEx.Unity.IL2CPP", "NebulaSequential");
+        printf("[host][r78] 补丁校验：NebulaSequential 类型 %s —— %s\n",
+               seqchk ? "存在" : "不存在",
+               seqchk ? "顺序预加载 IL 补丁已生效" : "!! 仍是旧 DLL（app bundle 散文件覆盖 blob？）");
+        fflush(NULL);
+    }
 
     MonoClass *k = mono_class_from_name(g_r56_il2cpp_img,
                                         "BepInEx.Unity.IL2CPP", "IL2CPPChainloader");
