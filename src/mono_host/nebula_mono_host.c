@@ -2475,6 +2475,22 @@ int SystemNative_IsATty(int fd) {
     return 0;   /* 非 tty：Console 认为输出已重定向，写文件/空设备不崩 */
 }
 
+/* [R72] 手动启动 dobby：把 dobby/libdobby/dobby.dll 的 dllmap 指向主 dylib 自身，
+   使 DllImport("dobby") 命中静态链进来的 DobbyHook（iOS arm64 单文件方案）。
+   关键：只在「装插件阶段」(NebulaManualExecute 之前) 调用，初始化阶段绝不调用 ——
+   见 nebula_setup_native_dllmaps 里 [R72] 的长注释。 */
+static void nebula_enable_dobby_dllmap(void) {
+    const char *self = nebula_r60_self_path();
+    if (nebula_r60_has_symbol("DobbyHook") && self) {
+        static const char *dobby_names[] = { "dobby", "libdobby", "dobby.dll", NULL };
+        for (int i = 0; dobby_names[i]; i++)
+            mono_dllmap_insert(NULL, dobby_names[i], NULL, self, NULL);
+        hlog("[host][r72] 手动启动 dobby：dllmap dobby -> %s（装插件阶段的 detour 现在可用）", self);
+    } else {
+        hlog("[host][r72] !! DobbyHook 符号缺失，dobby 仍不可用（插件 detour 会 DllNotFound）");
+    }
+}
+
 /* [Nebula iOS 第二十轮] 用 mono_dllmap_insert 把 .NET 8 CoreLib 的 P/Invoke
    原生库名（libSystem.Native 等）重映射到 iOS 版 shim。
    [R60] 改造：dobby + 5 个 libSystem.* 全部【静态链进主 dylib】，dllmap 一律
@@ -2494,16 +2510,20 @@ static void nebula_setup_native_dllmaps(const char *appdir)
 
     const char *self = nebula_r60_self_path();
 
-    /* ---- 1) dobby：修「播完 Innersloth 后崩」的根因 ---- */
+    /* ---- 1) dobby：[R72] 初始化阶段【故意不挂】 ----
+       R60 把 dobby 静态并入并在此 dllmap 挂上后，IL2CPPChainloader.Initialize 的
+       INativeDetour.CreateAndApply → GenerateTrampoline → GenerateNativeProxy →
+       FlushICache 会首次 JIT 编译含 ldstr 的托管方法 → coop sgen 的
+       sgen_try_alloc_obj_nolock SIGSEGV（R60~R71 六轮补丁/换线程崩点一字不差）。
+       R56 能跑到 Innersloth 恰恰因为 dobby DllNotFound：DobbyDetour.PrepareImpl
+       直接抛 System.DllNotFoundException，不生成 trampoline、不触发那次 JIT，
+       Preloader 异常被 Doorstop 吞掉而 chainloader Instance 仍在。
+       故这里【只】挪走 Windows PE 的 core/dobby.dll（让 DllImport("dobby") 干净
+       DllNotFound），真正的 dobby dllmap 延后到「装插件阶段」由
+       nebula_enable_dobby_dllmap() 手动启动 —— 用户方案：先跳过 dobby 让初始化
+       不崩，装插件时再手动挂上让插件的 detour 可用。 */
     nebula_r60_quarantine_win_dobby();
-    if (nebula_r60_has_symbol("DobbyHook") && self) {
-        static const char *dobby_names[] = { "dobby", "libdobby", "dobby.dll", NULL };
-        for (int i = 0; dobby_names[i]; i++)
-            mono_dllmap_insert(NULL, dobby_names[i], NULL, self, NULL);
-        hlog("[host][r60] dllmap: dobby -> %s（iOS arm64 Dobby 已静态并入主 dylib，chainloader 不再 DllNotFound）", self);
-    } else {
-        hlog("[host][r60] !! 主 dylib 未导出 DobbyHook —— BepInEx 仍会 DllNotFoundException: dobby");
-    }
+    hlog("[host][r72] 初始化阶段跳过 dobby dllmap：让 DobbyDetour.PrepareImpl DllNotFound，避开 GenerateTrampoline 的 ldstr JIT 崩；装插件时再手动启动");
 
     /* ---- 1.5) nebula_jit：R62 detour 内存翻转原生函数（vm_protect/mprotect + icache）---- */
     if (self) {
@@ -2981,15 +3001,32 @@ static void boot(void) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)nebula_r56_delay_ms() * NSEC_PER_MSEC),
                            dispatch_get_main_queue(), ^{
                 mono_thread_attach(g_boot_domain);
-                hlog("[host][r71] 主队列跑 Start()（真实主线程 post-load，规避 on_load 阶段 sgen 崩）");
+                /* [R72] 阶段A：跑 Start()（Doorstop→Preloader→IL2CPPChainloader.Initialize）。
+                   此刻 dobby 的 dllmap 故意【没挂】→ DobbyDetour.PrepareImpl 抛
+                   DllNotFoundException → 不生成 trampoline、不触发 FlushICache 的
+                   ldstr JIT → 绕过 R60~R71 一直没躲开的 sgen_try_alloc_obj_nolock 崩。
+                   R56 实证：detour 装不上时 Doorstop 吞异常、chainloader Instance 仍在，
+                   Unity 照常起、Innersloth 照常播。 */
+                hlog("[host][r72] 阶段A: 主队列跑 Start()（post-load 真实主线程；dobby 未挂，Initialize 不生成 trampoline）");
                 int ok = boot_bepinex(g_boot_domain, g_boot_root);
-                hlog("[host][r71] 主队列 boot_bepinex -> %d", ok);
+                hlog("[host][r72] 阶段A: 主队列 boot_bepinex(Start) -> %d", ok);
                 if (ok) {
-                    hlog("[host] BepInEx 已起(主队列)：保留 Mono 域常驻（不 cleanup）");
+                    hlog("[host][r72] BepInEx 已起：保留 Mono 域常驻（不 cleanup）");
                 } else {
-                    hlog("[host] BepInEx 未成功(主队列)：清理 Mono 域");
-                    mono_jit_cleanup(g_boot_domain);
+                    hlog("[host][r72] BepInEx 未成功：仍不 cleanup（Preloader 异常被 Doorstop 吞掉时 ok=0 也可能有 Instance）");
                 }
+                /* [R72] 阶段B：Start() 已返回、chainloader Instance 已建立、Unity 已就绪，
+                   真正要【装插件】了 —— 这一刻才【手动启动 dobby】：补上 dllmap，让插件 /
+                   Il2CppInterop 若需要 detour 能装上。用户方案：dobby 只在装插件阶段可用，
+                   从最脆弱的 Initialize 阶段挪开。装插件走 R56 的纯 managed
+                   NebulaManualExecute（PreloadInteropAssemblies + Execute 扫 plugins 加载 NOS）。 */
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    nebula_enable_dobby_dllmap();           // 手动启动 dobby
+                    g_r56_domain = g_boot_domain;           // 手动 Execute 依赖（boot_bepinex 已设 g_r56_il2cpp_img）
+                    hlog("[host][r72] 阶段B: dobby 已手动启动 + g_r56_domain 已登记，开始扫 plugins 装 NOS");
+                    nebula_r56_invoke_manual_execute();
+                });
                 free(g_boot_root); g_boot_root = NULL;
             });
             bepinex_dispatched = 1;
@@ -3014,12 +3051,13 @@ static void boot(void) {
            若设备端 dobby inline hook 因 code signing 失败导致 detour 没装上，
            可设 NEBULA_FORCE_MANUAL_EXECUTE=1 恢复旧兜底做对照。 */
         {
-            /* [R71] bepinex 路径已通过上方主队列派发接管 Start()（chainloader 官方路径，
-               含 trampoline 装钩），这里不能再跑 R56 手动 NebulaManualExecute，否则
-               BepInEx 双重初始化。仅当 bepinex 未接管（mods/engine 等无 BepInEx 域路径）
-               时才走下方手动/R69 派发兜底。 */
+            /* [R72] bepinex 路径已通过上方主队列派发分两阶段接管：
+               阶段A Start()（dobby 缺席，不生成 trampoline）+ 阶段B 手动启动 dobby 后
+               NebulaManualExecute 装插件。这里不能再重复派发一次 Execute，否则 BepInEx
+               双重初始化。仅当 bepinex 未接管（mods/engine 等无 BepInEx 域路径）时才走
+               下方手动/R69 派发兜底。 */
             if (bepinex_dispatched) {
-                hlog("[host][r71] bepinex 已接管 Start()，跳过 R56/R69 手动派发兜底（避免双重初始化）");
+                hlog("[host][r72] bepinex 已两阶段接管(Start→手动dob→Execute)，跳过此处独立派发（避免双重初始化）");
             } else {
             /* [R69] 切回默认 R56 手动执行路径。根因校准：R67/R68 的 didFinishLaunching
                后 SIGSEGV（UnitySendMessage → operator delete，mono fault address 为空）
