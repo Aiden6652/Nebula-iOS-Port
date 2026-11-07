@@ -2635,12 +2635,14 @@ static void *boot_thread_impl(void *arg) {
     neb_install_mach_trap();   // [第十五轮] thread 级 mach 端口：先于 BSD signal 抓真实 fault 地址
 #endif
 
-    // [R60] 启动画面：无条件强制播放 "AUI Mod Loader by Aiden" 满 3 秒。
-    //   ① 不再是「正在生成interop」占位 —— R60 设备端永不生成 interop，
-    //      那个文案会误导；② 用户明确要求每次启动强制播放 3s 品牌页；
+    // [R73] 启动画面：无条件强制播放 "AUI Mod Loader by Aiden" 满 5 秒（原 R60 = 3s）。
+    //   ① 不再是「正在生成interop」占位 —— R60 设备端永不生成 interop，那个文案会误导；
+    //   ② 用户 R73 明确要求拉到 5s，给「主线程 JIT 预热」留安全窗口：阶段A(Start)
+    //      成功返回后由宿主主线程把装插件链路方法提前 mono_compile_method 编好，
+    //      让阶段B 新起的托管线程执行已编译代码、不再首次 JIT 崩；
     //   ③ 最短展示时长由 boot_overlay.m 内部把关，Nebula 就绪信号也不得提前销毁。
     //   窗口可能还没起来，内部带重试；30s 安全超时兜底销毁（绝不卡屏）。
-    hlog("[host][r60] 启动画面：强制播放 3s AUI Mod Loader by Aiden");
+    hlog("[host][r73] 启动画面：强制播放 5s AUI Mod Loader by Aiden（预留主线程 JIT 预热窗口）");
     nebula_show_boot_overlay();
 
     // 大小写回退必须在知道游戏根目录后装（只对它生效），且默认关闭
@@ -2789,11 +2791,11 @@ static void *boot_thread_impl(void *arg) {
     }
     if (!ok && !g_boot_setup_done) hlog("[host] !! 没有任何启动路径成功");
 
-    // [R60] 启动画面收尾：请求销毁即可，boot_overlay.m 内部按「首次显示时间戳」
-    //   强制满 3 秒才真正移除（Nebula 就绪信号也不得提前销毁）。这里默认 3000ms
-    //   与之对齐；安全超时(默认30s)在 boot_overlay.m 内兜底。
+    // [R73] 启动画面收尾：请求销毁即可，boot_overlay.m 内部按「首次显示时间戳」
+    //   强制满 5 秒才真正移除（Nebula 就绪信号也不得提前销毁，覆盖 JIT 预热窗口）。
+    //   这里默认 5000ms 与之对齐；安全超时(默认30s)在 boot_overlay.m 内兜底。
     {
-        int hold = 3000;
+        int hold = 5000;
         const char *he = getenv("NEBULA_BOOT_OVERLAY_HOLD_MS");
         if (he && *he) { int v = atoi(he); if (v >= 0) hold = v; }
         if (hold > 0) {
@@ -2879,6 +2881,103 @@ static int64_t nebula_r56_delay_ms(void) {
     if (v < 0) v = 0;
     if (v > 60000) v = 60000;
     return (int64_t)v;
+}
+
+/* ==========================================================================
+ * [R73] 主线程 JIT 预热（用户方案：AUI 品牌页 5s 期间把装插件链路提前编译）
+ *
+ * 根因（R72 真机 nebula_host.txt 1442~1457）：阶段A Start() 成功、游戏进主菜单后，
+ *   阶段B NebulaManualExecute 内部【新起的托管线程】首次 mono_jit_runtime_invoke 崩：
+ *     栈顶 libsystem_platform <redacted>（写/执行 JIT 机器码），
+ *     fault PC 0x166bb15f8 = arm64 函数序言；栈底 start_wrapper → _pthread_start。
+ *   崩前刚加载 System.Threading.Tasks.Parallel.dll —— PreloadInteropAssemblies 用
+ *   Parallel.ForEach 并行加载 interop，线程池 worker 首次 JIT 触发 iOS W^X/codegen 崩。
+ *
+ * 关键实证：冒烟 CS_DEBUGGED=1、路线 F/G 全通，且阶段A 的 Start() 在【主线程 +
+ *   已 mono_thread_attach】跑通整个 Preloader、编译了海量含 ldstr 的方法都没崩 ——
+ *   说明「主线程」JIT 是安全的，坏的只是「新线程首次 JIT」。
+ *
+ * 修法：在阶段A Start() 成功返回后的【同一主线程安全窗口】，把这条链路会首次 JIT
+ *   的方法全部 mono_compile_method 预编译（含 IL2CPPChainloader 里 Parallel.ForEach
+ *   的编译器生成 lambda body、以及 corlib 的 Task/ThreadPool/Thread worker 方法）。
+ *   之后阶段B 即便起新线程，执行的也是已编译代码，不再走首次 JIT 崩点。
+ *
+ * 安全：纯 managed 编译、不执行、不碰 dobby（阶段B 才挂）；COOP/GC 全在主线程一致态。
+ *   只遍历少量关键类、限量（默认 1500 方法，几百 ms 完成），不会卡主线程触发看门狗。
+ *   所有预热用到的新 API 用函数内 extern 声明，不 include 任何新头（R70 教训：
+ *   debug-helpers.h 引入 typedef 冲突 / undeclared / 不完整结构体 → CI 编译失败）。
+ * 开关：NEBULA_PREWARM_JIT=0 关闭（回到 R72 基线做对照）；NEBULA_PREWARM_MAX 限量。
+ * ==========================================================================*/
+static void nebula_prewarm_jit(void) {
+    const char *off = getenv("NEBULA_PREWARM_JIT");
+    if (off && !strcmp(off, "0")) {
+        hlog("[host][r73] JIT 预热已关闭（NEBULA_PREWARM_JIT=0，R72 基线对照）");
+        return;
+    }
+    /* 函数内 extern：iOS 自定义 mono 头未必声明，避免依赖头文件声明（同 mono_thread_attach 处理） */
+    extern void       *mono_compile_method  (MonoMethod *method);
+    extern MonoMethod *mono_class_get_methods (MonoClass *klass, void **iter);
+    extern MonoImage  *mono_get_corlib      (void);
+
+    int maxn = 1500;
+    const char *mx = getenv("NEBULA_PREWARM_MAX");
+    if (mx && *mx) { int v = atoi(mx); if (v > 0) maxn = v; }
+
+    MonoImage *corlib = mono_get_corlib();
+    /* (是否用 BepInEx image, 命名空间, 类名)。use_il2cpp=0 → corlib。
+       IL2CPPChainloader 最关键：Parallel.ForEach 的 lambda body 就编译在这个类里。*/
+    struct pw_target { int use_il2cpp; const char *ns; const char *name; };
+    static const struct pw_target tg[] = {
+        { 1, "BepInEx.Unity.IL2CPP",   "IL2CPPChainloader" },
+        { 1, "BepInEx.Unity.IL2CPP",   "Preloader" },
+        { 0, "System.Threading.Tasks", "Task" },
+        { 0, "System.Threading.Tasks", "Parallel" },
+        { 0, "System.Threading",       "ThreadPool" },
+        { 0, "System.Threading",       "Thread" },
+        { 0, "System.Threading",       "Monitor" },
+    };
+    const int ntg = (int)(sizeof(tg) / sizeof(tg[0]));
+
+    int total = 0, ok = 0, fail = 0;
+    hlog("[host][r73] ===== 主线程 JIT 预热开始（上限 %d 方法，dobby 未挂 / GC 主线程一致态）=====", maxn);
+    for (int i = 0; i < ntg && total < maxn; i++) {
+        MonoImage *img = tg[i].use_il2cpp ? g_r56_il2cpp_img : corlib;
+        if (!img) continue;
+        MonoClass *k = mono_class_from_name(img, tg[i].ns, tg[i].name);
+        if (!k) {
+            hlog("[host][r73]   跳过 %s.%s（类未加载，正常）", tg[i].ns, tg[i].name);
+            continue;
+        }
+        void *iter = NULL;
+        MonoMethod *m = NULL;
+        int c = 0, cok = 0;
+        while (total < maxn && (m = mono_class_get_methods(k, &iter)) != NULL) {
+            total++;
+            c++;
+            /* mono_compile_method 对泛型/抽象/pinvoke/icall 返回 NULL，属正常跳过 */
+            if (mono_compile_method(m)) { ok++; cok++; } else { fail++; }
+        }
+        hlog("[host][r73]   %s.%s：遍历 %d 方法，编译成功 %d", tg[i].ns, tg[i].name, c, cok);
+    }
+    /* [R73] 直击 R72 崩点：start_wrapper → mono_runtime_invoke_checked →
+       mono_jit_runtime_invoke（新线程首次生成 runtime_invoke trampoline 时崩）。
+       mono_compile_method 只编译方法体、不生成 invoke trampoline，故在主线程
+       主动 mono_runtime_invoke 一次「静态 void 无参」的 corlib 方法，把通用
+       runtime_invoke trampoline 也预生成/缓存掉，尽量让新线程命中缓存、不再 JIT。*/
+    {
+        MonoImage *cl = mono_get_corlib();
+        MonoClass *tk = cl ? mono_class_from_name(cl, "System.Threading", "Thread") : NULL;
+        MonoMethod *mb = tk ? mono_class_get_method_from_name(tk, "MemoryBarrier", 0) : NULL;
+        if (mb) {
+            MonoObject *exc2 = NULL;
+            mono_runtime_invoke(mb, NULL, NULL, &exc2);
+            hlog("[host][r73]   runtime_invoke trampoline 预热：Thread.MemoryBarrier() %s",
+                 exc2 ? "抛异常(已忽略)" : "OK");
+        } else {
+            hlog("[host][r73]   runtime_invoke trampoline 预热跳过：找不到 Thread.MemoryBarrier()");
+        }
+    }
+    hlog("[host][r73] ===== JIT 预热完成：共 %d 方法，编译成功 %d，跳过 %d =====", total, ok, fail);
 }
 
 static void nebula_r56_invoke_manual_execute(void) {
@@ -3015,6 +3114,12 @@ static void boot(void) {
                 } else {
                     hlog("[host][r72] BepInEx 未成功：仍不 cleanup（Preloader 异常被 Doorstop 吞掉时 ok=0 也可能有 Instance）");
                 }
+                /* [R73] 关键：Start() 已成功返回、BepInEx/corlib 程序集全部就位、
+                   g_r56_il2cpp_img 已设置，且此刻仍在【同一条主线程 + 已 attach】的安全
+                   窗口、水印 5s 覆盖期内 —— 立刻把装插件链路的方法全部预编译。
+                   必须在下面阶段B（挂 dobby + NebulaManualExecute 起线程池 worker）之前
+                   完成，让新线程执行已编译代码、不再首次 JIT 崩。 */
+                nebula_prewarm_jit();
                 /* [R72] 阶段B：Start() 已返回、chainloader Instance 已建立、Unity 已就绪，
                    真正要【装插件】了 —— 这一刻才【手动启动 dobby】：补上 dllmap，让插件 /
                    Il2CppInterop 若需要 detour 能装上。用户方案：dobby 只在装插件阶段可用，

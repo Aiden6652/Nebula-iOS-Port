@@ -1,14 +1,16 @@
 /*
- * boot_overlay.m — [R60] 启动品牌页「AUI Mod Loader by Aiden」，强制播放 3 秒
+ * boot_overlay.m — [R60] 启动品牌页「AUI Mod Loader by Aiden」，[R73] 强制播放 5 秒
  *
  * 背景：R58/R59 的「正在生成interop...」占位在 R60 已彻底废除 —— 设备端永不生成
  * interop（131 个 iOS 桥接 dll 由主 dylib 内嵌、启动自动释放到 BepInEx/interop/）。
- * 用户明确要求：每次启动强制播放 "AUI Mod Loader by Aiden" 满 3 秒。
+ * [R73] 用户要求：每次启动强制播放 "AUI Mod Loader by Aiden" 满 5 秒（原 R60 是 3s），
+ *   给「主线程 JIT 预热」留一段安全窗口 —— 阶段A(Start) 成功后由主线程把装插件
+ *   链路的托管方法提前 mono_compile_method 编好，避免阶段B 新线程首次 JIT 崩。
  *
  * 做法（纯 UIKit，不碰 Unity 任何 Canvas / 委托链路，避免注入崩溃）：
  *   - 在 App 的 UIWindow 上叠一层黑底 + 居中白字（窗口早期未就绪则 GCD 重试安装）
- *   - 首次显示起算 3 秒内，任何 hide / signal_ready 请求都只登记、不真正销毁，
- *     由主队列保活定时器在满 3s 时移除 —— 即「强制播放」，Nebula 就绪也不得提前销毁
+ *   - 首次显示起算 5 秒内，任何 hide / signal_ready 请求都只登记、不真正销毁，
+ *     由主队列保活定时器在满 5s 时移除 —— 即「强制播放」，Nebula 就绪也不得提前销毁
  *   - 保活定时器每 100ms 打在主队列上，主线程持续有事件，规避 iOS 看门狗误杀
  *   - 最迟 30s 安全兜底强行移除，绝不卡屏
  */
@@ -31,7 +33,7 @@ static volatile int g_boot_hide_pending = 0;
 static dispatch_source_t g_boot_timer     = NULL;
 static dispatch_source_t g_boot_keepalive = NULL;
 static double g_boot_shown_at = 0.0;         /* gettimeofday 秒，首次显示时刻 */
-static int    g_boot_min_ms   = 3000;        /* 强制最短展示时长 */
+static int    g_boot_min_ms   = 5000;        /* [R73] 强制最短展示时长 5s（原 R60 = 3000） */
 
 static double boot_now(void)
 {
@@ -83,7 +85,7 @@ static void boot_remove_label(void)
     }
 }
 
-/* 真正销毁（内部，绕过 3s 门槛；安全兜底与保活定时器满 3s 时调用） */
+/* 真正销毁（内部，绕过 5s 门槛；安全兜底与保活定时器满 5s 时调用） */
 static void boot_do_hide(void)
 {
     if (g_boot_done) return;
@@ -135,7 +137,7 @@ static void boot_install_label(void)
     }
 }
 
-/* 保活定时器：① 主线程持续有事件（规避看门狗）；② 满 3s 自动销毁品牌页 */
+/* 保活定时器：① 主线程持续有事件（规避看门狗）；② 满 5s 自动销毁品牌页 */
 static void boot_start_keepalive(void)
 {
     if (g_boot_keepalive || g_boot_done) return;
@@ -148,7 +150,7 @@ static void boot_start_keepalive(void)
     dispatch_source_set_event_handler(t, ^{
         if (g_boot_done) { boot_do_hide(); return; }
         if ((boot_now() - g_boot_shown_at) * 1000.0 >= (double)g_boot_min_ms) {
-            boot_do_hide();   /* 强制满 3s 才移除，与 g_boot_hide_pending 无关 */
+            boot_do_hide();   /* 强制满 5s 才移除，与 g_boot_hide_pending 无关 */
         }
     });
     dispatch_resume(t);
@@ -205,7 +207,7 @@ void nebula_show_boot_overlay(void)
     boot_arm_safety();
 }
 
-/* 请求销毁（可多次调用，幂等）。[R60] 只登记，满 3s 才真正移除。 */
+/* 请求销毁（可多次调用，幂等）。[R73] 只登记，满 5s 才真正移除。 */
 void nebula_hide_boot_overlay(void)
 {
     if (g_boot_done) return;
@@ -215,7 +217,7 @@ void nebula_hide_boot_overlay(void)
 }
 
 /* 托管侧（BepInEx / Nebula）就绪信号：DllImport("__Internal") 可直达。
-   [R60] 语义改为「登记就绪」，不再提前销毁品牌页（强制播满 3s）。 */
+   [R73] 语义改为「登记就绪」，不再提前销毁品牌页（强制播满 5s）。 */
 void nebula_signal_ready(void)
 {
     nebula_hide_boot_overlay();
