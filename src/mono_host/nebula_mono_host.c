@@ -183,9 +183,12 @@ static const blob_entry *blob_find(const char *aname) {
         //                  Il2CppInteropManager 用 Assembly.Load 按路径加载；
         //                  若在这里被简单名匹配抢走，会顶掉真正的桥接加载）
         //   native/      → CoreLib P/Invoke 的 iOS shim dylib（fallback 释放用）
+        //   plugin/      → [R82] BepInEx 插件（AUI.ServerScroll.dll），必须由磁盘
+        //                  插件扫描流程加载，绝不能被简单名匹配内存抢走
         if (!strncmp(full, "unity-libs/", 11) ||
             !strncmp(full, "interop/", 8)    ||
-            !strncmp(full, "native/", 7)) continue;
+            !strncmp(full, "native/", 7)    ||
+            !strncmp(full, "plugin/", 7)) continue;
         const char *bn = strrchr(full, '/');
         const char *en = bn ? bn + 1 : full;
         size_t EL = strlen(en); char ebase[512];
@@ -802,6 +805,37 @@ static int nebula_blob_extract_cecil_refs(const char *dest) {
     return written;
 }
 
+/* [R82] 把 blob 里 "plugin/" 前缀的 BepInEx 插件【强制覆盖】写到 plugins 目录。
+   与 nebula_blob_extract_dir 的「已存在且大小一致就跳过」不同：插件 DLL 换包时
+   内容会变但大小常常不变，跳过会让用户拿着旧 DLL 白测一轮。这里每次启动都覆盖，
+   文件只有几 KB，代价可忽略。绝不投 core/（那边会被 Cecil 当参考程序集，且
+   R80 明确 core 不能混进插件）。 */
+static int nebula_blob_extract_plugins(const char *dest) {
+    if (!g_n) return 0;
+    if (neb_mkdir_p(dest) != 0) {
+        printf("[host][r82] !! 建 plugins 目录失败: %s\n", dest);
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < g_n; i++) {
+        const char *nm = g_entries[i].name;
+        if (strncmp(nm, "plugin/", 7)) continue;
+        const char *bn = strrchr(nm, '/'); bn = bn ? bn + 1 : nm;
+        if (!*bn) continue;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", dest, bn);
+        FILE *f = fopen(p, "wb");
+        if (!f) { printf("[host][r82] !! 写插件失败: %s\n", p); continue; }
+        size_t w = fwrite(g_entries[i].data, 1, g_entries[i].size, f);
+        fclose(f);
+        if (w != g_entries[i].size) { printf("[host][r82] !! 插件写入不完整: %s\n", p); continue; }
+        printf("[host][r82] 滑动插件已落盘 -> %s (%u bytes)\n", p, g_entries[i].size);
+        n++;
+    }
+    if (!n) printf("[host][r82] !! blob 里没有 plugin/ 条目，滑动插件不会加载\n");
+    return n;
+}
+
 /* [R60] 取本 dylib 自身的绝对路径。
    dllmap 的 target 指向它：dlopen(自身) 会返回已加载镜像的 handle，随后 dlsym
    即可命中静态链进来的 DobbyHook / SystemNative_* 符号。这样所有原生库都住在
@@ -855,6 +889,12 @@ static void nebula_r60_extract_bundle(const char *root) {
     if (home && home[0]) {
         snprintf(dest, sizeof(dest), "%s/Documents/BepInEx/core", home);
         nebula_blob_extract_cecil_refs(dest);
+    }
+    // [R82] 服务器列表滑动插件 -> Documents/BepInEx/plugins（BepInEx 扫描目录）
+    //   每次覆盖写，保证换包立即生效；必须在 Start()/Execute() 扫 plugins 之前。
+    if (home && home[0]) {
+        snprintf(dest, sizeof(dest), "%s/Documents/BepInEx/plugins", home);
+        nebula_blob_extract_plugins(dest);
     }
 }
 
@@ -1324,7 +1364,27 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     // [R47] iOS 布局校正：交互前先把 GameAssembly/metadata 的真实位置纠正
     // （见 nebula_fix_il2cpp_paths 上方注释 —— 不改这两个路径，interop 必然生成失败）
     nebula_fix_il2cpp_paths(root);
-    chdir(root);
+    /* [R82] CWD 修正：chdir(root) 把 CWD 设成【只读】的 AmongUs.app，而
+       NOS/NebulaLoader 用相对路径 "BepInEx/nebula/Nebula.dll" 找程序集
+       （R81 真机日志 1731 "Assembly Is Not Found." 实锤），真文件在
+       HOME/Documents/BepInEx/nebula/Nebula.dll（33.9MB，日志 984）。
+       切到 Documents 后相对路径即可命中。BepInEx.Paths 已由
+       nebula_init_bepinex_paths 用绝对路径设好，Unity 资源也走 bundle
+       绝对路径，均不受 CWD 影响。NEBULA_CWD=root 可回退旧行为对照。 */
+    {
+        const char *home = getenv("HOME");
+        const char *cwdenv = getenv("NEBULA_CWD");
+        if (home && home[0] && (!cwdenv || strcmp(cwdenv, "root"))) {
+            char doc[PATH_MAX];
+            snprintf(doc, sizeof(doc), "%s/Documents", home);
+            if (chdir(doc) == 0)
+                printf("[host][r82] CWD -> %s（NOS 相对路径 BepInEx/nebula/Nebula.dll 可命中）\n", doc);
+            else { chdir(root); printf("[host][r82] !! chdir(Documents) 失败，回退 root\n"); }
+        } else {
+            chdir(root);
+            printf("[host][r82] CWD -> %s（NEBULA_CWD=root 或 HOME 空，保持旧行为）\n", root);
+        }
+    }
     nebula_init_bepinex_paths(domain, root);
     // 关键：在 BepInEx 接管前注入 NEBULA_IOS=1，触发 vendored BepInEx 的 Patch A
     // （Preloader.Core.PlatformUtils.SetPlatform 在 set_Current 前若检测到该 env=1，
@@ -2652,7 +2712,7 @@ static void *boot_thread_impl(void *arg) {
         if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.txt", gd);             log_try(p); }
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
-        hlog("[host][r81] ===== 版本标记 R81：反射对齐 Paths.ProcessName=Among Us，放行 BepInProcess 插件（修 NebulaLoader/NOS 被跳过）=====");
+        hlog("[host][r82] ===== 版本标记 R82：三刀 IL 补丁(禁 Harmony 堆栈 detour / 禁冗余 FlushICache / 进程过滤器恒放行) + 滑动插件 hook FillServerOptions + CWD 修 NOS 相对路径 =====");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -3053,80 +3113,50 @@ static void nebula_prewarm_jit(void) {
     hlog("[host][r73] ===== JIT 预热完成：共 %d 方法，编译成功 %d，跳过 %d =====", total, ok, fail);
 }
 
-/* [R81] 修 NOS 不加载真凶：BepInProcess("Among Us.exe") 进程过滤器在 iOS 上永远不匹配。
+/* [R82] 进程过滤器：改为【纯诊断】，不再硬编码修改 Paths.ProcessName。
  *
- * BaseChainloader`1.ModifyLoadOrder() 对每个插件的 BepInProcess 特性跑：
- *   filter.ProcessName.Replace(".exe","").Equals(Paths.ProcessName, IgnoreCase) == false
- * 再用 Enumerable.All 判定"全部不匹配" → 打印 "Skipping [...] because of process filters"
- * 并跳过该插件（日志 1162~1164 实锤）。
+ * 背景：BepInProcess("Among Us.exe") 过滤器在 iOS 上永远不匹配 —— 主可执行名
+ * 是 "AmongUs"（无空格），PC 插件声明归一化后是 "Among Us"（带空格）。
+ * R81 曾用反射把 Paths.ProcessName 硬编码设成 "Among Us"，但用户明确要求
+ * 「带不带空格都认，万一后面版本改成带空格的也要认」——硬编码做不到。
  *
- * iOS 主可执行名是 "AmongUs"（.../AmongUs.app/AmongUs），Paths.SetExecutablePath 用
- * GetFileNameWithoutExtension(exePath) 把 ProcessName 设成 "AmongUs"；而 PC 插件声明
- * "Among Us.exe" 归一化后是 "Among Us"（带空格）——二者永远不相等。于是
- * NebulaLoader（NOS 加载器）/ AutoSave / GamePatch 三个全被跳过，只剩不带该特性的
- * Immersion Audio Bridge 加载，Chainloader startup complete 但 NOS 从未被拉起。
+ * R82 正解：tools/patch_r82 已把 BepInEx.Core.dll 里 ModifyLoadOrder 的进程名
+ * 比对 lambda（b__27_4）改成 `ldc.i4.0; ret`（恒返回 false=匹配），
+ * Enumerable.All 永远为 false → 任何 BepInProcess 过滤器一律放行，
+ * 无论进程名是 "AmongUs" / "Among Us" / 未来任何命名，都不再跳过插件。
  *
- * 解法：不动任何 DLL、不打 IL 补丁。在阶段B 调 NebulaManualExecute()→Execute() 之前，
- * 反射把 BepInEx.Paths.ProcessName 设成 PC 真实值 "Among Us"，process filter 随即命中，
- * 三个插件全部放行，NebulaLoader 去加载 Documents/BepInEx/nebula/Nebula.dll（NOS）。
- *
- * 时序安全：SetExecutablePath 只在阶段A IL2CPPChainloader.Initialize 跑一次
- * （日志 690 "Chainloader initialized"），Execute()/ModifyLoadOrder() 里不会重设；
- * 且 R80 的 nebula_log_paths 已证明 blob_find("BepInEx.Core") 读到的 Paths 静态值
- * 就是运行时真实状态（日志 694 打印出正确的 GameRootPath），反射写入必然生效。
+ * 所以这里只需读取并打印运行时真实进程名（诊断用），绝不再 setter 覆盖，
+ * 也少一次 mono_runtime_invoke（这个宿主上每次 invoke 都是潜在 JIT 崩点）。
  */
 static void nebula_fix_process_name(MonoDomain *domain) {
     if (!domain) return;
     const blob_entry *core_e = blob_find("BepInEx.Core");
-    if (!core_e) { printf("[host][r81] !! 找不到 BepInEx.Core blob，跳过进程名修正\n"); fflush(NULL); return; }
+    if (!core_e) { printf("[host][r82] !! 找不到 BepInEx.Core blob\n"); fflush(NULL); return; }
     MonoAssembly *core_as = blob_load_assembly(core_e);
-    if (!core_as) { printf("[host][r81] !! 加载 BepInEx.Core 失败\n"); fflush(NULL); return; }
+    if (!core_as) { printf("[host][r82] !! 加载 BepInEx.Core 失败\n"); fflush(NULL); return; }
     MonoImage *img = mono_assembly_get_image(core_as);
     MonoClass *paths = mono_class_from_name(img, "BepInEx", "Paths");
-    if (!paths) { printf("[host][r81] !! 找不到 BepInEx.Paths 类\n"); fflush(NULL); return; }
+    if (!paths) { printf("[host][r82] !! 找不到 BepInEx.Paths 类\n"); fflush(NULL); return; }
     MonoProperty *prop = mono_class_get_property_from_name(paths, "ProcessName");
-    MonoMethod *setter = prop ? mono_property_get_set_method(prop) : NULL;
     MonoMethod *getter = prop ? mono_property_get_get_method(prop) : NULL;
-    if (!setter) { printf("[host][r81] !! 找不到 Paths.ProcessName setter\n"); fflush(NULL); return; }
+    if (!getter) { printf("[host][r82] !! 找不到 Paths.ProcessName getter\n"); fflush(NULL); return; }
 
     MonoObject *exc = NULL;
-    if (getter) {
-        MonoObject *old = mono_runtime_invoke(getter, NULL, NULL, &exc);
-        if (old) {
-            char *c = mono_string_to_utf8((MonoString *)old);
-            printf("[host][r81] 修正前 Paths.ProcessName = %s\n", c ? c : "(null)");
-            if (c) free(c);
-        }
-        exc = NULL;
-    }
-
-    MonoString *val = mono_string_new(domain, "Among Us");
-    void *args[1] = { val };
-    mono_runtime_invoke(setter, NULL, args, &exc);   // 静态 setter，实例传 NULL
-    if (exc) {
-        nebula_log_exception(exc);
-        printf("[host][r81] !! 设置 Paths.ProcessName 失败\n");
-        exc = NULL;
+    MonoObject *val = mono_runtime_invoke(getter, NULL, NULL, &exc);
+    if (val) {
+        char *c = mono_string_to_utf8((MonoString *)val);
+        printf("[host][r82] 运行时真实 Paths.ProcessName = %s —— 进程过滤器已由 IL 补丁恒放行（带不带空格都认），不再覆盖\n",
+               c ? c : "(null)");
+        if (c) free(c);
     } else {
-        printf("[host][r81] 已设 Paths.ProcessName = \"Among Us\"\n");
-    }
-
-    if (getter) {
-        MonoObject *now = mono_runtime_invoke(getter, NULL, NULL, &exc);
-        if (now) {
-            char *c = mono_string_to_utf8((MonoString *)now);
-            printf("[host][r81] 修正后 Paths.ProcessName = %s —— BepInProcess(\"Among Us.exe\") 现应命中，NebulaLoader / NOS 不再被跳过\n",
-                   c ? c : "(null)");
-            if (c) free(c);
-        }
-        exc = NULL;
+        printf("[host][r82] 读取 Paths.ProcessName 返回空（不影响：过滤器已恒放行）\n");
     }
     fflush(NULL);
 }
 
 static void nebula_r56_invoke_manual_execute(void) {
     printf("[host][r56] ===== Unity 主线程触发开始 =====\n");
-    printf("[host][r81] 阶段B：顺序预加载 + Cecil 参考程序集已落盘 + 进程名已对齐（预期 4 plugins 全放行，NebulaLoader 拉起 NOS）\n");
+    printf("[host][r82] 阶段B：三刀 IL 补丁已生效（AutoSave/Harmony 不再崩、进程名带不带空格都放行）+ 滑动插件已落 plugins + CWD 已切 Documents（NebulaLoader 相对路径可命中 NOS）\n");
     fflush(NULL);
     if (!g_r56_domain || !g_r56_il2cpp_img) {
         printf("[host][r56] !! domain/image 为空，放弃触发\n");
@@ -3170,8 +3200,8 @@ static void nebula_r56_invoke_manual_execute(void) {
         return;
     }
 
-    /* [R81] 必须在 Execute()/ModifyLoadOrder() 之前对齐进程名，否则
-       BepInProcess("Among Us.exe") 会把 NebulaLoader（NOS 加载器）判成"不匹配"跳过。 */
+    /* [R82] 进程过滤器已由 IL 补丁恒放行（带不带空格都认），这里仅打印真实进程名
+       作诊断；不再硬编码覆盖 Paths.ProcessName。 */
     nebula_fix_process_name(g_r56_domain);
 
     printf("[host][r56] 已定位 NebulaManualExecute()，开始 mono_runtime_invoke（扫 plugins / 加载 NOS）\n");

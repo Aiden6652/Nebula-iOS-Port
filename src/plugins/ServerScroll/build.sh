@@ -8,7 +8,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/../.." && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
 MONO="$ROOT/src/mono_host"
 
 CSC="$(find /usr/share/dotnet /usr/lib/dotnet -name csc.dll -path '*Roslyn/bincore*' 2>/dev/null | head -1 || true)"

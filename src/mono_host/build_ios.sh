@@ -167,6 +167,19 @@ if os.path.isdir(native_src):
             n += 1
     print("   [R60] native shim(fallback): %d 个已内嵌" % n)
 
+# 6) [R82] 服务器列表滑动插件（BepInEx IL2CPP 托管 dll）。
+#    随 dylib 内嵌，启动时由宿主强制落盘到 Documents/BepInEx/plugins/，
+#    让 BepInEx 当普通插件扫描加载（Harmony hook ServerDropdown.FillServerOptions，
+#    把按钮装进 AU 原生 Scroller 实现滑动）。
+#    带 "plugin/" 前缀：blob_find 一律跳过（不能当普通程序集内存加载，否则会
+#    抢在 BepInEx 磁盘加载前、绕开插件扫描流程）。
+scroll_plugin = os.path.join(root_dir, "..", "plugins", "ServerScroll", "AUI.ServerScroll.dll")
+if os.path.isfile(scroll_plugin):
+    add("plugin/AUI.ServerScroll.dll", open(scroll_plugin, "rb").read())
+    print("   [R82] AUI.ServerScroll.dll 已内嵌（滑动插件，%d bytes）" % os.path.getsize(scroll_plugin))
+else:
+    print("!! [R82] 没找到 AUI.ServerScroll.dll，滑动插件不会进包", file=sys.stderr)
+
 buf = struct.pack("<I", 0x4E424C31)  # 'NBL1'
 buf += struct.pack("<I", len(entries))
 for name, data in entries:
