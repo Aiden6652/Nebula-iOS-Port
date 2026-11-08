@@ -757,6 +757,51 @@ static int nebula_blob_extract_dir(const char *prefix, const char *dest) {
     return written;
 }
 
+/* [R80] 把 blob 里的 BCL 散程序集 + BepInEx/core 托管 dll 落盘到
+   Documents/BepInEx/core。BepInEx 的 Cecil TypeLoader【只读文件系统】：
+   阶段B 扫 plugins 时 MetadataHelper.GetCustomAttributes(inherit=true) 会
+   TypeReference.Resolve() 基类，需要磁盘上的 System.Runtime.dll /
+   System.Private.CoreLib.dll 作参考程序集；mono 的内存 blob 对 Cecil 完全
+   不可见 → R79 真机每个插件都抛
+     Mono.Cecil.AssemblyResolutionException: Failed to resolve 'System.Runtime'
+   最后 0 plugins to load（NOS 静默不加载）。R48 已为 unity-libs/ 做过同样的
+   落盘，这里补上 BCL/core 这一半。
+   注意：只投 BepInExAssemblyDirectory(core)，绝不投 plugins/ —— 那边 *.dll
+   会被 TypeLoader 当插件扫描。 */
+static int nebula_blob_extract_cecil_refs(const char *dest) {
+    if (!g_n) return 0;
+    struct stat st;
+    if (stat(dest, &st) != 0 && neb_mkdir_p(dest) != 0) return 0;
+    int written = 0, skipped = 0;
+    for (int i = 0; i < g_n; i++) {
+        const char *nm = g_entries[i].name;
+        size_t L = strlen(nm);
+        if (L <= 4 || strcmp(nm + L - 4, ".dll")) continue;
+        const char *slash = strchr(nm, '/');
+        int is_bcl  = (slash == NULL);                     // 纯 basename = BCL
+        int is_core = !strncmp(nm, "BepInEx/core/", 13);  // 覆盖旧散文件，参考 R79 版
+        if (!is_bcl && !is_core) continue;
+        const char *bn = strrchr(nm, '/'); bn = bn ? bn + 1 : nm;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", dest, bn);
+        if (stat(p, &st) == 0 && st.st_size == (off_t)g_entries[i].size) { skipped++; continue; }
+        FILE *f = fopen(p, "wb");
+        if (!f) continue;
+        if (fwrite(g_entries[i].data, 1, g_entries[i].size, f) != g_entries[i].size) {
+            fclose(f); remove(p); continue;
+        }
+        fclose(f);
+        written++;
+    }
+    printf("[host][r80] 释放 Cecil 参考程序集 -> %s（新写 %d，已存在跳过 %d）\n",
+           dest, written, skipped);
+    char chk[PATH_MAX];
+    snprintf(chk, sizeof(chk), "%s/System.Runtime.dll", dest);
+    printf("[host][r80]   Cecil 参考 System.Runtime.dll %s\n",
+           stat(chk, &st) == 0 ? "已就位" : "!! 缺失（插件扫描仍会失败）");
+    return written;
+}
+
 /* [R60] 取本 dylib 自身的绝对路径。
    dllmap 的 target 指向它：dlopen(自身) 会返回已加载镜像的 handle，随后 dlsym
    即可命中静态链进来的 DobbyHook / SystemNative_* 符号。这样所有原生库都住在
@@ -805,6 +850,11 @@ static void nebula_r60_extract_bundle(const char *root) {
         snprintf(dest, sizeof(dest), "%s/Documents/nebula_native", home);
         int n = nebula_blob_extract_dir("native/", dest);
         printf("[host][r60] native shim fallback -> %s（本次新写 %d）\n", dest, n);
+    }
+    // [R80] BepInEx Cecil 插件扫描的磁盘参考程序集（必须在 Start()/Execute() 之前）
+    if (home && home[0]) {
+        snprintf(dest, sizeof(dest), "%s/Documents/BepInEx/core", home);
+        nebula_blob_extract_cecil_refs(dest);
     }
 }
 
@@ -2602,7 +2652,7 @@ static void *boot_thread_impl(void *arg) {
         if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.txt", gd);             log_try(p); }
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
-        hlog("[host][r79] ===== 版本标记 R79：顺序预加载 helper 已修（System.Runtime scope + VAR(0) Invoke，弃用 List<string>）=====");
+        hlog("[host][r80] ===== 版本标记 R80：BCL/core 落盘给 Cecil（修阶段B 0 plugins to load）=====");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -3005,7 +3055,7 @@ static void nebula_prewarm_jit(void) {
 
 static void nebula_r56_invoke_manual_execute(void) {
     printf("[host][r56] ===== Unity 主线程触发开始 =====\n");
-    printf("[host][r79] 阶段B：应为【顺序预加载】（helper 已修 System.Private.CoreLib 错 scope / List 成员缺失，零 worker）\n");
+    printf("[host][r80] 阶段B：顺序预加载 + Cecil 参考程序集已落盘（预期 4 plugins to load，不再 AssemblyResolutionException）\n");
     fflush(NULL);
     if (!g_r56_domain || !g_r56_il2cpp_img) {
         printf("[host][r56] !! domain/image 为空，放弃触发\n");
