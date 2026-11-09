@@ -186,3 +186,83 @@ TryDisable() {
 
 > 本轮范围仅限「把 NOS 跑通」。同日志里 AutoSave / ServerScroll 的 `TypeLoadException: System.Runtime.InteropServices.Marshal ... System.Runtime 6.0.0.0`、GamePatch 的 `FormatException`、ImmersionAudioBridge 的 `InjectorHelpers` 是各模组**各自独立**的问题（BCL 版本对齐 / 版本号解析 / class injection），不是 NOS 加载链的一部分，未在本轮处理。
 
+
+## 10. [R86] 路径基准全面改到可写 Documents：NOS 往只读 `.app/NebulaLibs` 建目录被拒
+
+**现象（R85 真机日志）**：R85 的 kernel32 no-op 生效了（日志第 49 行，不再是
+`DllNotFoundException: kernel32.dll`），`NebulaLoader` 已从
+`Documents/BepInEx/nebula/Nebula.dll`（33,928,192 B，日志 998）读到程序集，
+CWD 也在 Documents（617）——但 `LoadInternal` 仍中断：
+
+```
+Error loading [NebulaLoader 1.0.0]: System.Reflection.TargetInvocationException
+ ---> System.UnauthorizedAccessException: Access to the path
+      '/private/var/containers/Bundle/Application/.../AmongUs.app/NebulaLibs' is denied.
+   at System.IO.Directory.CreateDirectory(String path)
+   at Nebula.NebulaPlugin.<LoadInternal>g__LoadLibrary|30_2(Stream, String)
+   at Nebula.NebulaPlugin.<LoadInternal>g__LoadLibraryFromZip|30_1(String)
+   at Nebula.NebulaPlugin.LoadInternal(Boolean android)
+```
+
+**根因（查上游 `Dolly1016/Nebula-Public` 源码坐实，非猜测）**：
+- `NebulaPluginNova/Utilities/PathHelpers.cs`：
+  `NebulaLibsPath => PathHelpers.GameRootPath + "/NebulaLibs"`，其中 PC 编译版
+  `GameRootPath => BepInEx.Paths.GameRootPath`。
+- `LoadLibrary()` 对 `dirPath = PathHelpers.NebulaLibsPath` 调
+  `Directory.CreateDirectory(dirPath)` + `File.WriteAllBytes(...)`，把内嵌
+  `Nebula.Resources.Libs.zip` 里的依赖 dll 释放到磁盘。
+- 宿主此前把 `DOORSTOP_PROCESS_PATH` 设成 `root/AmongUs`，导致
+  `BepInEx.Paths.GameRootPath = 只读 .app`（日志 701）。于是 NOS 往只读签名
+  bundle 建目录 → `UnauthorizedAccessException`。**模组文件明明都在 Documents，
+  却因这个根指错而去 .app 创建。**
+
+**修法（用户明确要求：模组 DLL 一字节不动、BepInEx 原生加载，只把宿主层
+所有"指向 .app 的目录"改成 Documents，除游戏本体只读资源外）**：
+
+统一用 `nebula_doc_root()` = `HOME/Documents` 作为唯一可写基准：
+
+| 类别 | 落点 | 处理 |
+|---|---|---|
+| `GameRootPath`（`DOORSTOP_PROCESS_PATH`） | **Documents** | 改为 `Documents/AmongUs`；NOS 的 `NebulaLibsPath` 随之变 `Documents/NebulaLibs`（可写） |
+| `BepInExRootPath`（`DOORSTOP_INVOKE_DLL_PATH`） | Documents | 保持 `Documents/BepInEx` |
+| `MONO_PATH` 6 个目录 | **Documents** | 由 `.app/BepInEx/*`、` .app/NebulaLibs` 改为 `Documents/...`，与 NOS 释放位置同址 |
+| interop / native / Cecil refs / plugins 释放 | **Documents** | 删除往 `.app` 投的那一份（R85 日志第 30 行"新写 0"实锤是无效功） |
+| BepInEx.cfg 写入（GlobalMetadataPath / UnityBaseLibrariesSource / ScanMethodRefs / UpdateInteropAssemblies） | **Documents** | 由遍历 `bases`(含 .app) 收敛为单写 Documents；R85 日志 605~614 生效的本就是 Documents 那份 |
+| unity-libs / interop 兜底释放 | **Documents** | `wbase[1] = { Documents }`，保留 `for`+`continue` 结构 |
+| CWD | **Documents** | 删掉 `NEBULA_CWD=root` 诊断开关与 `chdir(root)` 兜底，恒为 Documents |
+| preloader 失败标志 / LogOutput / diag / 日志 / Mods / BepInEx 入口文件兜底 / 版本检测 | **Documents** | 全部由 `root` 改 `nebula_doc_root()` |
+| **游戏本体只读资源（保留 .app）** | `.app` | `nebula_fix_il2cpp_paths` 的三个探测 base（`app`/`root`/`doc`）用于找 UnityFramework、`global-metadata.dat`、`Data/`；`BEPINEX_GAME_ASSEMBLY_PATH`、cfg 里的 `GlobalMetadataPath` 仍是 `.app` 绝对路径；`module_dir`/宿主 dylib 自身不变 |
+
+**`Documents/Data -> .app/Data` 符号链接**：`GameRootPath` 改到 Documents 后，
+BepInEx 的 `Paths.SetExecutablePath` 会把 `GameDataPath` 算成 `Documents/Data`、
+`ManagedPath` 算成 `Documents/Data/Managed`。真实 Unity 数据在只读 `.app/Data`，
+故用 `symlink` 把两者接上（幂等：目标已存在则不动，绝不覆盖用户内容），
+保证 `Directory.Exists(GameDataPath)` 仍为真、游戏本体继续从 .app 读。
+这是"本该指向 .app 的只读资源"的例外，用链接而非复制，逻辑上仍归 .app。
+
+**为什么这样能成**：PC 版 NOS 的 `NebulaLibsPath` 完全由 `BepInEx.Paths.GameRootPath`
+派生；把它从只读 `.app` 换成可写 Documents，`CreateDirectory` / `WriteAllBytes` /
+`Assembly.LoadFrom` 整条释放链路自然落到 Documents，且 `MONO_PATH` 已包含同址的
+`Documents/NebulaLibs`，依赖 dll 可被解析。**零 IL 补丁、零预加载、模组 DLL
+一字节未改、BepInEx 照常原生加载**，符合用户一贯要求。
+
+**沙箱验证**：全文件大括号/圆括号配平（470/470、2318/2318）；抽出
+`nebula_doc_root`/`setup_mono_path`/`nebula_r60_extract_bundle`/
+`nebula_init_bepinex_paths`/`nebula_detect_bepinex`/`nebula_preloader_failed`/
+`boot_mods_dir` 七个改动函数 + `nebula_fix_il2cpp_paths` 全函数（187 行），
+配最小桩用 gcc `-fsyntax-only -Wall -Wextra` 编译 **0 error**；删除变量在函数体内
+无残留引用；R86 行引号成对。全量复核剩余 `root` 仅两处正当用途：
+`bases[nb++]=root`（只读探测游戏本体）、`target = root/Data`（符号链接源）。
+iOS 全量构建需 macOS+Xcode，真机待复测。
+
+**真机怎么验**：日志第 3 行应为 `版本标记 R86`；
+`[host][r86] BepInEx 环境就绪: ... GameRootPath=<...>/Documents(Documents,可写)`；
+`[host][r86] CWD -> <...>/Documents`；`[host][r86] 预生成 interop` 等释放路径
+全部是 Documents、不再出现 `.app/BepInEx/interop`；
+`Loading [NebulaLoader 1.0.0]` 之后**不再有** `UnauthorizedAccessException:
+.../AmongUs.app/NebulaLibs`，随后应出现 NOS 自身启动日志与
+`[host][r86] Data 链接: ... -> .../AmongUs.app/Data`。
+
+> AutoSave / ServerScroll 的 `Marshal` TypeLoad、GamePatch 的 `FormatException`、
+> ImmersionAudioBridge 的 `InjectorHelpers`、`dobby` DllNotFound 均属各模组/组件
+> 独立问题，不在本轮"NOS 加载链 + 路径基准"范围内，未处理。

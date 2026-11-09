@@ -453,17 +453,46 @@ static char *module_dir(void) {
     return strdup(".");
 }
 
+/* [R86] 统一的「可写内容根」= HOME/Documents。
+   分工（用户 2026-11-09 明确要求：把所有指向 .app 的目录改成 Documents，
+   除了本该指向 .app 的）：
+     - .app（只读签名 bundle）只放【游戏本体】：Frameworks/UnityFramework、
+       Data/Managed/Metadata/global-metadata.dat、注入的宿主 dylib 及其内置
+       cfg/blob。对这些路径只做只读探测，绝不写。
+     - 其余一切【模组 / 生成物 / 释放的依赖库 / 日志 / 配置 / 缓存 / 文件兜底 /
+       相对路径基准】一律落 Documents。
+   R85 真机日志实锤：PC 版 NOS 的
+       PathHelpers.NebulaLibsPath = BepInEx.Paths.GameRootPath + "/NebulaLibs"，
+   GameRootPath 指到 .app 时 Directory.CreateDirectory 直接抛
+   UnauthorizedAccessException，NebulaLoader 加载链中断（Nebula.dll 明明已从
+   Documents/BepInEx/nebula/ 读到）。故 GameRootPath 必须落到可写 Documents。 */
+static const char *nebula_doc_root(const char *fallback_root) {
+    (void)fallback_root;   /* [R86] 绝不回退到只读 .app：那正是本次要消灭的病根 */
+    static char doc[PATH_MAX];
+    if (!doc[0]) {
+        const char *home = getenv("HOME");
+        if (home && home[0]) snprintf(doc, sizeof(doc), "%s/Documents", home);
+        else snprintf(doc, sizeof(doc), "/var/mobile/Documents");   // iOS 传统可写容器，非 .app
+    }
+    return doc;
+}
+
 // 组装 MONO_PATH：仅保留用户内容目录作为【文件兜底】（BCL/BepInEx.core 已在 blob 里内存加载）
 static void setup_mono_path(const char *dir, const char *root) {
-    (void)dir;  // dir(=dylib 目录) 不再含 bcl，仅作占位
+    (void)dir;  // dir(=dylib 目录, 只读 .app) 不再含 bcl，仅作占位
+    (void)root;
+    /* [R86] 这 6 个都是模组/生成物目录，真文件全在 Documents（R85 日志 997~1007）。
+       以前拼在只读 root(.app) 下，纯属指错；尤其 NebulaLibs 必须与 NOS 的
+       PathHelpers.NebulaLibsPath 同址，否则 Assembly.LoadFrom 找不到依赖。 */
+    const char *doc = nebula_doc_root(root);
     char core[PATH_MAX], interop[PATH_MAX], plugins[PATH_MAX];
     char nebula[PATH_MAX], patchers[PATH_MAX], libs[PATH_MAX];
-    snprintf(core,     sizeof(core),     "%s/BepInEx/core", root);
-    snprintf(interop,  sizeof(interop),  "%s/BepInEx/interop", root);
-    snprintf(plugins,  sizeof(plugins),  "%s/BepInEx/plugins", root);
-    snprintf(nebula,   sizeof(nebula),   "%s/BepInEx/nebula", root);
-    snprintf(patchers, sizeof(patchers), "%s/BepInEx/patchers", root);
-    snprintf(libs,     sizeof(libs),     "%s/NebulaLibs", root);
+    snprintf(core,     sizeof(core),     "%s/BepInEx/core", doc);
+    snprintf(interop,  sizeof(interop),  "%s/BepInEx/interop", doc);
+    snprintf(plugins,  sizeof(plugins),  "%s/BepInEx/plugins", doc);
+    snprintf(nebula,   sizeof(nebula),   "%s/BepInEx/nebula", doc);
+    snprintf(patchers, sizeof(patchers), "%s/BepInEx/patchers", doc);
+    snprintf(libs,     sizeof(libs),     "%s/NebulaLibs", doc);
 
     const char *all[] = { core, interop, plugins, nebula, patchers, libs };
     char mp[8192]; mp[0] = '\0';
@@ -473,7 +502,7 @@ static void setup_mono_path(const char *dir, const char *root) {
         strcat(mp, all[i]);
     }
     setenv("MONO_PATH", mp, 1);
-    printf("[host] MONO_PATH(文件兜底)=%s\n", mp);
+    printf("[host][r86] MONO_PATH(文件兜底, Documents)=%s\n", mp);
 }
 
 // 前向声明：托管异常转可读文本（定义见下方 boot_bepinex 之后）
@@ -868,34 +897,29 @@ static const char *nebula_r60_self_path(void) {
 static void nebula_r60_extract_bundle(const char *root) {
     if (!g_n) return;
     char dest[PATH_MAX];
-    const char *home = getenv("HOME");
+    /* [R86] 释放目标一律是可写 Documents。以前还额外投了一份到只读 root(.app)，
+       R85 日志第 30 行 "预生成 interop -> .../AmongUs.app/BepInEx/interop 本次新写 0"
+       实锤那是纯无效功（bundle 只读，写不进），且正是用户反感的「在 .app 里创建」。
+       游戏本体数据仍从 .app 只读探测（nebula_fix_il2cpp_paths），两者不冲突。 */
+    const char *doc = nebula_doc_root(root);
 
-    // 投到所有可能的 BepInEx 基准目录：游戏根（用户放包处）+ Documents（BepInEx Paths 实际用）
-    const char *bases[2]; int nb = 0;
-    if (root && root[0]) bases[nb++] = root;
-    if (home && home[0]) { static char doc[PATH_MAX]; snprintf(doc, sizeof(doc), "%s/Documents", home); bases[nb++] = doc; }
-    for (int i = 0; i < nb; i++) {
-        snprintf(dest, sizeof(dest), "%s/BepInEx/interop", bases[i]);
-        int n = nebula_blob_extract_dir("interop/", dest);
-        printf("[host][r60] 预生成 interop -> %s（本次新写 %d，已存在则跳过）\n", dest, n);
-    }
-    // native shim 只投可写目录（app bundle 只读，写不进去也无害）
-    if (home && home[0]) {
-        snprintf(dest, sizeof(dest), "%s/Documents/nebula_native", home);
-        int n = nebula_blob_extract_dir("native/", dest);
-        printf("[host][r60] native shim fallback -> %s（本次新写 %d）\n", dest, n);
-    }
+    snprintf(dest, sizeof(dest), "%s/BepInEx/interop", doc);
+    int n = nebula_blob_extract_dir("interop/", dest);
+    printf("[host][r60] 预生成 interop -> %s（本次新写 %d，已存在则跳过）\n", dest, n);
+
+    // native shim 只投可写目录
+    snprintf(dest, sizeof(dest), "%s/nebula_native", doc);
+    n = nebula_blob_extract_dir("native/", dest);
+    printf("[host][r60] native shim fallback -> %s（本次新写 %d）\n", dest, n);
+
     // [R80] BepInEx Cecil 插件扫描的磁盘参考程序集（必须在 Start()/Execute() 之前）
-    if (home && home[0]) {
-        snprintf(dest, sizeof(dest), "%s/Documents/BepInEx/core", home);
-        nebula_blob_extract_cecil_refs(dest);
-    }
+    snprintf(dest, sizeof(dest), "%s/BepInEx/core", doc);
+    nebula_blob_extract_cecil_refs(dest);
+
     // [R82] 服务器列表滑动插件 -> Documents/BepInEx/plugins（BepInEx 扫描目录）
     //   每次覆盖写，保证换包立即生效；必须在 Start()/Execute() 扫 plugins 之前。
-    if (home && home[0]) {
-        snprintf(dest, sizeof(dest), "%s/Documents/BepInEx/plugins", home);
-        nebula_blob_extract_plugins(dest);
-    }
+    snprintf(dest, sizeof(dest), "%s/BepInEx/plugins", doc);
+    nebula_blob_extract_plugins(dest);
 }
 
 // 探 IL2CPP 二进制 + global-metadata.dat，并落地纠偏
@@ -1004,15 +1028,20 @@ static void nebula_fix_il2cpp_paths(const char *root) {
     if (found_md) {
         struct stat st; long long sz = stat(md, &st) == 0 ? (long long)st.st_size : -1;
         printf("[host][r47] global-metadata.dat 命中: %s (%lld bytes)\n", md, sz);
-        // 写进每一份可能生效的 BepInEx.cfg（BepInExRootPath 在 iOS 上可能被重定向到容器目录）
-        for (int i = 0; i < nb; i++) {
+        /* [R86] cfg 是生成物，只写可写 Documents；上面 bases 里的 .app 仅供【只读探测】
+           游戏本体（UnityFramework / global-metadata），不属于「该指向 .app 的写入」。
+           BepInExRootPath 已确定 = HOME/Documents/BepInEx，这份 cfg 就是唯一生效的一份
+           （R85 日志 605 行实锤生效路径就是它）。写入的 md 仍是 .app 绝对路径，游戏本体不变。 */
+        {
+            const char *doc = nebula_doc_root(root);
             char cfgd[PATH_MAX], cfgp[PATH_MAX + 64];
-            snprintf(cfgd, sizeof(cfgd), "%s/BepInEx/config", bases[i]);
+            snprintf(cfgd, sizeof(cfgd), "%s/BepInEx/config", doc);
             snprintf(cfgp, sizeof(cfgp), "%s/BepInEx.cfg", cfgd);
-            // 目录不存在就建（幂等，无害）；失败说明这里不可写，跳过
-            if (neb_mkdir_p(cfgd) != 0) continue;
-            // replace_if_bad=1：默认值（安卓布局那一串）根本不存在，必须被覆盖
-            neb_cfg_set(cfgp, "IL2CPP", "GlobalMetadataPath", md, 1);
+            if (neb_mkdir_p(cfgd) != 0) {
+                printf("[host][r47] !! cfg 目录不可写: %s\n", cfgd);
+            } else {
+                neb_cfg_set(cfgp, "IL2CPP", "GlobalMetadataPath", md, 1);
+            }
         }
     } else {
         printf("[host][r47] !! 没找到 global-metadata.dat，保留 BepInEx 默认路径\n");
@@ -1027,10 +1056,16 @@ static void nebula_fix_il2cpp_paths(const char *root) {
     //   DownloadUnityAssemblies() 开头若发现 UnityBaseLibrariesSource 为空就直接 return，
     //   而"删光 unity-libs/*.dll 再解 zip"在这行之后 —— 把 source 置空，既跳过联网、
     //   也保住你已经放好的 dll（否则下次启动会被它先清空，再解压失败）。
-    for (int i = 0; i < nb; i++) {
+    /* [R86] 这三项都是【写入/生成物】，只投可写 Documents。
+       上面 bases 数组（含 .app）仅供前面的【只读探测】游戏本体使用；
+       以前这里往只读 .app 写 unity-libs/cfg/interop 全是无效功（R85 日志里
+       真正生效的 606/608/610/612/614 行清一色 Documents 路径）。
+       wbase[1] + for(i<1) 保留原 continue 控制流，不改循环体逻辑。 */
+    const char *const wbase[1] = { nebula_doc_root(root) };
+    for (int i = 0; i < 1; i++) {
         char ul[PATH_MAX], cfgd[PATH_MAX], cfgp[PATH_MAX + 64];
-        snprintf(ul,   sizeof(ul),   "%s/BepInEx/unity-libs", bases[i]);
-        snprintf(cfgd, sizeof(cfgd), "%s/BepInEx/config",     bases[i]);
+        snprintf(ul,   sizeof(ul),   "%s/BepInEx/unity-libs", wbase[i]);
+        snprintf(cfgd, sizeof(cfgd), "%s/BepInEx/config",     wbase[i]);
         snprintf(cfgp, sizeof(cfgp), "%s/BepInEx.cfg",        cfgd);
         struct stat st;
         int ul_ok = (stat(ul, &st) == 0 && S_ISDIR(st.st_mode));
@@ -1076,7 +1111,7 @@ static void nebula_fix_il2cpp_paths(const char *root) {
         //     绝不备份/移除/重生成（R58 的"备份 + 强制重生成"与 R52 的"删哈希"一并废除）。
         {
             char ip[PATH_MAX];
-            snprintf(ip, sizeof(ip), "%s/BepInEx/interop", bases[i]);
+            snprintf(ip, sizeof(ip), "%s/BepInEx/interop", wbase[i]);
             /* 幂等兜底：已存在且大小一致就跳过，不覆盖不删除 */
             nebula_blob_extract_dir("interop/", ip);
             struct stat ist;
@@ -1123,14 +1158,22 @@ static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
     (void)domain;
     if (!root) return 0;
 
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = root;   // 兜底：iOS 一定有 HOME
+    /* [R86] 一切可写路径基准统一到 Documents（见 nebula_doc_root 上方说明）。 */
+    const char *doc = nebula_doc_root(root);
 
     char bepinroot[PATH_MAX], invoke[PATH_MAX], prelog[PATH_MAX], exepath[PATH_MAX];
-    snprintf(bepinroot, sizeof(bepinroot), "%s/Documents/BepInEx", home);
+    snprintf(bepinroot, sizeof(bepinroot), "%s/BepInEx", doc);
     snprintf(invoke,    sizeof(invoke),    "%s/core/BepInEx.Preloader.dll", bepinroot);
-    snprintf(prelog,    sizeof(prelog),    "%s/Documents/preloader.log", home);
-    snprintf(exepath,   sizeof(exepath),   "%s/AmongUs", root);   // GameRootPath = root(AmongUs.app)
+    snprintf(prelog,    sizeof(prelog),    "%s/preloader.log", doc);
+    /* [R86] 关键修复：GameRootPath 由 DOORSTOP_PROCESS_PATH 的所在目录决定。
+       以前 = root/AmongUs → GameRootPath = 只读 .app → PC 版 NOS 的
+         PathHelpers.NebulaLibsPath = GameRootPath + "/NebulaLibs" = .app/NebulaLibs
+       → Directory.CreateDirectory 抛 UnauthorizedAccessException
+       （R85 真机日志 1754 行实锤，NebulaLoader 加载链在此中断）。
+       现在 = Documents/AmongUs → GameRootPath = 可写 Documents →
+       NOS 的 NebulaLibs / DllCache / 配置 全部自然落到 Documents，
+       模组 DLL 一字节不动、BepInEx 照常原生加载。 */
+    snprintf(exepath,   sizeof(exepath),   "%s/AmongUs", doc);
 
     // 创建可写 BepInEx 目录结构：BepInEx 会在其下写 config / plugins / log / cache 等
     mkdir(bepinroot, 0755);
@@ -1140,17 +1183,43 @@ static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
     snprintf(tmp, sizeof(tmp), "%s/config", bepinroot);   mkdir(tmp, 0755);
     snprintf(tmp, sizeof(tmp), "%s/patchers", bepinroot); mkdir(tmp, 0755);
     snprintf(tmp, sizeof(tmp), "%s/cache", bepinroot);    mkdir(tmp, 0755);
+    // [R86] NOS 会在这里 CreateDirectory + 释放依赖 dll，提前建好（幂等）
+    snprintf(tmp, sizeof(tmp), "%s/NebulaLibs", doc);     mkdir(tmp, 0755);
 
-    // 1) DOORSTOP_INVOKE_DLL_PATH → ParentDirectory(.,2) 即 BepInExRootPath（可写，绕过只读 bundle）
+    /* [R86] GameDataPath 兜底：GameRootPath 改到 Documents 后，BepInEx 的
+       SetExecutablePath 会把 GameDataPath 算成 Documents/Data、ManagedPath 算成
+       Documents/Data/Managed。真实游戏数据在只读 .app/Data —— 用符号链接把
+       两者接上，让这些路径仍命中游戏本体（不改 IL、不改 BepInEx）。
+       这是「本该指向 .app」的只读资源，链接后逻辑上仍从 .app 读。
+       幂等：链接/目录已存在就不动，绝不覆盖用户自己放的内容。 */
+    {
+        char linkp[PATH_MAX], target[PATH_MAX];
+        snprintf(linkp,  sizeof(linkp),  "%s/Data", doc);
+        snprintf(target, sizeof(target), "%s/Data", root);
+        struct stat lst;
+        if (lstat(linkp, &lst) != 0) {          // 不存在才建
+            struct stat tst;
+            if (stat(target, &tst) == 0 && S_ISDIR(tst.st_mode)) {
+                if (symlink(target, linkp) == 0)
+                    printf("[host][r86] Data 链接: %s -> %s（游戏数据仍从只读 .app 读）\n", linkp, target);
+                else
+                    printf("[host][r86] !! Data 链接失败 errno=%d（interop 已预生成 + cfg 绝对路径兜底，不影响）\n", errno);
+            } else {
+                printf("[host][r86] .app/Data 不存在，跳过 Data 链接（cfg 中 GlobalMetadataPath 是绝对路径，不受影响）\n");
+            }
+        }
+    }
+
+    // 1) DOORSTOP_INVOKE_DLL_PATH → ParentDirectory(.,2) 即 BepInExRootPath（可写 Documents/BepInEx）
     setenv("DOORSTOP_INVOKE_DLL_PATH", invoke, 1);
-    // 2) DOORSTOP_PROCESS_PATH → GameRootPath = 其所在目录 = root（AmongUs.app，Data 真实存在）
+    // 2) DOORSTOP_PROCESS_PATH → GameRootPath = 其所在目录 = Documents（可写）
     setenv("DOORSTOP_PROCESS_PATH", exepath, 1);
     // 3) BEPINEX_PRELOADER_LOG → 绝对可写路径：Start() 的 catch 把真实异常写到这里，
     //    避免落到只读 bundle 抛 UnauthorizedAccessException 把真错误彻底掩盖
     setenv("BEPINEX_PRELOADER_LOG", prelog, 1);
 
-    printf("[host] BepInEx 环境就绪: BepInExRootPath=%s  GameRootPath=%s  prelog=%s\n",
-           bepinroot, root, prelog);
+    printf("[host][r86] BepInEx 环境就绪: BepInExRootPath=%s  GameRootPath=%s(Documents,可写)  游戏本体=.app(只读)  prelog=%s\n",
+           bepinroot, doc, prelog);
     fflush(NULL);
     return 1;
 }
@@ -1481,20 +1550,15 @@ static bex_version_t nebula_classify_bepinex_core(const char *core_dir, char *ve
 //   3) 磁盘都没 → 若宿主 blob 内置 v6 入口，视为宿主提供的 v6（NOS 默认路径）
 static bex_version_t nebula_detect_bepinex(const char *root, char *ver, size_t versz) {
     ver[0] = 0;
-    const char *home = getenv("HOME");
-    char core_root[PATH_MAX], core_doc[PATH_MAX];
-    snprintf(core_root, sizeof(core_root), "%s/BepInEx/core", root);
-    if (home && home[0])
-        snprintf(core_doc, sizeof(core_doc), "%s/Documents/BepInEx/core", home);
-    else core_doc[0] = 0;
+    /* [R86] 模组/宿主释放的 BepInEx core 全在 Documents（R85 日志 705~755 是
+       Documents/BepInEx/core 的目录枚举），只读 .app 里本来就没有这个目录。 */
+    const char *doc = nebula_doc_root(root);
+    char core_doc[PATH_MAX];
+    snprintf(core_doc, sizeof(core_doc), "%s/BepInEx/core", doc);
 
-    bex_version_t r = nebula_classify_bepinex_core(core_root, ver, versz);
-    if (r != BEX_NONE) return r;                          // 模组自带 BepInEx 优先
-    if (core_doc[0]) {
-        bex_version_t d = nebula_classify_bepinex_core(core_doc, ver, versz);
-        if (d != BEX_NONE) return d;                       // Documents 里的
-    }
-    if (blob_find("BepInEx.Unity.IL2CPP")) {               // 宿主内置 v6
+    bex_version_t d = nebula_classify_bepinex_core(core_doc, ver, versz);
+    if (d != BEX_NONE) return d;                           // Documents 里的
+    if (blob_find("BepInEx.Unity.IL2CPP")) {                // 宿主内置 v6
         snprintf(ver, versz, "(宿主内置 BepInEx 6)");
         return BEX_V6;
     }
@@ -1513,7 +1577,8 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     }
     if (!as) {
         char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/BepInEx/core/BepInEx.Unity.IL2CPP.dll", root);
+        /* [R86] 文件兜底也在 Documents（core 是宿主释放的生成物，非游戏本体） */
+        snprintf(path, sizeof(path), "%s/BepInEx/core/BepInEx.Unity.IL2CPP.dll", nebula_doc_root(root));
         FILE *probe = fopen(path, "rb");
         if (!probe) {
             printf("[host] 未找到 BInEx 入口（内存与文件均无）\n");
@@ -1539,26 +1604,18 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     // [R47] iOS 布局校正：交互前先把 GameAssembly/metadata 的真实位置纠正
     // （见 nebula_fix_il2cpp_paths 上方注释 —— 不改这两个路径，interop 必然生成失败）
     nebula_fix_il2cpp_paths(root);
-    /* [R82] CWD 修正：chdir(root) 把 CWD 设成【只读】的 AmongUs.app，而
-       NOS/NebulaLoader 用相对路径 "BepInEx/nebula/Nebula.dll" 找程序集
-       （R81 真机日志 1731 "Assembly Is Not Found." 实锤），真文件在
-       HOME/Documents/BepInEx/nebula/Nebula.dll（33.9MB，日志 984）。
-       切到 Documents 后相对路径即可命中。BepInEx.Paths 已由
-       nebula_init_bepinex_paths 用绝对路径设好，Unity 资源也走 bundle
-       绝对路径，均不受 CWD 影响。NEBULA_CWD=root 可回退旧行为对照。 */
+    /* [R82/R86] CWD 恒为 Documents：NOS/NebulaLoader 用相对路径
+       "BepInEx/nebula/Nebula.dll" 找程序集（R81 真机日志 1731 "Assembly Is Not
+       Found." 实锤），真文件在 HOME/Documents/BepInEx/nebula/Nebula.dll（33.9MB）。
+       R86：删掉 NEBULA_CWD=root 诊断开关与 chdir(root) 兜底 —— CWD 指向只读
+       .app 没有任何正当用途，只会被 NOS 的相对路径写入坑到。BepInEx.Paths /
+       GameRootPath 现已全部落到 Documents，Unity 游戏本体资源仍走 .app 绝对路径。 */
     {
-        const char *home = getenv("HOME");
-        const char *cwdenv = getenv("NEBULA_CWD");
-        if (home && home[0] && (!cwdenv || strcmp(cwdenv, "root"))) {
-            char doc[PATH_MAX];
-            snprintf(doc, sizeof(doc), "%s/Documents", home);
-            if (chdir(doc) == 0)
-                printf("[host][r82] CWD -> %s（NOS 相对路径 BepInEx/nebula/Nebula.dll 可命中）\n", doc);
-            else { chdir(root); printf("[host][r82] !! chdir(Documents) 失败，回退 root\n"); }
-        } else {
-            chdir(root);
-            printf("[host][r82] CWD -> %s（NEBULA_CWD=root 或 HOME 空，保持旧行为）\n", root);
-        }
+        const char *doc = nebula_doc_root(root);
+        if (chdir(doc) == 0)
+            printf("[host][r86] CWD -> %s（NOS 相对路径 BepInEx/nebula/Nebula.dll 可命中）\n", doc);
+        else
+            printf("[host][r86] !! chdir(%s) 失败 errno=%d（NOS 相对路径可能找不到程序集）\n", doc, errno);
     }
     nebula_init_bepinex_paths(domain, root);
     // 关键：在 BepInEx 接管前注入 NEBULA_IOS=1，触发 vendored BepInEx 的 Patch A
@@ -1597,9 +1654,8 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 诊断（R35）：枚举 BepInEx 目录，确认 Preloader/Chainloader 是否生成产物
     // （preloader.log / LogOutput.log / plugins 缓存），定位 NOS 初始化失败原因
     {
-        const char *home = getenv("HOME");
         char bepdir[PATH_MAX];
-        snprintf(bepdir, sizeof(bepdir), "%s/Documents/BepInEx", home ? home : root);
+        snprintf(bepdir, sizeof(bepdir), "%s/BepInEx", nebula_doc_root(root));
         printf("[host][diag] === BepInEx 目录枚举（Start 之后）===\n");
         nebula_list_dir(bepdir, 0);
         fflush(NULL);
@@ -1610,8 +1666,7 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 设备上的文件取回来成本高，这里把关键行直接抓进 host 日志。
     {
         char lglo[PATH_MAX];
-        const char *hom2 = getenv("HOME");
-        snprintf(lglo, sizeof(lglo), "%s/Documents/BepInEx/LogOutput.log", hom2 ? hom2 : root);
+        snprintf(lglo, sizeof(lglo), "%s/BepInEx/LogOutput.log", nebula_doc_root(root));
         static const char *const keys[] = {
             "Interop", "UpdateInteropAssemblies", "Regenerating", "GameAssembly",
             "Cpp2IL", "Generating", "Generator", "possibly out of date",
@@ -1681,21 +1736,18 @@ static void nebula_grep_file(const char *path, const char *const keys[], int nke
    只要 BepInEx 根目录里出现任何 preloader_*.log，就判定 Preloader 半路死掉。
    app 根与 Documents 两处都查（BepInEx 根目录在 iOS 上被重定向到可写容器）。 */
 static int nebula_preloader_failed(const char *root) {
-    const char *home = getenv("HOME");
-    const char *dirs[3];
-    static char b0[PATH_MAX], b1[PATH_MAX], b2[PATH_MAX];
+    /* [R86] 失败标志/日志都在可写 Documents，只读 .app 里不可能有（也不可能写进）。 */
+    const char *doc = nebula_doc_root(root);
+    const char *dirs[2];
+    static char b1[PATH_MAX], b2[PATH_MAX];
     int n = 0;
-    snprintf(b0, sizeof(b0), "%s/BepInEx", root);
-    dirs[n++] = b0;
-    if (home) {
-        snprintf(b1, sizeof(b1), "%s/Documents/BepInEx", home);
-        dirs[n++] = b1;
-        // [R44 修正] preloader.log 真实落点在 Documents 根目录（BepInExRootPath 的
-        // 上一级），不是 Documents/BepInEx —— R43 漏了这个目录，于是明明 Preloader
-        // 崩了却判不出失败，日志里照样打出 boot_bepinex -> 1。
-        snprintf(b2, sizeof(b2), "%s/Documents", home);
-        dirs[n++] = b2;
-    }
+    snprintf(b1, sizeof(b1), "%s/BepInEx", doc);
+    dirs[n++] = b1;
+    // [R44 修正] preloader.log 真实落点在 Documents 根目录（BepInExRootPath 的
+    // 上一级），不是 Documents/BepInEx —— R43 漏了这个目录，于是明明 Preloader
+    // 崩了却判不出失败，日志里照样打出 boot_bepinex -> 1。
+    snprintf(b2, sizeof(b2), "%s", doc);
+    dirs[n++] = b2;
 
     for (int i = 0; i < n; i++) {
         DIR *d = opendir(dirs[i]);
@@ -1758,7 +1810,7 @@ static int boot_mods_dir(MonoDomain *domain, const char *root) {
     char mdir[PATH_MAX];
     const char *m = getenv("NEBULA_MODS_DIR");
     if (m && *m) snprintf(mdir, sizeof(mdir), "%s", m);
-    else         snprintf(mdir, sizeof(mdir), "%s/Mods", root);
+    else         snprintf(mdir, sizeof(mdir), "%s/Mods", nebula_doc_root(root));  /* [R86] 模组目录在可写 Documents */
 
     DIR *d = opendir(mdir);
     if (!d) { printf("[host] 无 Mods 目录: %s\n", mdir); return 0; }
@@ -2958,16 +3010,16 @@ static void *boot_thread_impl(void *arg) {
     // 若要完整文化格式化，放 icudt.dat 到 dylib 同目录并删此行。
     setenv("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1", 1);
 
-    {   // 尽早开日志（早到能覆盖后面每一步），并依次试多个可写位置
+    {   // [R86] 尽早开日志，只试【可写 Documents】；不再试只读 .app / NEBULA_GAME_DIR
         char p[PATH_MAX];
         const char *home = getenv("HOME");
         if (home) { snprintf(p, sizeof(p), "%s/Documents/nebula_host.txt", home); log_try(p); }
-        const char *gd = getenv("NEBULA_GAME_DIR");
-        if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.txt", gd);             log_try(p); }
+        snprintf(p, sizeof(p), "/var/mobile/Documents/nebula_host.txt"); log_try(p);
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
-        hlog("[host][r85] ===== 版本标记 R85：宿主层 kernel32.dll -> no-op stub(GetModuleHandle* 恒返回 0)，让 NOS 的 Windows 增量 GC 干预(TryDisable/DiscoverFlagAddress)安全短路；模组 DLL 零改动、BepInEx 原生加载；GC 只在宿主层(MONO_GC_PARAMS=major=marksweep)管 =====");
-        hlog("[host][r85] 提示：R84 的日志里若出现 DllNotFoundException: kernel32.dll / Error loading [NebulaLoader]，说明跑的是旧包，请用 R85 重新 build 的 dylib");
+        hlog("[host][r86] ===== 版本标记 R86：路径基准全面改到可写 Documents —— GameRootPath 由 DOORSTOP_PROCESS_PATH=Documents/AmongUs 落到 Documents，NOS 的 NebulaLibsPath(PC 版=GameRootPath/NebulaLibs)不再往只读 .app 建目录；MONO_PATH/生成物/日志/配置/Mods/CWD 全改 Documents；.app 仅保留游戏本体只读资源(UnityFramework/global-metadata/Data/dylib)，Data 用符号链接接回；模组 DLL 零改动、BepInEx 原生加载 =====");
+        hlog("[host][r86] 继承 R85：kernel32.dll -> no-op stub(GetModuleHandle* 恒返回 0)，NOS 增量 GC 干预安全短路；GC 只在宿主层(MONO_GC_PARAMS=major=marksweep)管");
+        hlog("[host][r86] 提示：若日志仍出现 UnauthorizedAccessException: .../AmongUs.app/NebulaLibs 或 DllNotFoundException: kernel32.dll，说明跑的是旧包(R85 及以前)，请用 R86 重新 build 的 dylib");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -2984,10 +3036,10 @@ static void *boot_thread_impl(void *arg) {
     if (!root || !*root) root = dir;
     hlog("[host] game root = %s", root);
 
-    if (!g_logfp) {   // 前面候选都没成功，再试游戏根目录 / dylib 同目录
+    if (!g_logfp) {   // [R86] 前面候选都没成功，再试可写 Documents（只读 .app 写不进，不再尝试）
         char p[PATH_MAX];
-        snprintf(p, sizeof(p), "%s/nebula_host.txt", root); log_try(p);
-        snprintf(p, sizeof(p), "%s/nebula_host.txt", dir);  log_try(p);
+        snprintf(p, sizeof(p), "%s/nebula_host.txt", nebula_doc_root(root)); log_try(p);
+        snprintf(p, sizeof(p), "%s/BepInEx/nebula_host.txt", nebula_doc_root(root)); log_try(p);
     }
     if (!g_logfp) hlog("[host] !! 日志无法创建：所有候选路径都不可写");
 
