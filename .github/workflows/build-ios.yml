@@ -7,6 +7,7 @@ on:
     paths:
       - 'scripts/**'
       - 'src/mono_host/**'
+      - 'tools/**'
       - '.github/workflows/build-ios.yml'
 
 # 独有并发组（与 build.yml 不重名），避免同一 commit 重复跑 15 分钟 mono 重编；

@@ -111,6 +111,78 @@ if [ ! -d "$MONO_ROOT/lib/net8.0" ]; then
 fi
 echo "MONO_ROOT: $MONO_ROOT"
 
+# ---------------------------------------------------------------------------
+# [R87] 修 net6 typeref -> .NET 8 facade 的 Marshal 转发断链（NOS 加载主因）
+#
+# R86 真机日志 1655/1683/1758：AutoSave / AUI.ServerScroll / NebulaLoader 全崩在
+#   TypeLoadException: Could not resolve type with token 01000059 from typeref
+#     (expected class 'System.Runtime.InteropServices.Marshal'
+#      in assembly 'System.Runtime, Version=6.0.0.0 ...')
+#   -> Harmony.PatchAll -> Il2CppType.From -> Il2CppClassPointerStore<T>.cctor；
+#   NebulaPlugin.LoadInternal 也在此中断，NOS 起不来。
+#
+# 根因（元数据坐实，非裁剪、非模组问题）：BepInEx / Il2CppInterop 1.5.3 用 .NET 6
+#   reference assemblies 编译，ref pack 把 Marshal 定义成 System.Runtime.dll 的
+#   TypeDef，故 typeref 的 ResolutionScope 写死 System.Runtime 6.0.0.0；宿主 BCL
+#   是官方 .NET 8.0.32 System.Runtime.dll(43344B, 891 个 ExportedType)，它把
+#   System.Runtime.InteropServices.* 整体交给 System.Runtime.InteropServices.dll
+#   转发，自己不再含 Marshal 本体 -> Mono 按 scope 命中 8.0 facade 后查不到。
+#   Marshal 在 4375336B 的 System.Private.CoreLib(8.0.0.0) 里确实有 TypeDef。
+#   精确扫描 bepinex-core/*.dll 全部 TypeRef：缺失项【只有 Marshal 一个】，
+#   补这一条即可，不会连锁挤牙膏；.NET 6->8 的另外 55 个差异全是内部嵌套类型/
+#   泛型数学接口，与插件无关。
+#
+# 修法（只改宿主 BCL facade；模组 DLL 一字节不动、不做 IL 补丁、BepInEx 原生加载）：
+#   给 System.Runtime.dll 追加
+#     [TypeForwardedTo(System.Runtime.InteropServices.Marshal)] -> System.Private.CoreLib
+#   该 dll 的 AssemblyRef 已含 corelib，零新增依赖。
+#
+# 双路径（CI 的 host-dylib job 没有 setup-dotnet，不能硬依赖 dotnet）：
+#   ① 主路径：官方 8.0.32 原版 sha 匹配 -> 换成本仓库预生成、已完整验证的补丁版
+#      （Cecil 自校验 + dnfile 独立复核 + ikdasm + 幂等，零编译依赖）。
+#   ② 兜底：BCL 版本变了（原版 sha 不符）-> 用 tools/patch_facade_marshal 现场
+#      用 Cecil 补转发，该工具自带完整语义校验，失败即拒绝产出。
+# 最后把当前 FACADE 的 sha 写进 FACADE_SHA_MARK，blob 生成的 python 会断言内嵌的
+# 确实是同一份 —— 绝不给用户一个「看着出了包、真机仍崩」的版本。
+# ---------------------------------------------------------------------------
+FACADE="$MONO_ROOT/lib/net8.0/System.Runtime.dll"
+FACADE_SHA_MARK="$OUT/.facade_marshal.sha"
+PREBUILT="$ROOT/facade-patch/System.Runtime.net8.0.32.patched.dll"
+ORIG_SHA_8032="c6fd93aa8bb5016fb1766525940353c9a7723425152d2812a84dd679630c1f38"
+PATCHED_SHA_8032="b2b0f39a8ba03cca70bd810814a4be8d82bf410ce6072a8e1328fb5d063b755c"
+R87_PATCH_PROJ="$ROOT/../../tools/patch_facade_marshal/patch_facade_marshal.csproj"
+
+sha256_of() {
+    python3 -c 'import sys,hashlib;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
+}
+
+[ -f "$FACADE" ] || { echo "✗ [R87] 找不到 $FACADE" >&2; exit 1; }
+CUR_SHA="$(sha256_of "$FACADE")"
+echo "   [R87] 官方 System.Runtime.dll: $(wc -c < "$FACADE") bytes, sha=$CUR_SHA"
+
+if [ "$CUR_SHA" = "$PATCHED_SHA_8032" ]; then
+    echo "   [R87] ✓ 已是补丁版（缓存/重复构建命中），跳过写入"
+elif [ "$CUR_SHA" = "$ORIG_SHA_8032" ] && [ -f "$PREBUILT" ] && \
+     [ "$(sha256_of "$PREBUILT")" = "$PATCHED_SHA_8032" ]; then
+    cp "$PREBUILT" "$FACADE"
+    echo "   [R87] ✓ 已换为预生成补丁版（含 Marshal 转发，零 dotnet 依赖）"
+else
+    echo "   [R87] 原版 sha 与 8.0.32 基准不符或预生成版缺失 -> 走 dotnet 现场补丁" >&2
+    command -v dotnet >/dev/null 2>&1 || { echo "✗ [R87] 需要 dotnet 现场补转发，但 dotnet 不可用" >&2; exit 1; }
+    [ -f "$R87_PATCH_PROJ" ] || { echo "✗ [R87] 补丁工具缺失: $R87_PATCH_PROJ" >&2; exit 1; }
+    dotnet run --project "$R87_PATCH_PROJ" -c Release -- \
+        "$FACADE" "$FACADE_SHA_MARK" || { echo "✗ [R87] 现场补丁/语义校验失败，拒绝产出" >&2; exit 1; }
+fi
+
+# 主路径（含缓存命中）也写 sha 标记；dotnet 路径由工具自己写好，不覆盖
+if [ ! -s "$FACADE_SHA_MARK" ]; then
+    sha256_of "$FACADE" > "$FACADE_SHA_MARK"
+fi
+FINAL_SHA="$(sha256_of "$FACADE")"
+[ "$(cat "$FACADE_SHA_MARK")" = "$FINAL_SHA" ] || {
+    echo "✗ [R87] sha 标记与当前 facade 不一致（blob 可能内嵌错版本）" >&2; exit 1; }
+echo "   [R87] ✓ 待内嵌 facade sha=$FINAL_SHA（Marshal -> System.Private.CoreLib）"
+
 echo "=== 生成嵌入式 blob（BCL + 可选 BepInEx/core，全部内存加载，无散文件）==="
 BLOB="$OUT/.nebula_bcl.blob"
 # BepInEx/core 默认取 vendored 目录（与星云包锁版本）；可用 BEPINEX_CORE_DIR 覆盖
@@ -143,12 +215,13 @@ if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
   fi
 fi
 
-python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" <<'PY'
+python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
 bepinex_core = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else ""
 blob_path = sys.argv[3]
 root_dir = sys.argv[4] if len(sys.argv) > 4 else "."
+facade_sha_mark = sys.argv[5] if len(sys.argv) > 5 else ""
 
 entries = []; seen = set()
 def add(name, data):
@@ -156,11 +229,28 @@ def add(name, data):
     seen.add(name); entries.append((name, data))
 
 # 1) .NET 8 BCL（托管程序集，含 System.Private.CoreLib）
+# [R87] 强校验：内嵌的 System.Runtime.dll 必须是上面补过 Marshal 转发的那份。
+# sha 标记由 build_ios.sh 的 R87 段写入（主路径=预生成补丁版；兜底=dotnet 现场
+# 补丁工具语义校验通过后自己写）。不一致直接 sys.exit(1)，绝不出会崩的包。
+import hashlib
+expected_facade_sha = ""
+if facade_sha_mark and os.path.isfile(facade_sha_mark):
+    expected_facade_sha = open(facade_sha_mark).read().strip()
 bcl_dir = os.path.join(mono_root, "lib", "net8.0")
 if os.path.isdir(bcl_dir):
     for f in sorted(os.listdir(bcl_dir)):
         if f.endswith(".dll"):
-            add(f, open(os.path.join(bcl_dir, f), "rb").read())
+            data = open(os.path.join(bcl_dir, f), "rb").read()
+            if f == "System.Runtime.dll":
+                actual = hashlib.sha256(data).hexdigest()
+                if not expected_facade_sha or actual != expected_facade_sha:
+                    print("!! [R87] blob 内 System.Runtime.dll 不是补过 Marshal 转发的版本 "
+                          "(expected=%s actual=%s) —— 拒绝产出" %
+                          (expected_facade_sha[:16] or "<无标记>", actual[:16]), file=sys.stderr)
+                    sys.exit(1)
+                print("   [R87] ✓ blob System.Runtime.dll sha=%s (%d bytes, 含 Marshal 转发)"
+                      % (actual[:16], len(data)))
+            add(f, data)
 else:
     print("!! 没找到 lib/net8.0，BCL 未嵌入", file=sys.stderr)
 

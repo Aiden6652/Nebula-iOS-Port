@@ -263,6 +263,143 @@ iOS 全量构建需 macOS+Xcode，真机待复测。
 .../AmongUs.app/NebulaLibs`，随后应出现 NOS 自身启动日志与
 `[host][r86] Data 链接: ... -> .../AmongUs.app/Data`。
 
-> AutoSave / ServerScroll 的 `Marshal` TypeLoad、GamePatch 的 `FormatException`、
-> ImmersionAudioBridge 的 `InjectorHelpers`、`dobby` DllNotFound 均属各模组/组件
-> 独立问题，不在本轮"NOS 加载链 + 路径基准"范围内，未处理。
+> **§10 结论更正（R87）**：上面把 AutoSave / ServerScroll 的 `Marshal` TypeLoad
+> 判成「各模组独立问题、不在 NOS 加载链上」是**错的**。R87 已坐实它是**全局
+> BCL 主因**：同一个 `Marshal` typeref 解析失败也把 `NebulaLoader` /
+> `NebulaPlugin.LoadInternal` 一起干掉（见 §11）。R86 之所以看起来「三关都过了、
+> 只差一点」，正是因为路径修好后 NOS 终于走到 `LoadInternal`，才第一次暴露出
+> 这个一直存在、此前被更早的崩溃遮住的底层问题。
+>
+> GamePatch 的 `FormatException`、ImmersionAudioBridge 的 `InjectorHelpers`、
+> `dobby` DllNotFound 确实各自独立，与本轮主因无关，仍未处理。
+
+## 11. [R87] System.Runtime facade 缺 Marshal 转发：net6 typeref 在 .NET 8 Mono 上全灭
+
+### 现象（R86 真机日志，三关全过后的新主因）
+
+R85 的 kernel32 no-op、R86 的路径基准都生效了：首行 `版本标记 R86`，日志里
+**没有** `UnauthorizedAccessException: .../AmongUs.app/NebulaLibs`，也**没有**
+`DllNotFoundException: kernel32.dll`；`Nebula.dll`(33928192 B) 已读到，
+`NebulaPlugin.LoadInternal(Boolean android)` 在 1779 行**真的进去了**。
+
+但 AutoSave(1652) / AUI.ServerScroll(1680) / NebulaLoader(1754) 三个插件全部
+`Error loading`，且是**同一条链**：
+
+```
+System.TypeLoadException: Could not resolve type with token 01000059 from typeref
+  (expected class 'System.Runtime.InteropServices.Marshal'
+   in assembly 'System.Runtime, Version=6.0.0.0, Culture=neutral,
+    PublicKeyToken=b03f5f7f11d50a3a')
+   at Il2CppInterop.Runtime.IL2CPP.GetIl2CppClass(String, String, String)
+   at Il2CppInterop.Runtime.Il2CppClassPointerStore`1..cctor()
+   at Il2CppInterop.Runtime.Il2CppType.From(Type, Boolean)
+   at Il2CppInterop.HarmonySupport.HarmonySupportComponent.TryResolve(...)
+   at HarmonyLib.Harmony.PatchAll()
+   at Nebula.NebulaPlugin.LoadInternal(Boolean android)   ← NOS 在此中断
+```
+
+它不只是 AutoSave 的问题：`NebulaLoader` 的栈里 `LoadInternal` → `PatchAll()`
+崩在同一行，所以 **NOS 起不来就是这个 typeref**。§10 把它判成「各模组独立问题」
+是错的，已更正。
+
+### 根因（元数据坐实，非猜测、非裁剪）
+
+| 程序集 | 事实 |
+|---|---|
+| `Il2CppInterop.Runtime.dll` 1.5.3（BepInEx/core，net6 编译） | AssemblyRef 含 `System.Runtime 6.0.0.0`；TypeRef `token 0x01000059` = `System.Runtime.InteropServices.Marshal`，ResolutionScope 指向该 AssemblyRef |
+| 官方 .NET 8.0.32 `System.Runtime.dll` **43344 B** | AssemblyDef `8.0.0.0`，891 个 ExportedType，**没有 `Marshal` 本体**（只有 `Marshalling.*`、`DisableRuntimeMarshallingAttribute`、`MarshalByRefObject` 等 10 个近似名） |
+| 官方 `System.Runtime.InteropServices.dll` **57680 B** | 150 个 ExportedType，**有** `System.Runtime.InteropServices.Marshal → System.Private.CoreLib` |
+| 官方 `System.Private.CoreLib.dll` **4375336 B** | TypeDef 里**有** `System.Runtime.InteropServices.Marshal` |
+
+三个字节数与真机日志 598/644/103 行**分毫不差**，说明真机加载的就是官方
+8.0.32 原版 BCL —— **facade 没有被裁剪**。
+
+真正的原因是 **.NET 6 → .NET 8 的契约迁移**：.NET 6 ref pack 把 `Marshal` 定义成
+`System.Runtime.dll` 里的 TypeDef（编译期占位），所以 net6 编译的程序集把 typeref
+的 scope 写死 `System.Runtime`；而 .NET 8 runtime 把
+`System.Runtime.InteropServices.*` 的转发整体挪给了
+`System.Runtime.InteropServices.dll`。Mono 按 typeref scope 命中 8.0 的
+`System.Runtime.dll` 后查不到该 ExportedType → `TypeLoadException`。
+
+### 精确扫描：只需补一条，不会连锁挤牙膏
+
+扫描 `bepinex-core/*.dll` 全部 TypeRef，找 scope=`System.Runtime` 且 .NET8 facade
+里不存在的类型：**只有 `System.Runtime.InteropServices.Marshal` 一个**
+（被 `Il2CppInterop.Runtime` / `BepInEx.Unity.IL2CPP` / `AsmResolver.DotNet` /
+`Gee.External.Capstone` 引用）。对照 .NET 6 runtime facade(844) 与 .NET 8(884)
+的 55 个差异，全是 `<...>e__FixedBuffer` / `*DebugView` / `INumber<T>` 这类内部
+嵌套类型与泛型数学接口，插件不会引用。补 Marshal 一条即可。
+
+### 修法（只改宿主 BCL facade，模组零改动、BepInEx 原生加载）
+
+给宿主 BCL 的 `System.Runtime.dll` 追加：
+
+```
+[assembly: TypeForwardedTo(typeof(System.Runtime.InteropServices.Marshal))]
+    -> Implementation = System.Private.CoreLib (8.0.0.0)
+```
+
+该 dll 的 AssemblyRef 里**已有** `System.Private.CoreLib`，零新增依赖；两个
+facade 同时转发同一类型不冲突（typeref 的 scope 决定查哪个）。**不改模组 DLL、
+不做 IL 补丁、不预加载、不动 BepInEx core 原版**。
+
+**对 DeepSeek 建议的取舍（为什么没照抄）**：
+
+| 建议 | 结论 |
+|---|---|
+| 「确认 System.Runtime facade 被裁剪」 | **证伪**：43344/4375336/57680 B 与官方 8.0.32 包字节级一致，是完整原版，问题是契约迁移不是裁剪 |
+| 「A：用 AssemblyResolve 重定向 typeref」 | **在 Mono 里无效**：typeref 由 runtime 内部 `mono_class_from_typeref` 解析，只走已加载 assembly + preload hook，不触发 `AppDomain.AssemblyResolve`（后者只管按名字 `Assembly.Load`） |
+| 「B：完整 facade 放 Documents/BepInEx/core 并确保 MONO_PATH 命中」 | **本项目不生效**：`nebula_preload` 内存 blob 钩子优先于磁盘，且 `System.Runtime.dll` 已在 blob 内被内存加载（日志 598），放散文件不会被读到 |
+| 「用 TypeForwardedTo 兜底」 | **采纳思路，改落点**：在构建期改 blob 里的宿主 BCL facade，这是本项目唯一能生效的位置 |
+
+### 构建期落地（双路径 + 强校验）
+
+- `tools/patch_facade_marshal/`（Mono.Cecil，net6.0）：幂等补转发；写回后**重新读**
+  校验 AssemblyDef 仍 `System.Runtime 8.x`、`IsForwarder`、目标
+  `System.Private.CoreLib`、ExportedType 数 891→892；任一不满足非零退出。
+- `src/mono_host/facade-patch/System.Runtime.net8.0.32.patched.dll`：沙箱预生成、
+  已完整验证的补丁版（33280 B），随仓库入库。
+- `build_ios.sh` R87 段：
+  ① **主路径**：官方 8.0.32 原版 sha 匹配 → 直接换预生成补丁版，
+  **零编译依赖**（CI 的 `host-dylib` job 没有 `setup-dotnet`，不能硬依赖 dotnet）；
+  ② **兜底**：BCL 版本变了（原版 sha 不符）→ 用 dotnet 现场跑补丁工具，
+  失败或缺 dotnet 即 `exit 1` 拒绝产出；
+  ③ 把当前 facade 的 sha 写进 `$OUT/.facade_marshal.sha`。
+- blob 生成 python 新增第 5 参数：断言内嵌的 `System.Runtime.dll` sha 与标记一致，
+  不一致 `sys.exit(1)` —— 绝不出「看着有包、真机仍崩」的版本。
+- `.github/workflows/build-ios.yml` 的 `paths` 补 `tools/**`（改补丁工具也能触发 CI）。
+- 版本标记 → **R87**。
+
+### 沙箱验证
+
+- 补丁工具**实际编译运行通过**；Cecil 自校验 + dnfile 独立复核：
+  AssemblyDef `System.Runtime 8.0` 保持、AssemblyRef 两个（`System.Private.CoreLib`
+  / `System.Private.Uri`）都在、ExportedType **891 → 892、原 891 个转发一个没丢**、
+  新增项 `ikdasm` 显示 `.class extern forwarder System.Runtime.InteropServices.Marshal`
+  → `.assembly extern System.Private.CoreLib`。
+- 原版 891 个 ExportedType 的 Flags 本来全是 `0x0`，补丁版与官方惯例一致
+  （不是漏写 `tdForwarder` 位；ikdasm 已确认是 forwarder）。
+- 幂等：连跑两次产物 sha 一致（`b2b0f39a8ba03cc…`）。
+- `bash -n`、blob python 语法、sha 校验链路本地模拟通过。
+- iOS 全量构建需 macOS + Xcode，真机待复测。
+
+### 真机怎么验
+
+1. 构建日志出现 `[R87] ✓ blob System.Runtime.dll ... 含 Marshal 转发`。
+2. 日志首行 `版本标记 R87`。
+3. `Loading [AutoSave]` / `[AUI Server Scroll]` / `[NebulaLoader]` 之后**不再出现**
+   `Could not resolve type with token 01000059`、`System.Runtime.InteropServices.Marshal`、
+   `HarmonyException`、`Il2CppClassPointerStore`。
+4. `Il2CppClassPointerStore<EndGameManager/AmongUsClient>` 的
+   `RunClassConstructor` 成功，Harmony patch 真正装上。
+5. `NebulaPlugin.LoadInternal` 继续往下，出现 **NOS 自身启动日志**。
+
+### 首发剔除名单（确认独立，按「别浪费精力」不处理）
+
+| 插件 | 栈 | 原因 |
+|---|---|---|
+| GamePatch `0.0.1+00d126c…` | `System.Version.Parse("1+00d126c…")` → `FormatException` | SemVer 的 `+hash` 不是合法版本号；自己 `.cctor` 崩，与 Marshal 无关 |
+| ImmersionAudioBridge | `Enumerable.Single<ProcessModule>` → `InvalidOperationException: Sequence contains no matching element`（`InjectorHelpers..cctor`） | iOS 上 IL2CPP 模块叫 `UnityFramework` 不是 `GameAssembly`，`ClassInjector` 找不到；`[Warning]` 级，插件本身已 loaded |
+
+两者均不影响 NOS 骨架，按建议不投入精力、也不删用户 Documents 里的模组文件。
+`dobby` DllNotFound 同样是独立组件问题。

@@ -43,6 +43,10 @@ src/mono_host/out/
 # 例外：Unity 2022.3.44 托管基础库（构建期嵌进 dylib 当 Cecil 参考，vendored，非构建产物）
 !src/mono_host/unity-libs/
 !src/mono_host/unity-libs/*.dll
+# 例外：[R87] 预生成的 .NET 8 System.Runtime facade 补丁版（补了 Marshal 转发；
+#       随仓库固定，构建期直接替换 BCL 原件，避免 CI 依赖 dotnet）
+!src/mono_host/facade-patch/
+!src/mono_host/facade-patch/*.dll
 # 例外：[R60] 预编译的服务器列表滑动补丁（BepInEx IL2CPP 插件，随包发布）
 !src/plugins/ServerScroll/
 !src/plugins/ServerScroll/*.dll

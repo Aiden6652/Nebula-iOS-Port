@@ -3017,9 +3017,11 @@ static void *boot_thread_impl(void *arg) {
         snprintf(p, sizeof(p), "/var/mobile/Documents/nebula_host.txt"); log_try(p);
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
-        hlog("[host][r86] ===== 版本标记 R86：路径基准全面改到可写 Documents —— GameRootPath 由 DOORSTOP_PROCESS_PATH=Documents/AmongUs 落到 Documents，NOS 的 NebulaLibsPath(PC 版=GameRootPath/NebulaLibs)不再往只读 .app 建目录；MONO_PATH/生成物/日志/配置/Mods/CWD 全改 Documents；.app 仅保留游戏本体只读资源(UnityFramework/global-metadata/Data/dylib)，Data 用符号链接接回；模组 DLL 零改动、BepInEx 原生加载 =====");
-        hlog("[host][r86] 继承 R85：kernel32.dll -> no-op stub(GetModuleHandle* 恒返回 0)，NOS 增量 GC 干预安全短路；GC 只在宿主层(MONO_GC_PARAMS=major=marksweep)管");
-        hlog("[host][r86] 提示：若日志仍出现 UnauthorizedAccessException: .../AmongUs.app/NebulaLibs 或 DllNotFoundException: kernel32.dll，说明跑的是旧包(R85 及以前)，请用 R86 重新 build 的 dylib");
+        hlog("[host][r87] ===== 版本标记 R87：宿主 BCL 的 System.Runtime.dll 补 TypeForwardedTo(System.Runtime.InteropServices.Marshal) -> System.Private.CoreLib，修 net6 typeref 在 .NET 8 facade 上的 TypeLoadException；模组 DLL 零改动、BepInEx 原生加载 =====");
+        hlog("[host][r87] 根因：Il2CppInterop/BepInEx 用 .NET 6 ref pack 编译，typeref scope 写死 System.Runtime 6.0.0.0 的 Marshal；官方 .NET 8 System.Runtime.dll(43344B) 把 InteropServices 全交给 System.Runtime.InteropServices.dll 转发，自己不含 Marshal -> Mono 解析 typeref 01000059 失败，Harmony.PatchAll 全灭(含 NebulaPlugin.LoadInternal)");
+        hlog("[host][r87] 继承 R86：路径基准全改 Documents(GameRootPath 可写，NOS 的 NebulaLibs 不再往只读 .app 建)；继承 R85：kernel32.dll -> no-op stub；GC 只在宿主层(MONO_GC_PARAMS=major=marksweep)管");
+        hlog("[host][r87] 真机验收：Loading [AutoSave]/[AUI Server Scroll]/[NebulaLoader] 之后不应再出现 Could not resolve type with token 01000059 / System.Runtime.InteropServices.Marshal；NebulaPlugin.LoadInternal 应继续往下走，出现 NOS 自身启动日志");
+        hlog("[host][r87] 提示：若仍出现 UnauthorizedAccessException: .../AmongUs.app/NebulaLibs 或 DllNotFoundException: kernel32.dll，说明跑的是旧包(R86 及以前)，请用 R87 重新 build 的 dylib");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
