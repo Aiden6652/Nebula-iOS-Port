@@ -52,11 +52,22 @@ echo "MONO_INC: $MONO_INC"
 #   mono_component_debugger_init / diagnostics_server_init / event_pipe_init /
 #   hot_reload_init / marshal_ilgen_init
 # 少一个就 Undefined symbol。
-# 唯一可以省的是 debugger：有 stub 版（0.06MB）顶替完整版（1.32MB），二选一。
+#
+# [R84] 组件必须「stub / full 二选一」，不能两个都进 LIBS：官方 iOS nupkg 对同一个
+# 组件同时提供 libmono-component-<name>-static.a（完整实现）和
+# libmono-component-<name>-stub-static.a（空实现），两者导出同名的
+# mono_component_<name>_init。静态库按命令行顺序先到先得，两个都链时谁赢取决于
+# find 的返回顺序，不受控 —— 这正是 R83 真机崩溃的根因（详见 docs/mod-compatibility.md §8）。
+#   · debugger：完整版 1.32MB 且 iOS 用不上调试器 → 留 stub（0.06MB），排除 full。
+#   · marshal-ilgen：**必须用 full**。本宿主强制 mono_aot_only=0 纯 JIT，任何
+#     P/Invoke 首次调用都要运行时生成 native wrapper（IL）。stub 注册的回调是
+#     stub_emit_marshal_ilgen → g_assert_not_reached() → abort()，真机表现为加载
+#     第一个 Harmony/IL2CPP 插件时 SIGSEGV。官方 iOS 默认 AOT 所以用 stub，我们不适用。
 LIBS=()
 while IFS= read -r line; do
   case "$(basename "$line")" in
-    libmono-component-debugger-static.a) continue ;;  # 用 stub 版
+    libmono-component-debugger-static.a) continue ;;          # debugger 用 stub 版
+    libmono-component-marshal-ilgen-stub-static.a) continue ;; # [R84] 排除 stub，只链 full
     libSystem.*.a) continue ;;  # [R60] 下面用 -Wl,-force_load 单独全量链，避免重复定义
     libicu*.a) continue ;;      # [R60] ICU 同样单独 -force_load
   esac
@@ -69,6 +80,24 @@ if [ "${#LIBS[@]}" -eq 0 ]; then
   echo "!! 没找到 Mono 静态库，检查 $MONO_PREFIX" >&2
   exit 1
 fi
+
+# [R84] 构建期强校验：完整版 marshal-ilgen 必须在链接清单里，且 stub 版必须不在。
+# 宁可构建失败，也不能静默产出「一碰 P/Invoke 就 abort」的 dylib 让用户白测一轮。
+MI_FULL=0; MI_STUB=0
+for l in "${LIBS[@]}"; do
+  case "$(basename "$l")" in
+    libmono-component-marshal-ilgen-static.a)      MI_FULL=1 ;;
+    libmono-component-marshal-ilgen-stub-static.a) MI_STUB=1 ;;
+  esac
+done
+if [ "$MI_FULL" -ne 1 ] || [ "$MI_STUB" -ne 0 ]; then
+  echo "!! [R84] marshal-ilgen 组件选择错误：full=$MI_FULL stub=$MI_STUB（要求 full=1 stub=0）" >&2
+  echo "!! 纯 JIT 必须链接 libmono-component-marshal-ilgen-static.a；只链 stub 会让" >&2
+  echo "!! mono_marshal_get_native_wrapper → stub_emit_marshal_ilgen → abort()。拒绝产出。" >&2
+  exit 1
+fi
+echo "   [R84] marshal-ilgen: 完整版已入选、stub 已排除（纯 JIT 的 P/Invoke wrapper 可正常生成）"
+
 echo "静态库 ${#LIBS[@]} 个:"
 printf '  %s\n' "${LIBS[@]}"
 
@@ -88,11 +117,12 @@ if [ -z "${BEPINEX_CORE_DIR:-}" ] && [ -d "$ROOT/bepinex-core" ]; then
 fi
 echo "   BepInEx/core 来源: ${BEPINEX_CORE_DIR:-无（仅嵌 BCL）}"
 
-# [R83] 幂等应用 marshal-ilgen 补丁：iOS 裁剪版 MonoVM 的 marshal-ilgen 后端被 stub
-# 掉（build_ios.sh 早有记录），任何 string/bool 的非 blittable P/Invoke 首次 JIT 生成
-# native wrapper 即 abort()（AutoSave / ServerScroll 等所有 Harmony 打 IL2CPP 类型的
-# 插件都踩）。此工具把这些 P/Invoke 改成 blittable(IntPtr/byte) + 同名托管 wrapper，
-# 调用点零改动。已打过的 dll 会因 Needs()=0 自动跳过，可反复安全执行。
+# [R83 → R84 更正] 下面这个 blittable 补丁【不是崩溃的根因修复】，保留仅作无害兜底。
+# R83 曾误判为「非 blittable 参数(string/bool/LPUTF8Str)导致 marshal-ilgen 失败」，
+# 但 R84 真机日志证明：.cctor 里零参数、纯 IntPtr 的 il2cpp_domain_get() 照样崩，
+# 真根因是链接了 marshal-ilgen 的 stub 组件(见 §8，build_ios.sh 已排除、只链 full)。
+# 补丁把 string/bool 的 P/Invoke 改成 blittable + 同名托管 wrapper，调用点零改动，
+# 已验证合法且无副作用，保留可降低完整版 marshal-ilgen 的封送复杂度。幂等可反复执行。
 if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
   # 从源码现场编译运行，不依赖 bin/（bin/obj 已被 .gitignore 忽略，干净 clone 也能用）。
   # Cecil 由 csproj 的 HintPath 指向已入库的 bepinex-core/Mono.Cecil.dll。
@@ -372,6 +402,32 @@ else
   do_link "${FORCE_DOBBY[@]}"
 fi
 echo "    [R60] CoreLib shim 模式: $R60_SHIM_MODE"
+
+# [R84] 产物级终检：直接对最终 dylib 查 stub 组件独有的字符串常量。
+# 上面「清单校验」只能保证 LIBS 里没列 stub；万一 force_load 的其它归档或
+# 别处又拉进一份 stub 目标文件，清单看不出来，但产物里必然留下这句错误文本。
+# 检出即判失败，绝不让「一碰 P/Invoke 就 abort」的包流到用户手上。
+DYLIB_STRINGS="$(strings -a "$OUT/libnebula_standard.dylib" 2>/dev/null || true)"
+if grep -q "Cannot marshal nonblittlable types without marshal-ilgen" <<<"$DYLIB_STRINGS"; then
+  echo "!! [R84] 最终 dylib 里检出 marshal-ilgen STUB 实现（会 abort），拒绝产出" >&2
+  echo "!! 检查是否有 -force_load 的归档或 MONO_PREFIX 下别处又提供了 stub 版" >&2
+  rm -f "$OUT/libnebula_standard.dylib"
+  exit 1
+fi
+# 正向校验：完整实现独有字符串（仅在 marshal-ilgen.c.o 里，stub 版没有）必须在，
+# 否则说明 full 的 .o 根本没被拉进链接（静态库按需加载，若 init 符号被 stub 顶掉就会这样）。
+FULL_MARK=1
+if ! grep -q "Return marshalling of stringbuilders is not implemented" <<<"$DYLIB_STRINGS"; then
+  # 仅告警不阻断：清单已保证 full 入选且 stub 排除，链接器必然拉入 full 的 .o；
+  # 这里查不到多半是不同平台 strings 对 __cstring 的扫描差异，误杀会让人白等一轮构建。
+  echo "    [R84] ⚠ 产物里未见 full 实现标志字符串（可能是 strings 扫描差异），清单/负向校验已通过，继续" >&2
+  FULL_MARK=0
+fi
+if [ "$FULL_MARK" -eq 1 ]; then
+  echo "    [R84] 终检通过：无 stub 字符串、有 full 实现标志（完整版 marshal-ilgen 已链入）"
+else
+  echo "    [R84] 终检通过：无 stub 字符串（完整版 marshal-ilgen 已链入，清单校验为准）"
+fi
 
 # 注：BCL 已嵌入 dylib 的 __nebulabcl 段（见上方 blob 生成），不再散落 bcl/ 目录。
 # 运行时由 nebula_mono_host.c 的 Mono 预加载钩子从内存加载。

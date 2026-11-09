@@ -84,22 +84,54 @@ Engine.dll POC（仅桌面验证用）
 
 - `UpdateInteropAssemblies` → iOS 上建议 **false**（没网也没必要，interop 我们离线生成好带过去）
 
-## 7. [R83] marshal-ilgen 崩溃根因与补丁（修好一切 Harmony 打 IL2CPP 类型的模组）
+## 7. [R83] blittable 补丁（⚠️ 根因判断错误，现仅为无害兜底，见 §8）
 
-**现象**：加载第一个用 Harmony 打游戏类型补丁的插件（AutoSave、AUI.ServerScroll 等）即 SIGSEGV，托管栈顶是 `Il2CppInterop.Runtime.IL2CPP:.cctor`，native 栈 `stub_emit_marshal_ilgen → g_assert_not_reached() → abort()`。C# 的 try/catch 接不住（这是 native `abort()`）。
+> **更正**：本节把崩溃归因于「P/Invoke 参数含 string/bool/LPUTF8Str 导致 marshal-ilgen 生成失败」，**这是错的**。R84 真机日志证明：`.cctor` 里 `il2cpp_domain_get()` 这种**零参数、纯 IntPtr** 的 P/Invoke 同样崩，且 `dobby` / CoreLib 的 P/Invoke 一直能正常跑。真正的根因是**构建脚本链错了 Mono 组件**（§8）。本节补丁对修崩溃无用，但已验证合法、无副作用，保留作兜底。
 
-**根因**：这套 iOS 裁剪版 MonoVM 的 **marshal-ilgen 后端被 stub 掉**（`build_ios.sh` 早有记录 "Cannot marshal nonblittlable types without marshal-ilgen"）。`Il2CppInterop.Runtime.dll` 里 il2cpp 桥接的 P/Invoke 大量用 `string`/`bool` 等非 blittable 类型（含 `UnmanagedType.LPUTF8Str`），**首次 JIT 生成 native wrapper 即 abort**——与具体是 LPUTF8Str 还是 LPStr 无关，单纯改枚举没用。BepInEx.Core / Unity.IL2CPP / Preloader.Core / MonoMod.Utils / Capstone / AsmResolver 里也有少量同类 P/Invoke，同样会崩。
+**当时的现象**：加载第一个用 Harmony 打游戏类型补丁的插件（AutoSave、AUI.ServerScroll 等）即 SIGSEGV，托管栈顶 `Il2CppInterop.Runtime.IL2CPP:.cctor`，native 栈 `stub_emit_marshal_ilgen → g_assert_not_reached() → abort()`。
 
-> 注意：这不是 NOS 的问题。任何用 Harmony 碰 IL2CPP 类型的插件都会触发，所以"修一个模组"不如"修桥"。
+**当时的（错误）修法**（`tools/patch_marshal_blittable/`）：把 7 个 core dll 里含 `string`/`bool` 的 P/Invoke 改成全 blittable（`string→IntPtr`、`bool→byte`）+ 同名原始签名托管 wrapper（`StringToHGlobalAnsi`/`PtrToStringAnsi`/`FreeHGlobal`，finally 释放），按对象引用相等重定向调用点。共 66 个方法，调用点零改动，幂等。
 
-**修法**（`tools/patch_marshal_blittable/`）：对每个含 `string`/`bool` 的 P/Invoke 方法 M——
-1. 把 M 改成全 blittable（`string→IntPtr`、`bool→byte`），清掉 MarshalInfo，保留 `PInvokeInfo`（仍是同一个 il2cpp 导出，ABI 不变）；
-2. 把改写后的 M 改名 `_Raw`，新建一个**同名、原始签名**的托管 wrapper W（用 `Marshal.StringToHGlobalAnsi`/`PtrToStringAnsi`/`FreeHGlobal` 做转换 + finally 释放）；
-3. 按**对象引用相等**把同模块内所有调用点重定向到 W（Cecil 按名字+参数解析会忽略返回类型造成歧义，必须按引用改）。
+**验证**：7 个 dll 经 `ikdasm` 回读 + `AssemblyName.GetAssemblyName` 强校验合法，非 blittable 残留 0，全仓库其余 dll 亦 0 残留。
 
-调用点零改动，131 个 interop 程序集、HarmonySupport、NOS 全部不受影响。构建时由 `build_ios.sh` 幂等调用（已打过的 dll 会因 `Needs()=0` 自动跳过）。
+**结论**：R83 补丁**没能修好崩溃**（R84 真机仍崩在同一栈）。保留它只是因为它无害，且能顺带降低完整版 marshal-ilgen 的封送复杂度；`build_ios.sh` 里的幂等钩子仍在，但不再是修复手段。
 
-**验证**：7 个 core dll 经 `ikdasm` 反汇编回读 + `AssemblyName.GetAssemblyName` 强校验全部合法，非 blittable 残留 = 0；`GetErrorMessage` 等调用点已正确绑到 string wrapper。
+## 8. [R84] 崩溃真根因：构建脚本链接了 marshal-ilgen 的 **stub 组件**
 
-**真机怎么验**：日志里搜 `[r83]`。若仍有插件加载即崩，先看崩点是不是别的 P/Invoke（理论上已全覆盖 core，但 interop/插件自带的非 blittable P/Invoke 若被调用也可能触发，届时把对应 dll 加进补丁清单即可）。
+**现象**：R83 打过补丁的最新包，加载第一个插件（AutoSave）时仍 SIGSEGV，栈一字不差：
+
+```
+abort ← mono_assertion_message_unreachable ← stub_emit_marshal_ilgen
+     ← emit_native_wrapper_ilgen ← mono_marshal_get_native_wrapper
+     ← mono_jit_compile_method ← mono_magic_trampoline
+Managed: Il2CppInterop.Runtime.IL2CPP:.cctor <0x000cb> ← EndGameManager:.cctor
+       ← Il2CppClassPointerStore`1:.cctor ← Il2CppType:From
+       ← HarmonySupportComponent:TryResolve ← Harmony.PatchAll ← AutoSave.Load
+```
+
+**根因（证据链）**：
+
+1. 官方 .NET 8 iOS runtime nupkg 对同一组件提供**两份**：
+   - `libmono-component-marshal-ilgen-static.a`（208 KB，`marshal-ilgen.c.o`，完整实现，含 `emit_native_wrapper` / `emit_marshal_string_ilgen` / `emit_marshal_boolean_ilgen`）
+   - `libmono-component-marshal-ilgen-stub-static.a`（61 KB，`marshal-ilgen-stub.c.o`，内含字符串 `Cannot marshal nonblittlable types without marshal-ilgen.`）
+   - **两者导出同名符号 `mono_component_marshal_ilgen_init`**。
+2. `build_ios.sh` 用 `find "$MONO_PREFIX" -name "*.a"` 把两份**都**收进 `LIBS`；case 只给 debugger 做了「stub/full 二选一」，**漏了 marshal-ilgen**。静态库按命令行顺序先到先得 → stub 版胜出，注册的回调就是 `stub_emit_marshal_ilgen`（导出符号表实测：`_stub_emit_marshal_ilgen`），内部 `g_assert_not_reached()`。
+3. 本宿主强制 `mono_aot_only=0` **纯 JIT**（官方 iOS 是 AOT，才用 stub）。纯 JIT 下**任何 P/Invoke 首次调用都要运行时生成 native wrapper IL** → `mono_marshal_get_native_wrapper` → stub → abort。
+   - 所以 `dobby` / `libSystem.Native` 能跑（它们是 dllmap 到主 dylib 的 icall 静态链，或已在 AOT 侧解析），而 `Il2CppInterop.Runtime` 的 197 个 `pinvokeimpl("GameAssembly")` 一碰就炸。
+   - `.cctor` 里 `il2cpp_domain_get()`、`il2cpp_domain_get_assemblies(native int, uint32&)`、`il2cpp_assembly_get_image(native int)` **全是纯 blittable**，照样崩 → 证明与参数类型无关，R83 的 blittable 补丁打偏了。
+
+**修法**（`src/mono_host/build_ios.sh`，不动任何模组/dll 内容）：
+
+| 位置 | 改动 |
+|---|---|
+| LIBS 收集 case | 新增 `libmono-component-marshal-ilgen-stub-static.a) continue`，只链 full |
+| 清单强校验 | 遍历 LIBS，要求 `full=1 && stub=0`，否则 `exit 1` 拒绝产出 |
+| 链接后终检 | `strings -a` 对最终 dylib 查 stub 独有字符串 `Cannot marshal nonblittlable types without marshal-ilgen`，命中即删产物并 `exit 1` |
+| 版本标记 | `nebula_mono_host.c` 改为 R84，启动日志明示本次修复 |
+
+> 为什么清单校验 + 产物校验两道：清单只能保证 `LIBS` 里没列 stub；`-force_load` 的其它归档或 `MONO_PREFIX` 下别处若又提供一份 stub，清单看不出来，但产物里必然留下那句错误文本。两道都是**构建期失败**，绝不让坏包流到真机。
+
+**真机怎么验**：日志第 3 行应为 `[host][r84] ===== 版本标记 R84：...`（若为 r82/r83 说明跑的是旧包）。构建脚本输出应出现 `[R84] marshal-ilgen: 完整版已入选、stub 已排除` 和 `[R84] 终检通过`。之后 `Loading [AutoSave ...]` 不应再出现 `stub_emit_marshal_ilgen` / SIGSEGV。
+
+**为什么之前几轮都没发现**：`build_ios.sh` 第 51-54 行注释早就写了「components.c 会引用 `marshal_ilgen_init`，少一个就 Undefined symbol」，作者据此把 `find` 到的全链上，却没意识到「同名符号、stub 优先」会静默替换实现——直到反汇编 `libmono-component-marshal-ilgen-stub-static.a` 看到 `stub_emit_marshal_ilgen` 与崩溃栈完全对上。
 

@@ -2887,7 +2887,8 @@ static void *boot_thread_impl(void *arg) {
         if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.txt", gd);             log_try(p); }
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
-        hlog("[host][r82] ===== 版本标记 R82：三刀 IL 补丁(禁 Harmony 堆栈 detour / 禁冗余 FlushICache / 进程过滤器恒放行) + 滑动插件 hook FillServerOptions + CWD 修 NOS 相对路径 =====");
+        hlog("[host][r84] ===== 版本标记 R84：修 marshal-ilgen 崩溃真根因 —— build_ios.sh 排除 libmono-component-marshal-ilgen-stub-static.a，只链【完整版】(纯 JIT 必须运行时生成 P/Invoke wrapper)；构建期清单+产物双校验；(R83 的 blittable 补丁为无害冗余，保留兜底) =====");
+        hlog("[host][r84] 提示：R82/R83 的日志里若仍出现 stub_emit_marshal_ilgen / IL2CPP:.cctor 崩溃，说明跑的是旧包，请用 R84 重新 build 的 dylib");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -3350,7 +3351,7 @@ static void nebula_fix_process_name(MonoDomain *domain) {
 
 static void nebula_r56_invoke_manual_execute(void) {
     printf("[host][r56] ===== Unity 主线程触发开始 =====\n");
-    printf("[host][r82] 阶段B：三刀 IL 补丁已生效（AutoSave/Harmony 不再崩、进程名带不带空格都放行）+ 滑动插件已落 plugins + CWD 已切 Documents（NebulaLoader 相对路径可命中 NOS）\n");
+    printf("[host][r84] 阶段B：开始扫 plugins 装 NOS。三刀 IL 补丁/滑动插件/CWD 修正(R82) 与 blittable 兜底(R83) 均在；崩溃真根因由 R84 在构建层修复(完整版 marshal-ilgen)\n");
     fflush(NULL);
     if (!g_r56_domain || !g_r56_il2cpp_img) {
         printf("[host][r56] !! domain/image 为空，放弃触发\n");
