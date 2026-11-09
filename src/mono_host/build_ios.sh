@@ -29,11 +29,13 @@ echo "已清空并重建产物目录: $OUT"
 
 # [R64d] 导出清单：ld64 一旦看到 -exported_symbol(s_list) 就切换成"仅导出清单内符号"模式，
 # 会把默认导出的 mono_* 等全砍掉（R64d 首版踩过：mono_jit_init 全部缺失）。所以这里用
-# 通配 '*' 保留默认全导出，再单独追加 _SystemNative_IsATty 强制导出（该符号在静态链入的
-# libSystem.Native.a 里是隐藏可见性强符号，默认不导出，导致设备端 IsATty P/Invoke 报
-# EntryPointNotFoundException）。
-printf '*\n_SystemNative_IsATty\n' > "$OUT/export_list.txt"
-echo "    导出清单: $OUT/export_list.txt (* + _SystemNative_IsATty)"
+# 通配 '*' 保留默认全导出，再单独追加需要强制导出的符号：
+#   _SystemNative_IsATty —— 静态链入的 libSystem.Native.a 里是隐藏可见性强符号（R64c）
+#   _GetModuleHandle* / _GetProcAddress —— [R85] 宿主导出的 Windows kernel32 no-op stub，
+#     dllmap 把 kernel32.dll 指到主 dylib 后，NOS 的 P/Invoke 靠 dlsym 命中它们。
+#     显式列出确保进导出表（'*' 通常已覆盖，但列全可防可见性/裁剪差异导致 dlsym 落空）。
+printf '*\n_SystemNative_IsATty\n_GetModuleHandleW\n_GetModuleHandleA\n_GetModuleHandle\n_GetModuleHandleWW\n_GetProcAddress\n_GetProcAddressA\n' > "$OUT/export_list.txt"
+echo "    导出清单: $OUT/export_list.txt (* + IsATty + [R85] kernel32 no-op stubs)"
 
 # 定位 Mono 头文件目录（找到 .../include/mono，再往上取 include）
 MONO_INC_DIR="$(find "$MONO_PREFIX" -type d -name mono -path "*include*" 2>/dev/null | head -1 || true)"
@@ -481,6 +483,20 @@ case "$SYMS" in
   *_SystemNative_IsATty*) echo "    ✓ SystemNative_IsATty（强制导出，CoreLib IsATty P/Invoke 可命中）" ;;
   *) echo "    ✗ SystemNative_IsATty 未导出！设备端 IsATty P/Invoke 将 EntryPointNotFound" >&2; exit 1 ;;
 esac
+
+# [R85] kernel32 no-op stub 强制导出校验：dllmap 把 kernel32.dll 指到主 dylib 自身后，
+# NOS 的 GetModuleHandleW P/Invoke 靠 dlsym 命中宿主 stub。若 stub 没进导出表，
+# 会从 DllNotFoundException 变成 EntryPointNotFoundException —— 一样中断 NebulaLoader，
+# NOS 仍然起不来。构建期直接 fail，绝不让这种包流到真机。
+MISS85=0
+for s in _GetModuleHandleW _GetModuleHandleA _GetModuleHandle _GetModuleHandleWW _GetProcAddress _GetProcAddressA; do
+  case "$SYMS" in
+    *"$s"*) : ;;
+    *) echo "    ✗ [R85] $s 未导出！kernel32 no-op dllmap 会落空" >&2; MISS85=1 ;;
+  esac
+done
+[ "$MISS85" -eq 0 ] && echo "    ✓ [R85] kernel32 no-op stub 全部已导出（GetModuleHandle* / GetProcAddress）"
+[ "$MISS85" -ne 0 ] && { echo "!! [R85] kernel32 no-op stub 导出不全，拒绝产出" >&2; rm -f "$OUT/libnebula_standard.dylib"; exit 1; }
 
 echo "--- [R60] 单一文件校验：产物目录里只应有 1 个 .dylib ---"
 find "$OUT" -name '*.dylib' -print | sed 's|^|    |'

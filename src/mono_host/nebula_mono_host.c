@@ -2760,6 +2760,79 @@ int SystemNative_IsATty(int fd) {
     return 0;   /* 非 tty：Console 认为输出已重定向，写文件/空设备不崩 */
 }
 
+/* ---- [R85] Windows kernel32 空操作 stub：让 NOS 的增量 GC 干预在 iOS 上安全短路 ----
+ * 真机日志（R84 包，游戏已跑进主界面）：
+ *   Error loading [NebulaLoader 1.0.0]:
+ *     ---> System.DllNotFoundException: kernel32.dll
+ *       at Nebula.Utilities.IncrementalGcInvalidator.DiscoverFlagAddress()
+ *       at Nebula.Utilities.IncrementalGcInvalidator.TryDisable()
+ *       at Nebula.NebulaPlugin.LoadInternal(Boolean android)
+ *   Nebula.cs: `if (!android) IncrementalGcInvalidator.TryDisable();` —— 返回值被忽略，
+ *   但 DllNotFoundException 是异常，直接从 Load() 冒出去，BepInEx 记为 Error 并中断
+ *   该插件，NOS 本体（33MB 的 Nebula.dll）就此没起来。
+ *
+ * NOS 源码（Dolly1016/Nebula-Public, IncrementalGcInvalidator.cs）：
+ *   [DllImport("kernel32.dll", CharSet=Unicode)] static extern nint GetModuleHandleW(...)
+ *   [DllImport("kernel32.dll", CharSet=Ansi)]    static extern nint GetProcAddress(...)
+ *   DiscoverFlagAddress() {
+ *       nint h = GetModuleHandleW("GameAssembly.dll");
+ *       if (h == 0) return 0;              // ★ 只要返回 0，整条链安全退出
+ *       ...
+ *   }
+ *   TryDisable() {
+ *       nint flagAddr = DiscoverFlagAddress();
+ *       if (flagAddr == 0) return false;   // ★ 直接返回，不读不写任何内存
+ *       ...  *p = 0; ...                   // 只有 Windows 才会走到这里
+ *   }
+ *
+ * 它在 Windows 上做的事：定位 GameAssembly.dll 里 il2cpp 增量 GC 的 flag 并写 0，
+ * 保证性能。而【iOS 侧宿主早已用 MONO_GC_PARAMS=major=marksweep 关掉增量 GC】
+ * （启动日志第 22 行实锤，非增量 marksweep），这一步在 iOS 上纯属多余，且
+ * Mach-O 里根本没有 "GameAssembly.dll" 这个 PE 模块，本来就该失败。
+ *
+ * 修法（不改模组、不做 IL 补丁、不预加载，保持 BepInEx 原生加载）：
+ *   把 kernel32.dll 家族 dllmap 到主 dylib 自身，导出恒返回 0 的 GetModuleHandle*
+ *   / GetProcAddress stub。NOS 自带的 `if (h == 0) return 0` 安全分支立即生效，
+ *   TryDisable() 静默返回 false，连 IsIncrementalNative() 都不会调用。GC 完全由
+ *   宿主层统一管理 —— 正是「GC 只允许在宿主层里干」。
+ *
+ * 兼容性：任何模组里 Windows 专属但 iOS 上多余的这几个 P/Invoke 都一并兜住，
+ * 不再因 DllNotFoundException 中断加载链。多导出 W/A/无后缀/追加W 变体，覆盖
+ * Mono 对 CharSet + ExactSpelling 的符号名探测差异，避免 EntryPointNotFound。
+ * 纯 C 返回 0，无 detour / 无 JIT trampoline，初始化阶段挂上也绝对安全
+ * （与 dobby 必须延后到装插件阶段不同）。 */
+__attribute__((visibility("default")))
+intptr_t GetModuleHandleW(void *lpModuleName) { (void)lpModuleName; return 0; }
+__attribute__((visibility("default")))
+intptr_t GetModuleHandleA(void *lpModuleName) { (void)lpModuleName; return 0; }
+__attribute__((visibility("default")))
+intptr_t GetModuleHandle(void *lpModuleName)  { (void)lpModuleName; return 0; }
+__attribute__((visibility("default")))
+intptr_t GetModuleHandleWW(void *lpModuleName){ (void)lpModuleName; return 0; }
+__attribute__((visibility("default")))
+intptr_t GetProcAddress(void *hModule, void *lpProcName) {
+    (void)hModule; (void)lpProcName; return 0;
+}
+__attribute__((visibility("default")))
+intptr_t GetProcAddressA(void *hModule, void *lpProcName) {
+    (void)hModule; (void)lpProcName; return 0;
+}
+
+/* 把 kernel32.dll 家族重映射到主 dylib 自身（stub 就在这里）。
+ * 必须在任何插件加载之前挂；放在 nebula_setup_native_dllmaps()，即 mono_jit_init
+ * 之前，早于 Start() / Execute()，与现有 libSystem.* / nebula_jit dllmap 同批。 */
+static void nebula_install_win32_gc_noop_dllmap(void) {
+    const char *self = nebula_r60_self_path();
+    if (!self) { hlog("[host][r85] !! self path 未知，kernel32 no-op dllmap 未挂"); return; }
+    static const char *k32[] = {
+        "kernel32.dll", "kernel32", "KERNEL32.DLL", "KERNEL32",
+        "libkernel32", "libkernel32.dll", NULL
+    };
+    for (int i = 0; k32[i]; i++)
+        mono_dllmap_insert(NULL, k32[i], NULL, self, NULL);
+    hlog("[host][r85] kernel32.dll -> 宿主 no-op stub（GetModuleHandle* 恒返回 0）：NOS 的 Windows 增量 GC 干预安全短路，模组原生加载不中断");
+}
+
 /* [R72] 手动启动 dobby：把 dobby/libdobby/dobby.dll 的 dllmap 指向主 dylib 自身，
    使 DllImport("dobby") 命中静态链进来的 DobbyHook（iOS arm64 单文件方案）。
    关键：只在「装插件阶段」(NebulaManualExecute 之前) 调用，初始化阶段绝不调用 ——
@@ -2809,6 +2882,12 @@ static void nebula_setup_native_dllmaps(const char *appdir)
        不崩，装插件时再手动挂上让插件的 detour 可用。 */
     nebula_r60_quarantine_win_dobby();
     hlog("[host][r72] 初始化阶段跳过 dobby dllmap：让 DobbyDetour.PrepareImpl DllNotFound，避开 GenerateTrampoline 的 ldstr JIT 崩；装插件时再手动启动");
+
+    /* ---- 1.2) [R85] kernel32 no-op：初始化阶段即可挂（纯 C 返回 0，无 detour/无 JIT
+       trampoline，不像 dobby 会触发 chainloader.Initialize 的首次 JIT 崩）。必须在
+       Start()/Execute() 扫插件之前就位，否则 NOS 加载时 DiscoverFlagAddress() 仍会
+       DllNotFoundException: kernel32.dll 中断整个 NebulaLoader。 ---- */
+    nebula_install_win32_gc_noop_dllmap();
 
     /* ---- 1.5) nebula_jit：R62 detour 内存翻转原生函数（vm_protect/mprotect + icache）---- */
     if (self) {
@@ -2887,8 +2966,8 @@ static void *boot_thread_impl(void *arg) {
         if (gd)   { snprintf(p, sizeof(p), "%s/nebula_host.txt", gd);             log_try(p); }
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
-        hlog("[host][r84] ===== 版本标记 R84：修 marshal-ilgen 崩溃真根因 —— build_ios.sh 排除 libmono-component-marshal-ilgen-stub-static.a，只链【完整版】(纯 JIT 必须运行时生成 P/Invoke wrapper)；构建期清单+产物双校验；(R83 的 blittable 补丁为无害冗余，保留兜底) =====");
-        hlog("[host][r84] 提示：R82/R83 的日志里若仍出现 stub_emit_marshal_ilgen / IL2CPP:.cctor 崩溃，说明跑的是旧包，请用 R84 重新 build 的 dylib");
+        hlog("[host][r85] ===== 版本标记 R85：宿主层 kernel32.dll -> no-op stub(GetModuleHandle* 恒返回 0)，让 NOS 的 Windows 增量 GC 干预(TryDisable/DiscoverFlagAddress)安全短路；模组 DLL 零改动、BepInEx 原生加载；GC 只在宿主层(MONO_GC_PARAMS=major=marksweep)管 =====");
+        hlog("[host][r85] 提示：R84 的日志里若出现 DllNotFoundException: kernel32.dll / Error loading [NebulaLoader]，说明跑的是旧包，请用 R85 重新 build 的 dylib");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE

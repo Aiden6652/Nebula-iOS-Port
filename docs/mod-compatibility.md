@@ -135,3 +135,54 @@ Managed: Il2CppInterop.Runtime.IL2CPP:.cctor <0x000cb> ← EndGameManager:.cctor
 
 **为什么之前几轮都没发现**：`build_ios.sh` 第 51-54 行注释早就写了「components.c 会引用 `marshal_ilgen_init`，少一个就 Undefined symbol」，作者据此把 `find` 到的全链上，却没意识到「同名符号、stub 优先」会静默替换实现——直到反汇编 `libmono-component-marshal-ilgen-stub-static.a` 看到 `stub_emit_marshal_ilgen` 与崩溃栈完全对上。
 
+## 9. [R85] NOS 没起来：`kernel32.dll` 的 Windows 增量 GC 干预 → 宿主层 no-op
+
+**现象**（R84 真机包，游戏已正常跑进主界面、UnityIAP/存档都在动，说明 §8 的 marshal-ilgen 修复已生效）：
+
+```
+[Info   :   BepInEx] Loading [NebulaLoader 1.0.0]
+[Error  :   BepInEx] Error loading [NebulaLoader 1.0.0]: System.Reflection.TargetInvocationException
+ ---> System.DllNotFoundException: kernel32.dll
+   at Nebula.Utilities.IncrementalGcInvalidator.DiscoverFlagAddress()
+   at Nebula.Utilities.IncrementalGcInvalidator.TryDisable()
+   at Nebula.NebulaPlugin.LoadInternal(Boolean android)
+   at NebulaLoader.NebulaLoader.TryLoadNebula(String dllFilePath)
+```
+
+`NebulaLoader` 已找到并加载 33MB 的 `Nebula.dll`，但 `LoadInternal` 第一步就抛异常，BepInEx 记为 Error 并中断该插件，**NOS 本体没起来**。
+
+**根因**（查 NOS 上游源码 `Dolly1016/Nebula-Public` 坐实，非猜测）：
+
+- `IncrementalGcInvalidator.cs` 用 `[DllImport("kernel32.dll")] GetModuleHandleW` + `GetProcAddress` 定位 `GameAssembly.dll` 里 il2cpp 增量 GC 的 flag 并写 0，目的是**保性能**。这是纯 Windows PE 逻辑，iOS 是 Mach-O、无 `GameAssembly.dll` 模块，本就不该成功。
+- 宿主层**早已用 `MONO_GC_PARAMS=major=marksweep`（非增量 marksweep）关掉增量 GC**（启动日志实锤），这一步在 iOS 上完全多余。
+- 关键：调用点 `Nebula.cs:145` 是 `if (!android) IncrementalGcInvalidator.TryDisable();` —— **返回值被忽略**，且源码自带安全分支：
+
+```csharp
+DiscoverFlagAddress() {
+    nint h = GetModuleHandleW("GameAssembly.dll");
+    if (h == 0) return 0;              // ★ 只要返回 0，整条链安全退出
+    ...
+}
+TryDisable() {
+    nint flagAddr = DiscoverFlagAddress();
+    if (flagAddr == 0) return false;   // ★ 直接返回，不读不写任何内存
+    ... *p = 0; ...                    // 只有 Windows 才会走到
+}
+```
+
+所以只要让 `GetModuleHandleW` 返回 0，NOS 自己就会静默跳过，连 `IsIncrementalNative()`（`DllImport("GameAssembly")`）都不会碰。
+
+**修法**（`src/mono_host/nebula_mono_host.c` + `build_ios.sh`）——**模组 DLL 一字节不动、不做 IL 补丁、不预加载、BepInEx 照常原生加载**：
+
+1. 宿主导出 6 个 `visibility("default")` 的恒返回 0 stub：`GetModuleHandleW/A/(无后缀)/WW`、`GetProcAddress/A`（覆盖 Mono 对 `CharSet` + `ExactSpelling` 的符号名探测差异，避免 `EntryPointNotFoundException`）。
+2. `nebula_install_win32_gc_noop_dllmap()` 把 `kernel32.dll` 家族（含大小写/`lib` 变体）用 `mono_dllmap_insert` 映射到主 dylib 自身。挂在与 `libSystem.*` / `nebula_jit` 同批的初始化阶段（早于 `mono_jit_init`、早于 `Start()/Execute()` 扫插件）。**纯 C 返回 0，无 detour / 无 JIT trampoline**，不像 dobby 必须延后到装插件阶段。
+3. `build_ios.sh` 的 `export_list.txt` 追加这 6 个 `_` 前缀符号（ld64 一旦用 `-exported_symbols_list` 就只导出清单内符号），并新增构建期 `nm` 强校验：任一 stub 未导出即 `exit 1` 拒绝产出。GC 完全归宿主层管理 —— 即「GC 只允许在宿主层里干」。
+
+> 兼容意义：不止 NOS。任何模组里 Windows 专属、iOS 上多余的 `GetModuleHandle*` / `GetProcAddress` P/Invoke 都一并兜住，不再因 `DllNotFoundException` 中断加载链 —— 这正是「兼容大部分模组」的方向。
+
+**沙箱验证**：`bash -n` 通过；抽出新增 C 块用 gcc `-Wall -Wextra` 桩编译 0 error，6 个 stub 全部为全局 `T` 符号；全量扫 `/tmp/monoios` 所有 `.a`，无裸同名强符号冲突（只有带 `SystemNative_` 前缀的，不撞）；定义顺序（2824 定义 / 2890 调用）与 `mono_dllmap_insert(NULL, 名, NULL, self, NULL)` 参数均与现有 dobby/SystemNative 调用一致。iOS 全量构建需 macOS+Xcode，真机待复测。
+
+**真机怎么验**：日志第 3 行应为 `版本标记 R85`；搜 `[host][r85] kernel32.dll -> 宿主 no-op stub` 确认 dllmap 已挂；`Loading [NebulaLoader 1.0.0]` 之后**不再有** `DllNotFoundException: kernel32.dll`，随后应出现 NOS 自身的启动日志。
+
+> 本轮范围仅限「把 NOS 跑通」。同日志里 AutoSave / ServerScroll 的 `TypeLoadException: System.Runtime.InteropServices.Marshal ... System.Runtime 6.0.0.0`、GamePatch 的 `FormatException`、ImmersionAudioBridge 的 `InjectorHelpers` 是各模组**各自独立**的问题（BCL 版本对齐 / 版本号解析 / class injection），不是 NOS 加载链的一部分，未在本轮处理。
+
