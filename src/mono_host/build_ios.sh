@@ -147,6 +147,7 @@ echo "MONO_ROOT: $MONO_ROOT"
 # ---------------------------------------------------------------------------
 FACADE="$MONO_ROOT/lib/net8.0/System.Runtime.dll"
 FACADE_SHA_MARK="$OUT/.facade_marshal.sha"
+FINAL_SHA=""   # [R87] 预初始化，确保下方 echo 永不为 unbound（任何分支都安全）
 PREBUILT="$ROOT/facade-patch/System.Runtime.net8.0.32.patched.dll"
 ORIG_SHA_8032="c6fd93aa8bb5016fb1766525940353c9a7723425152d2812a84dd679630c1f38"
 PATCHED_SHA_8032="b2b0f39a8ba03cca70bd810814a4be8d82bf410ce6072a8e1328fb5d063b755c"
@@ -181,7 +182,7 @@ fi
 FINAL_SHA="$(sha256_of "$FACADE")"
 [ "$(cat "$FACADE_SHA_MARK")" = "$FINAL_SHA" ] || {
     echo "✗ [R87] sha 标记与当前 facade 不一致（blob 可能内嵌错版本）" >&2; exit 1; }
-echo "   [R87] ✓ 待内嵌 facade sha=$FINAL_SHA（Marshal -> System.Private.CoreLib）"
+echo "   [R87] ✓ 待内嵌 facade sha=${FINAL_SHA:-UNKNOWN}（Marshal -> System.Private.CoreLib）"
 
 echo "=== 生成嵌入式 blob（BCL + 可选 BepInEx/core，全部内存加载，无散文件）==="
 BLOB="$OUT/.nebula_bcl.blob"
