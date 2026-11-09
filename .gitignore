@@ -49,3 +49,13 @@ src/mono_host/out/
 *.zip
 *.dat
 metadata/
+
+# [R83] marshal 补丁的二进制原件备份（本地回滚用，不入库；真件 *.dll 已打补丁入库）
+*.orig
+
+# dotnet 工具编译产物（tools/patch_* 下的 bin/ obj/，R78 起忽略；源码与 csproj 入库）
+tools/*/bin/
+tools/*/obj/
+
+# 已废弃的老 Mono 方案占位目录（按设备从 ipa 提取；含其 README，见目录内说明，不入库）
+src/mono_host_mono/

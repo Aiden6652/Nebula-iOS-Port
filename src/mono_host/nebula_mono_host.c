@@ -1326,6 +1326,181 @@ static MonoDomain *g_boot_domain      = NULL;
 static char       *g_boot_root        = NULL;
 static int         g_boot_setup_done  = 0;    // boot 线程已完成 mono 初始化+环境，主线程可跑 Start()
 
+/* ---- [MOD-COMPAT] BepInEx 版本检测门 ------------------------------------
+ * iOS 上只有 BepInEx 6（IL2CPP）能真正跑起来：BepInEx 5 只支持纯 Mono，
+ * 没有对应的 IL2CPP 实现，硬加载必崩。模组包自带的 BepInEx 文件夹决定版本，
+ * 宿主不做选择，只辨认后分流：
+ *   BEX_V6         → 走 boot_bepinex 适配路径，再由 Mono 虚拟机实测能否跑；
+ *   BEX_V5_OR_OTHER→ 不硬加载，回退原版游戏（避免崩溃）；
+ *   BEX_NONE       → 没模组 BepInEx，回退原版。
+ * 指纹判定（可靠）：
+ *   v6 = BepInEx.Unity.IL2CPP.dll（含 Il2CppInterop.Runtime.dll）
+ *   v5 = BepInEx.IL2CPP.dll / UnhollowerBaseLib.dll（无 Unity.IL2CPP）
+ * ---------------------------------------------------------------------- */
+typedef enum { BEX_NONE = 0, BEX_V6, BEX_V5_OR_OTHER } bex_version_t;
+
+// PE/CLI 全小端；以下安全读取器用 memcpy 避免 arm64 未对齐 SIGBUS（boot 关键路径）。
+static uint16_t nebula_rd16(const unsigned char *p) {
+    uint16_t v; memcpy(&v, p, 2); return v;
+}
+static uint32_t nebula_rd32(const unsigned char *p) {
+    uint32_t v; memcpy(&v, p, 4); return v;
+}
+static uint64_t nebula_rd64(const unsigned char *p) {
+    uint64_t v; memcpy(&v, p, 8); return v;
+}
+
+// 把 PE 中某 CLI 元数据 RVA 折算成文件偏移（解析 section 表；失败返回 -1）
+static long nebula_rva_to_off(const unsigned char *buf, long sz, uint32_t rva) {
+    if (sz < 0x40 || buf[0] != 'M' || buf[1] != 'Z') return -1;
+    uint32_t e_lfanew = nebula_rd32(buf + 0x3C);
+    if ((long)e_lfanew + 0x18 + 2 > sz) return -1;
+    if (buf[e_lfanew] != 'P' || buf[e_lfanew + 1] != 'E') return -1;
+    uint16_t nsec = nebula_rd16(buf + e_lfanew + 6);
+    uint32_t oh = e_lfanew + 0x18;
+    uint16_t optsz = nebula_rd16(buf + oh + 0x10);
+    uint32_t sec_tbl = oh + optsz;
+    for (int i = 0; i < nsec; i++) {
+        uint32_t base = sec_tbl + (uint32_t)i * 40;
+        if ((long)base + 40 > sz) break;
+        uint32_t vaddr = nebula_rd32(buf + base + 12);
+        uint32_t vsize = nebula_rd32(buf + base + 8);
+        uint32_t raw   = nebula_rd32(buf + base + 20);
+        if (rva >= vaddr && rva < vaddr + vsize) return (long)raw + (long)(rva - vaddr);
+    }
+    return -1;
+}
+
+// 尽力读 .NET dll 的 AssemblyVersion（Major.Minor.Build.Revision）。
+// 任意解析失败都安全返回 0，绝不阻断启动；仅用于日志与「和 NOS 齐平」核对。
+static int nebula_read_assembly_version(const char *path, char *out, size_t outsz) {
+    out[0] = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < 0x200) { fclose(f); return 0; }
+    unsigned char *buf = (unsigned char*)malloc((size_t)sz);
+    if (!buf) { fclose(f); return 0; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return 0; }
+    fclose(f);
+    int ok = 0;
+    do {
+        if (sz < 0x40 || buf[0] != 'M' || buf[1] != 'Z') break;
+        uint32_t e_lfanew = nebula_rd32(buf + 0x3C);
+        if ((long)e_lfanew + 0x18 + 2 > sz) break;
+        if (buf[e_lfanew] != 'P' || buf[e_lfanew + 1] != 'E') break;
+        uint32_t oh = e_lfanew + 0x18;
+        uint16_t magic = nebula_rd16(buf + oh);
+        uint32_t dd_off = (magic == 0x20B) ? oh + 0x70 : oh + 0x60;  // PE32+ / PE32
+        uint32_t cli_off = dd_off + 14u * 8u;                          // CLI 数据目录（index 14）
+        if ((long)cli_off + 8 > sz) break;
+        uint32_t cli_rva = nebula_rd32(buf + cli_off);
+        uint32_t cli_size = nebula_rd32(buf + cli_off + 4);
+        if (cli_rva == 0 || cli_size < 0x48) break;
+        long cli_fo = nebula_rva_to_off(buf, sz, cli_rva);
+        if (cli_fo < 0 || cli_fo + 0x48 > sz) break;
+        uint32_t md_rva = nebula_rd32(buf + cli_fo + 8);        // CLI 头 +0x8 = Metadata RVA
+        long md_fo = nebula_rva_to_off(buf, sz, md_rva);
+        if (md_fo < 0 || md_fo + 16 > sz) break;
+        if (buf[md_fo] != 'B' || buf[md_fo+1] != 'S' || buf[md_fo+2] != 'J' || buf[md_fo+3] != 'B') break;
+        uint32_t verlen = nebula_rd32(buf + md_fo + 12);
+        uint32_t verpad = (verlen + 3u) & ~3u;
+        long sh_base = md_fo + 16 + verpad;        // flags(2)+numstreams(2) 起点
+        if (sh_base + 4 > sz) break;
+        uint16_t nstream = *(const uint16_t*)(sh_base + 2);
+        long sp = sh_base + 4;                      // 第一个 stream 头
+        for (int i = 0; i < nstream; i++) {
+            if (sp + 8 > sz) break;
+            uint32_t soff = nebula_rd32(buf + sp);
+            long name_off = sp + 8;
+            if (name_off + 32 > sz) break;
+            const char *nm = (const char*)(buf + name_off);
+            if (!strncmp(nm, "#~", 3)) {
+                long tbl_fo = md_fo + soff;
+                if (tbl_fo + 24 > sz) break;
+                // #~ 头：reserved(4) major(1) minor(1) heapsizes(1) reserved(1) valid(8) sorted(8)
+                uint64_t valid = nebula_rd64(buf + tbl_fo + 8);
+                if (!(valid & ((uint64_t)1u << 0x20u))) break;        // 无 Assembly 表
+                long rc = tbl_fo + 24;
+                uint32_t asm_count = 0;
+                for (int t = 0; t <= 0x20; t++) {
+                    if (valid & ((uint64_t)1u << t)) {
+                        if (rc + 4 > sz) { asm_count = 0; break; }
+                        if (t == 0x20) { asm_count = nebula_rd32(buf + rc); break; }
+                        rc += 4;
+                    }
+                }
+                if (asm_count == 0) break;
+                long arow = rc;                                    // 首行 Assembly
+                if (arow + 12 > sz) break;
+                uint16_t maj = nebula_rd16(buf + arow + 4);
+                uint16_t min = nebula_rd16(buf + arow + 6);
+                uint16_t bld = nebula_rd16(buf + arow + 8);
+                uint16_t rev = nebula_rd16(buf + arow + 10);
+                snprintf(out, outsz, "%u.%u.%u.%u", maj, min, bld, rev);
+                ok = 1;
+                break;
+            }
+            long namelen = 0;
+            while (namelen < 32 && buf[name_off + namelen] != 0) namelen++;
+            sp = name_off + ((namelen + 4) & ~3L);                 // 名字按 4 字节对齐
+        }
+    } while (0);
+    free(buf);
+    return ok;
+}
+
+// 对单个 BepInEx/core 目录做指纹分类，并尽力读出版本号。
+static bex_version_t nebula_classify_bepinex_core(const char *core_dir, char *ver, size_t versz) {
+    char p[PATH_MAX];
+    int has_v6entry = 0, has_v5entry = 0, has_unhollower = 0;
+    snprintf(p, sizeof(p), "%s/BepInEx.Unity.IL2CPP.dll", core_dir);
+    if (neb_is_file(p)) has_v6entry = 1;
+    snprintf(p, sizeof(p), "%s/BepInEx.IL2CPP.dll", core_dir);
+    if (neb_is_file(p)) has_v5entry = 1;
+    snprintf(p, sizeof(p), "%s/UnhollowerBaseLib.dll", core_dir);
+    if (neb_is_file(p)) has_unhollower = 1;
+
+    if (has_v6entry) {
+        snprintf(p, sizeof(p), "%s/BepInEx.Core.dll", core_dir);
+        if (!nebula_read_assembly_version(p, ver, versz))
+            snprintf(ver, versz, "(BepInEx 6)");
+        return BEX_V6;
+    }
+    if (has_v5entry || has_unhollower) {
+        snprintf(ver, versz, "(BepInEx 5 / Unhollower 系，iOS 不支持)");
+        return BEX_V5_OR_OTHER;
+    }
+    ver[0] = 0;
+    return BEX_NONE;
+}
+
+// 顶层检测：模组自带 BepInEx 文件夹决定版本。
+//   1) root/BepInEx/core（模组合并进 app 根的）→ 优先判定
+//   2) HOME/Documents/BepInEx/core（用户丢进 Documents 的 / 宿主释放的）
+//   3) 磁盘都没 → 若宿主 blob 内置 v6 入口，视为宿主提供的 v6（NOS 默认路径）
+static bex_version_t nebula_detect_bepinex(const char *root, char *ver, size_t versz) {
+    ver[0] = 0;
+    const char *home = getenv("HOME");
+    char core_root[PATH_MAX], core_doc[PATH_MAX];
+    snprintf(core_root, sizeof(core_root), "%s/BepInEx/core", root);
+    if (home && home[0])
+        snprintf(core_doc, sizeof(core_doc), "%s/Documents/BepInEx/core", home);
+    else core_doc[0] = 0;
+
+    bex_version_t r = nebula_classify_bepinex_core(core_root, ver, versz);
+    if (r != BEX_NONE) return r;                          // 模组自带 BepInEx 优先
+    if (core_doc[0]) {
+        bex_version_t d = nebula_classify_bepinex_core(core_doc, ver, versz);
+        if (d != BEX_NONE) return d;                       // Documents 里的
+    }
+    if (blob_find("BepInEx.Unity.IL2CPP")) {               // 宿主内置 v6
+        snprintf(ver, versz, "(宿主内置 BepInEx 6)");
+        return BEX_V6;
+    }
+    return BEX_NONE;
+}
+
 // 正式路径：把控制权交给 BepInEx（优先从 blob 内存加载，否则文件兜底）
 static int boot_bepinex(MonoDomain *domain, const char *root) {
     // 记录 LogOutput.log 的起始大小，Start() 之后只 grep 这一段增量
@@ -2877,7 +3052,26 @@ static void *boot_thread_impl(void *arg) {
     int auto_mode = !bm || !*bm || !strcmp(bm, "auto");
     int ok = 0;
 
-    if (auto_mode || !strcmp(bm, "bepinex")) {
+    // [MOD-COMPAT] BepInEx 版本检测门：iOS 只跑得动 BepInEx 6。
+    // 模组自带 BepInEx 文件夹决定版本；非 6（如 BepInEx 5 / Unhollower 系）
+    // 在 iOS IL2CPP 上无对应实现，硬加载必崩 —— 直接回退原版游戏，不碰模组。
+    int compat_bepinex = 0;
+    {
+        char bex_ver[96];
+        bex_version_t bv = nebula_detect_bepinex(root, bex_ver, sizeof(bex_ver));
+        if (bv == BEX_V6) {
+            hlog("[host][compat] 检测到 BepInEx 6 %s：走适配路径，交由 Mono 虚拟机实测能否运行", bex_ver);
+            compat_bepinex = 1;
+        } else if (bv == BEX_V5_OR_OTHER) {
+            hlog("[host][compat] 检测到非 BepInEx 6（%s）：iOS IL2CPP 无法运行，跳过模组加载，回退原版游戏", bex_ver);
+            auto_mode = 0;   // 阻止 auto 下再试 mods/engine 无谓路径，直接原版兜底
+        } else { // BEX_NONE
+            hlog("[host][compat] 未检测到模组 BepInEx 文件夹：跳过模组加载，回退原版游戏");
+            auto_mode = 0;
+        }
+    }
+
+    if (compat_bepinex && (auto_mode || !strcmp(bm, "bepinex"))) {
         // [R70] Start()（含 MonoMod trampoline 生成）必须在「已登记 GC 的主线程」上跑，
         // 不能在裸 boot pthread 上跑——外来 pthread 即便 mono_thread_attach，coop sgen
         // 的线程信息/TLAB 仍不一致，首次 ldstr 分配即 sgen_try_alloc_obj_nolock 崩

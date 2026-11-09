@@ -87,6 +87,30 @@ if [ -z "${BEPINEX_CORE_DIR:-}" ] && [ -d "$ROOT/bepinex-core" ]; then
   BEPINEX_CORE_DIR="$ROOT/bepinex-core"
 fi
 echo "   BepInEx/core 来源: ${BEPINEX_CORE_DIR:-无（仅嵌 BCL）}"
+
+# [R83] 幂等应用 marshal-ilgen 补丁：iOS 裁剪版 MonoVM 的 marshal-ilgen 后端被 stub
+# 掉（build_ios.sh 早有记录），任何 string/bool 的非 blittable P/Invoke 首次 JIT 生成
+# native wrapper 即 abort()（AutoSave / ServerScroll 等所有 Harmony 打 IL2CPP 类型的
+# 插件都踩）。此工具把这些 P/Invoke 改成 blittable(IntPtr/byte) + 同名托管 wrapper，
+# 调用点零改动。已打过的 dll 会因 Needs()=0 自动跳过，可反复安全执行。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  # 从源码现场编译运行，不依赖 bin/（bin/obj 已被 .gitignore 忽略，干净 clone 也能用）。
+  # Cecil 由 csproj 的 HintPath 指向已入库的 bepinex-core/Mono.Cecil.dll。
+  PATCH_PROJ="$ROOT/../../tools/patch_marshal_blittable/patch_marshal_blittable.csproj"
+  if [ -f "$PATCH_PROJ" ]; then
+    echo "   [R83] 对 BepInEx/core 应用 marshal-ilgen 补丁（幂等）..."
+    dotnet run --project "$PATCH_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/Il2CppInterop.Runtime.dll \
+        "$BEPINEX_CORE_DIR"/BepInEx.Core.dll \
+        "$BEPINEX_CORE_DIR"/BepInEx.Unity.IL2CPP.dll \
+        "$BEPINEX_CORE_DIR"/BepInEx.Preloader.Core.dll \
+        "$BEPINEX_CORE_DIR"/MonoMod.Utils.dll \
+        "$BEPINEX_CORE_DIR"/Gee.External.Capstone.dll \
+        "$BEPINEX_CORE_DIR"/AsmResolver.DotNet.dll || \
+      echo "   [R83] ⚠ marshal 补丁失败（已提交的预修补 dll 仍可用，继续）" >&2
+  fi
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
