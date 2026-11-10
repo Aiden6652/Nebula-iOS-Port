@@ -737,6 +737,55 @@ else
   echo "    MONO_IOS_JIT 未开启，保留标准 DISABLE_JIT 构建（standard 安全）"
 fi
 
+echo "=== [3.7/5] R90: 元数据损坏兜底（FieldMarshal 列宽非法不再 g_assert_not_reached 崩）==="
+# 真机 R89 崩点（nebula_host.txt）：Harmony 给游戏类型(EndGameManager)打补丁 ->
+# Il2CppClassPointerStore<T>.cctor -> il2cpp_class_from_name -> 宿主 JIT 编译某方法 ->
+# mono_marshal_get_native_wrapper -> mono_method_get_marshal_info -> mono_metadata_get_marshal_info
+# -> mono_metadata_decode_row_col_raw.cold.2(g_assert_not_reached) 直接 SIGSEGV。
+# 根因：被 JIT 的方法所属 assembly 的 FieldMarshal(0x0D) 表列宽非法（元数据损坏 /
+# 堆尺寸错位 / 表行列布局算错），decode_row_col_raw 解 NativeType 列宽不是 1/2/4 就 assert。
+# 这套程序集多为 Il2CppInterop 运行时生成 / Cecil 重写产物，元数据不完美是常态。
+# 修法：
+#   (1) 全局兜底：decode_row_col_raw 列宽非法(default) 由 g_assert_not_reached() 改 return 0，
+#       不崩、不野指针（switch 在 n 非法时直接 return 0 不读 data）。
+#   (2) 定向诊断：get_marshal_info 在 NativeType 列宽非法时先告警打出 image 名再 return NULL
+#       （=该字段无封送信息），既能定位是哪个程序集损坏，又不崩。
+F="$WORK/runtime/src/mono/mono/metadata/metadata.c"
+[ -f "$F" ] || { echo "!! 找不到 $F" >&2; exit 1; }
+python3 - "$F" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='replace').read()
+T = "\t"
+
+# (1) decode_row_col_raw 的 switch(n) default：g_assert_not_reached() -> return 0
+old1 = (T+"switch (n) {\n"+T+"case 1:\n"+T+T+"return *data;\n"
+        +T+"case 2:\n"+T+T+"return read16 (data);\n"
+        +T+"case 4:\n"+T+T+"return read32 (data);\n"
+        +T+"default:\n"+T+T+"g_assert_not_reached ();\n"+T+"}")
+assert old1 in s, "decode_row_col_raw switch 未匹配（mono 源码可能已改结构）"
+new1 = (T+"switch (n) {\n"+T+"case 1:\n"+T+T+"return *data;\n"
+        +T+"case 2:\n"+T+T+"return read16 (data);\n"
+        +T+"case 4:\n"+T+T+"return read32 (data);\n"
+        +T+"default:\n"+T+T+"/* [Nebula iOS R90] 列宽非法=元数据损坏，按 0 处理而非崩 */\n"
+        +T+T+"return 0;\n"+T+"}")
+s = s.replace(old1, new1, 1)
+
+# (2) get_marshal_info：FieldMarshal.NativeType 列宽非法 -> 告警(image 名) + return NULL
+old2 = (T+"return mono_metadata_blob_heap (meta, mono_metadata_decode_row_col (tdef, loc.result, MONO_FIELD_MARSHAL_NATIVE_TYPE));\n"
+        +"}\n\nMonoMethod*")
+assert old2 in s, "get_marshal_info return 未匹配（mono 源码可能已改结构）"
+new2 = (T+"{\n"+T+T+"guint32 _nw = mono_metadata_table_size (tdef->size_bitfield, MONO_FIELD_MARSHAL_NATIVE_TYPE);\n"
+        +T+T+"if (_nw == 0 || _nw > 4) {\n"
+        +T+T+T+'g_warning ("[Nebula] FieldMarshal.NativeType 列宽非法(%u)，跳该 marshal 信息(元数据损坏? image=%s)", _nw, meta->name ? meta->name : "?");\n'
+        +T+T+T+"return NULL;\n"+T+T+"}\n"+T+"}\n"
+        +old2)
+s = s.replace(old2, new2, 1)
+
+open(p, 'w', encoding='utf-8').write(s)
+print("    R90 补丁已应用到 metadata.c（decode_row_col_raw 兜底 + get_marshal_info 定向诊断）")
+PY
+
 echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="
 cd "$WORK/runtime"
 ./build.sh -s mono -os ios -arch arm64 -c Release 2>&1 | tail -60

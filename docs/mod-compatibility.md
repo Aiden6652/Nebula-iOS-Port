@@ -613,3 +613,67 @@ if (lstat(linkp, &lst) != 0) {          // 不存在才建
   此时路径这个变量已排除。
 - **不变约束**：模组 DLL 保持用户 `Documents` 原样、不删不改；`.app` 只保留只读游戏资源；
   保持 BepInEx 原生加载链，不做运行时 IL patch。
+
+---
+
+## R90：元数据损坏兜底（FieldMarshal 列宽非法不再 `g_assert_not_reached` 崩）
+
+### R89 真机复盘（nebula_host.txt）
+
+- `[host][r89] ✓ Data 链接已重建` 出现 → Data 链接自愈**生效**，路径这关已过。
+- `NebulaManualExecute ENTER` 出现、`Loading [AutoSave]` 恢复、chainloader 这关**已过**。
+- 崩点推进到 **Harmony 给游戏类型 `EndGameManager` 打补丁**：
+  `Il2CppClassPointerStore<T>.cctor -> il2cpp_class_from_name -> 宿主 JIT 编译某方法`
+  `-> mono_marshal_get_native_wrapper -> mono_method_get_marshal_info`
+  `-> mono_metadata_get_marshal_info -> mono_metadata_decode_row_col_raw.cold.2
+  (g_assert_not_reached)` 直接 **SIGSEGV**。
+- 日志 691 行 `Interop assemblies are possibly out of date`、618 行强制
+  `UpdateInteropAssemblies=false` 复用设备端 131 个 interop dll（可能 out-of-date）。
+
+### 根因
+
+被 JIT 的方法所属 assembly 的 **`FieldMarshal(0x0D)` 表列宽非法**（元数据损坏 /
+堆尺寸错位 / 表行列布局算错）。mono 原版在 `mono_metadata_decode_row_col_raw` 里对列宽 `n`
+只认 `1/2/4`，否则 `g_assert_not_reached()` 直接崩。这套程序集多为 **Il2CppInterop 运行时生成 /
+Cecil 重写产物**，元数据不完美是常态。
+
+> **与 JIT 无关**：用户环境是 StikDebug 调试型 JIT（CS_DEBUGGED，内核允许 RWX），JIT 本身正常，
+> MAP_JIT / jit allow 那条线不需要处理。也与 facade / Marshal 转发无关（R88 的 PE 保真 facade 保留）。
+
+### 修法（在自编译 mono 源码 `metadata.c`，`scripts/build_mono_ios.sh` 的 `[3.7/5]` 段注入）
+
+- **① 全局兜底**：`decode_row_col_raw` 的 `switch(n)` 在列宽非法（default）时由
+  `g_assert_not_reached()` 改为 **`return 0`**——不崩、不野指针（default 分支直接 return 不读 data）。
+- **② 定向诊断**：`get_marshal_info` 在 `FieldMarshal.NativeType` 列宽非法（`==0 || >4`）时，
+  先 `g_warning` 打出 **`image=` 程序集名**再 `return NULL`（=该字段无封送信息），
+  既能定位元凶程序集，又不崩。
+
+```c
+/* [Nebula iOS R90] decode_row_col_raw 列宽非法=元数据损坏，按 0 处理而非崩 */
+default:
+    return 0;
+
+/* get_marshal_info 内：NativeType 列宽非法时告警并跳过 */
+guint32 _nw = mono_metadata_table_size (tdef->size_bitfield, MONO_FIELD_MARSHAL_NATIVE_TYPE);
+if (_nw == 0 || _nw > 4) {
+    g_warning ("[Nebula] FieldMarshal.NativeType 列宽非法(%u)，跳该 marshal 信息(元数据损坏? image=%s)", _nw, meta->name ? meta->name : "?");
+    return NULL;
+}
+```
+
+### 真机怎么验
+
+1. **不再出现** `Got a SIGSEGV` + `mono_metadata_decode_row_col_raw.cold.2`。
+2. 若 JIT 仍触到损坏元数据，会看到
+   `[Nebula] FieldMarshal.NativeType 列宽非法(N) image=<某程序集>` 告警，
+   **`image=` 指向的那个程序集就是要重生成 / 修正元数据的那份**（多半是 out-of-date 的 interop dll）。
+3. chainloader / NOS 继续往下走，出现 NOS 自身启动日志。
+4. R88 的 `Marshal token 01000059` 与 R89 的 `✓ Data 链接已重建` 都不回归。
+
+### 若 R90 仍失败
+
+- 若崩栈**不再是** `mono_metadata_decode_row_col_raw.cold.2` → 说明元数据兜底这关已过，
+  进入下一个崩溃点，按新的崩溃栈继续定位（用 `image=` 告警把元凶程序集揪出来后，
+  重生成或替换该 interop dll 的元数据即可从根上消除告警）。
+- 若仍出现 `decode_row_col_raw.cold.2` → 说明坏元数据走的是别的列宽路径没被守卫覆盖，
+  需要扩展 `get_marshal_info` 之外的 `decode_row_col` 调用点兜底。

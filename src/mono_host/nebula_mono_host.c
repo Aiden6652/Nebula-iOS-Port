@@ -3174,6 +3174,11 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r89] 根因：每次侧载重装 .app/容器 UUID 都变，Documents/Data 符号链接仍指向上一轮 .app/Data；旧代码 lstat 判「存在就跳过」(lstat 对悬空链接也成功) -> Directory.Exists(GameDataPath) 失败 -> SetExecutablePath 抛 DirectoryNotFoundException -> ConfigPath/BepInExConfigPath/PluginPath 全为 null");
         hlog("[host][r89] 修法：每轮校验链接目标是否等于本次 .app/Data 且可达，不是就 unlink 重建；兜底保证 Documents/Data 是真实存在目录。nebula_log_paths 扩展打印全部 Paths 属性；异常链补 ParamName");
         hlog("[host][r89] 真机验收：出现 [host][r89] ✓ Data 链接已重建（或 Data 链接有效）；Paths.ConfigPath/BepInExConfigPath/PluginPath 不再是 (null)；不再出现托管异常链；Loading [AutoSave]/[AUI Server Scroll]/[NebulaLoader] 恢复；NebulaPlugin.LoadInternal 继续往下并出现 NOS 自身启动日志");
+        hlog("[host][r90] ===== 版本标记 R90：mono 元数据损坏兜底（FieldMarshal 列宽非法不再 g_assert_not_reached 崩）=====");
+        hlog("[host][r90] R89 真机复盘：Data 链接自愈生效（✓ Data 链接已重建），NebulaManualExecute ENTER 出现、Loading [AutoSave] 恢复，chainloader 这关已过；崩点推进到 Harmony 给游戏类型(EndGameManager)打补丁 -> Il2CppClassPointerStore<T>.cctor -> il2cpp_class_from_name -> 宿主 JIT 编译某方法生成原生包装 -> mono_metadata_get_marshal_info");
+        hlog("[host][r90] 根因：被 JIT 的方法所属 assembly 的 FieldMarshal(0x0D) 表列宽非法（元数据损坏 / 堆尺寸错位 / 表行列布局算错），mono 原版在 mono_metadata_decode_row_col_raw 里列宽不是 1/2/4 就 g_assert_not_reached() 直接 SIGSEGV。多为 Il2CppInterop 运行时生成 / Cecil 重写的程序集（设备端 131 个 interop dll 还被宿主强制复用旧版、可能 out-of-date）");
+        hlog("[host][r90] 修法（在自编译 mono 源码 metadata.c）：① decode_row_col_raw 列宽非法(default) 由 g_assert_not_reached() 改 return 0（不崩不野指针）；② get_marshal_info 在 FieldMarshal.NativeType 列宽非法时先 g_warning 打出 image 名再 return NULL（=该字段无封送信息），便于定位元凶。此崩与 JIT 无关（用户调试型 JIT 已生效），也与 facade/Marshal 无关");
+        hlog("[host][r90] 真机验收：不再出现 Got a SIGSEGV + mono_metadata_decode_row_col_raw.cold.2；若仍崩，看 [Nebula] FieldMarshal.NativeType 列宽非法(...) 告警里的 image= 是哪个程序集，那就是要重生成/修的那份元数据");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
