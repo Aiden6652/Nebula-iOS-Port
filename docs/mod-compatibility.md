@@ -403,3 +403,115 @@ facade 同时转发同一类型不冲突（typeref 的 scope 决定查哪个）�
 
 两者均不影响 NOS 骨架，按建议不投入精力、也不删用户 Documents 里的模组文件。
 `dobby` DllNotFound 同样是独立组件问题。
+
+## §12 R88：R87 真机「没加载」复盘 —— PE 保真 facade + 完整异常链日志
+
+> §11 里「预生成补丁版（33280 B，sha `b2b0f39a…`）」在 R88 已被替换为
+> **PE 保真版（43344 B，sha `61e74e92…`）**，本章解释为什么。
+
+### 真机证据（用户上传 `1794303911228467452-nebula_host.txt`）
+
+用户反馈「没加载」。日志 2345 行，关键事实：
+
+| 观察 | 结论 |
+|---|---|
+| 第 3 行 `版本标记 R87` | 跑的确是 R87 包，不是旧包 |
+| 第 600 行 `内存加载 System.Runtime.dll (33280 bytes)` | 内嵌的是 R87 的 Cecil 全量重写版（R86 是官方 43344 B） |
+| `Could not resolve type with token 01000059` / `Marshal` **消失** | §11 的 `TypeForwardedTo(Marshal)` 语义补丁**方向对了**，typeref 断链已修 |
+| 第 1584 行 `已定位 NebulaManualExecute()` → 第 1585 `managed 抛出异常` → `异常类型: System.TypeInitializationException` | 失败点**提前**到 `mono_runtime_invoke` 扫 plugins 阶段 |
+| 之后**没有** `NebulaManualExecute ENTER`，**没有** `Loading [AutoSave]` / `[NebulaLoader]`，BepInEx `LogOutput.log` 本次增量为 0 | chainloader 连插件枚举都没开始，比 R86 更早挂 |
+| 末尾 `MainMenuManager.RunStartUp finished` | 游戏本体正常，只是 NOS 没起来 |
+| 宿主 `nebula_log_exception()` 只打印 `异常类型` | **`TypeInitializationException` 的内层真因被吞掉**，无法直接定位 |
+
+R86 → R87 唯一变量就是 `System.Runtime.dll` 从 43344 B 换成 33280 B，因此怀疑点集中在这份
+facade 本身，而非模组或路径。
+
+### 根因假设：Cecil `mod.Write()` 全量重写 PE 的副作用
+
+用官方 .NET 8.0.32 原版（`/tmp/iosmono.nupkg` → `runtimes/ios-arm64/lib/net8.0/System.Runtime.dll`，
+43344 B，sha `c6fd93aa…`）与 R87 Cecil 版逐字节对比：
+
+| 项 | 官方 8.0.32 | R87 Cecil 版 |
+|---|---|---|
+| 文件大小 | 43344 B | 33280 B |
+| Authenticode overlay（SecurityDir 33280,10064） | 完整 | **被剥离，目录置 0** |
+| PE checksum | 有效 | **归零** |
+| CLI flags | `0x9`（ILONLY \| STRONGNAMESIGNED） | `0x9` **仍声明已强名签名** |
+| 强名签名区（128 B） | 128/128 非零 | **全 0** |
+| DebugDir / `#~` 流 | 原始布局 | 缩小、整段重排 |
+
+语义上 `ikdasm` diff 只有「新增一行 `.class extern forwarder System.Runtime.InteropServices.Marshal`
+→ `.assembly extern System.Private.CoreLib`」+ `.corflags 0x9 -> 0x1`（dnfile 独立复核
+ExportedType 891→892，原 891 个转发一个没丢）。**问题不在元数据，在 PE 骨架**：
+「声明 `STRONGNAMESIGNED` 却给了全零签名」这种自相矛盾的镜像，本地 Mono 6.12 宽松
+（`Assembly.LoadFile` 能过），但 iOS 的 .NET 8 MonoVM 更严格，可能在加载 facade 时翻车。
+
+已核实 `blob_load_assembly()` 确实检查 `MONO_IMAGE_OK` 与 `mono_assembly_load_from_full()`
+返回值后才打印「内存加载」，所以日志里的 `33280 bytes` 不是盲目打印——那份 facade
+至少被 Mono 接收了，但仍不能排除后续类初始化阶段因 PE 不一致而失败。
+
+### 修法一：PE 保真 facade（`tools/patch_facade_marshal/pe_restore.py`）
+
+不再用 Cecil 的成品镜像，而是**字节级手术**：以官方 43344 B 原版 PE 为基底，
+只覆盖 Cecil 补丁版的 metadata 流（含 Marshal ExportedType），同步 CLI header 的
+`MetaData.Size`，并做两处一致性修正：
+
+- 清 `STRONGNAMESIGNED`（`0x8`）位 —— 没有私钥、无法重签名，就不该再声称已签名；
+- 强名签名区清零 —— 内容变了签名必然无效，明确留空而非留半个无效签名。
+
+完整保留官方 PE 头 / checksum / SecurityDir / DebugDir / Authenticode overlay /
+section 布局。带校验：`md_rva` 必须一致、Cecil `md_sz` 必须变大、metadata 不越界，
+任一不满足 `exit 1`。产物：
+
+```text
+[R88] ✓ PE 保真: 43344 bytes (官方 43344), flags 0x9->0x1,
+MetaData 30180->30200, sha=61e74e928980ea680959584d4f826864b26ddf95e8eea2c8b6dfa4765a7ae4a9
+```
+
+`ikdasm` diff vs 官方仍只有「新增 Marshal forwarder + corflags」；dnfile 复核
+ExportedType 892 行、`Marshal` 项 1 个、`IsForwarder: True`、Impl 指向
+`System.Private.CoreLib`。`src/mono_host/facade-patch/System.Runtime.net8.0.32.patched.dll`
+已替换为此版本。
+
+### 修法二：完整异常链日志（诊断，不再吞真因）
+
+`nebula_log_exception()` 原来只打 `异常类型`。R88 改为纯 embedding C API **直接读字段**
+（绝不调用托管 getter / `ToString` —— 异常态下 JIT 会把进程带崩并丢日志），
+沿继承链向上查字段（`_message` / `_innerException` 定义在基类 `System.Exception`），
+递归打印 InnerException 链，逐层输出 `Message` / `TypeName` /
+`StackTraceString` / `Source`，并对 `_stackTrace` 只打印对象类型名。
+
+字段名兼容两套 CoreLib：运行时是 **Mono 版** `System.Private.CoreLib.dll`
+（`System.Exception` 有 `_message` / `_innerException` / `_stackTraceString` /
+`_source` / `_HResult` / `_helpURL`，**没有** `_stackTrace` / `_className`）；
+.NET 版另有 `_stackTrace` / `_className`。一律「按名字查、找不到就跳过」，
+不确定类型就绝不 `mono_string_to_utf8`，不会因字段差异崩溃。
+新增 API 已用 `llvm-nm` 核实 iOS `libmonosgen-2.0.a` 中均为全局 `T` 符号。
+
+### `build_ios.sh` 同步
+
+- `PATCHED_SHA_8032` → `61e74e92…`；主路径仍为「官方原版 sha 命中 → `cp` 预生成版」，
+  **零 dotnet 依赖**（CI 的 `host-dylib` job 没有 `setup-dotnet`）。
+- 兜底路径重构：先备份官方原版 PE → `dotnet run` 现场跑 Cecil 补丁工具 →
+  `pe_restore.py` 把补丁 metadata 合回官方骨架 → 覆盖回 `FACADE`。
+- sha 标记改为**无条件以最终 `FACADE` 实际 sha 重写**（R87 的 `if [ ! -s ]` 在缓存复用
+  时会残留旧 sha，导致 blob 校验误判）。
+- blob python 强校验注释与打印同步为 R88。
+
+### 真机怎么验
+
+1. 日志首行 `版本标记 R88`；`内存加载 System.Runtime.dll (43344 bytes)`（不再是 33280）。
+2. `Loading [AutoSave]` / `[AUI Server Scroll]` / `[NebulaLoader]` 恢复，
+   且**不回归** `token 01000059` / `Marshal` TypeLoadException。
+3. `NebulaPlugin.LoadInternal` 继续往下，出现 **NOS 自身启动日志**。
+4. 若仍失败：看 `[host] ===== 托管异常链（R88 完整诊断）=====` 里**最内层**的异常类型
+   + `Message` + `TypeName`，那就是下一关要修的真因（不再需要靠猜）。
+
+### 若 R88 仍未加载的分支
+
+- PE 保真版直接恢复 R86 的 `Loading [...]` 且无 `Marshal` 报错 → 说明 R87 的失败确实来自
+  Cecil 全量重写 PE，继续看下一关即可。
+- 仍有 `TypeInitializationException` → 用新增异常链日志拿到内层异常，按内层真因继续修；
+  此时 facade 这个变量已被排除，可把注意力转到具体类型的 `.cctor`。
+- **不变约束**：模组 DLL 保持用户 `Documents` 原样、不删不改；`.app` 只保留只读游戏资源；
+  保持 BepInEx 原生加载链，不改成运行时 IL patch 用户 DLL。

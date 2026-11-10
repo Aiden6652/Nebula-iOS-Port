@@ -536,6 +536,17 @@ extern MonoMethod *mono_method_desc_search_in_class(MonoMethodDesc *desc, MonoCl
 extern void mono_method_desc_free(MonoMethodDesc *desc);
 extern char *mono_string_to_utf8(MonoString *s);
 
+// [R88] 异常链诊断需要的 embedding API。只用「直接读字段」的 C API，绝不调用托管
+// getter / ToString（异常态下 JIT 会把进程带崩并丢掉最后几行日志，见下方注释）。
+// 原型与 iOS mono 头(details/class-functions.h、object-functions.h、
+// appdomain-functions.h)一致；这里补 extern 沿用本文件既有做法，兼容两套 mono 头。
+// 符号已用 llvm-nm 在 iOS libmonosgen-2.0.a 核实均为全局 T 符号，链接无虞。
+typedef struct _MonoClassField MonoClassField;   // 与头内相同 typedef，C11 允许重复
+extern MonoClassField *mono_class_get_field_from_name(MonoClass *klass, const char *name);
+extern MonoObject *mono_field_get_value_object(MonoDomain *domain, MonoClassField *field, MonoObject *obj);
+extern MonoClass *mono_class_get_parent(MonoClass *klass);
+extern MonoDomain *mono_get_root_domain(void);
+
 static void nebula_fix_platform(MonoDomain *domain) {
     if (!domain) return;
     const blob_entry *mm_e = blob_find("MonoMod.Utils");
@@ -1694,15 +1705,97 @@ static int boot_bepinex(MonoDomain *domain, const char *root) {
     return 1;
 }
 
-// 把托管异常转成可读文本打到 host 日志（避免只看得到"抛出异常"却不知原因）
-// 只走原生 API 打印异常类型：托管 ToString(mono_object_to_string) 在异常态下
+// [R88] 把托管异常转成可读文本打到 host 日志。
+// 只走原生 embedding API 直接读字段：托管 ToString / property getter 在异常态下
 // 需要 JIT 编译，iOS 上实测会把进程带崩并丢掉最后几行日志（看不到异常内容），故弃用。
+// R87 只打印异常类型名，导致真机上看到 System.TypeInitializationException 却看不到
+// 内层真因。R88 改为递归打印 InnerException 链 + Message / TypeName /
+// StackTraceString，让「外层只是包装」的异常露出真正出错的那一层。
+//   字段名已用 ikdasm / dnfile 在运行时 System.Private.CoreLib.dll 核实：
+//   Mono 版 System.Exception 有 _message / _innerException / _stackTraceString /
+//   _source / _HResult / _helpURL；.NET 版另有 _stackTrace / _className。
+//   两套都照顾到：字段一律「按名字查、找不到就跳过」，绝不强转、绝不假设类型。
+
+// mono_class_get_field_from_name 只查当前类声明的字段；_message / _innerException
+// 定义在基类 System.Exception，故沿继承链向上找（System.Object 的 parent 为 NULL 终止）。
+static MonoClassField *nebula_find_field(MonoClass *klass, const char *name) {
+    while (klass) {
+        MonoClassField *f = mono_class_get_field_from_name(klass, name);
+        if (f) return f;
+        klass = mono_class_get_parent(klass);
+    }
+    return NULL;
+}
+
+// 把对象当 System.String 打印；不是 string 就绝不传给 mono_string_to_utf8（会崩）。
+// 与文件其它 mono_string_to_utf8 调用一致：少量日志内存不 free，换取异常态下的稳定。
+static void nebula_print_string_obj(MonoObject *v, const char *label) {
+    if (!v) return;
+    MonoClass *vc = mono_object_get_class(v);
+    const char *vns = vc ? mono_class_get_namespace(vc) : NULL;
+    const char *vnm = vc ? mono_class_get_name(vc) : NULL;
+    if (!vnm || !vns || strcmp(vnm, "String") != 0 || strcmp(vns, "System") != 0) return;
+    char *s = mono_string_to_utf8((MonoString *)v);
+    if (s && *s) fprintf(stderr, "[host]   %s: %s\n", label, s);
+}
+
+static void nebula_log_exception_chain(MonoObject *exc, int depth) {
+    if (!exc || depth > 8) return;              // 防环 / 防过深
+    MonoDomain *dom = mono_get_root_domain();
+    MonoClass *c = mono_object_get_class(exc);
+    const char *ns = c ? mono_class_get_namespace(c) : "";
+    const char *nm = c ? mono_class_get_name(c) : "?";
+    fprintf(stderr, "[host]   [%d] 异常类型: %s.%s\n", depth, ns ? ns : "", nm ? nm : "?");
+
+    // 字符串字段：两套 CoreLib 的并集，缺哪个就静默跳过（不会崩）
+    const char *str_fields[][2] = {
+        {"_message",          "Message"},
+        {"_typeName",         "TypeName"},   // TypeInitializationException：哪个类型的 .cctor 挂了
+        {"_className",        "ClassName"},  // .NET 版 Exception 有
+        {"_stackTraceString", "StackTraceString"},
+        {"_remoteStackTraceString", "RemoteStackTraceString"},
+        {"_source",           "Source"},
+        {"_helpURL",          "HelpURL"},
+    };
+    for (size_t i = 0; i < sizeof(str_fields) / sizeof(str_fields[0]); i++) {
+        MonoClassField *f = nebula_find_field(c, str_fields[i][0]);
+        if (!f) continue;                     // 该字段这套 CoreLib 没有 -> 跳过
+        MonoObject *v = mono_field_get_value_object(dom, f, exc);
+        nebula_print_string_obj(v, str_fields[i][1]);
+    }
+    // _stackTrace 在 .NET 版是 object（StackTrace 对象 / byte[]），Mono 版没有此字段。
+    // 只打印它的实际类型名，绝不按 string 解读。
+    {
+        MonoClassField *f = nebula_find_field(c, "_stackTrace");
+        if (f) {
+            MonoObject *v = mono_field_get_value_object(dom, f, exc);
+            if (v) {
+                MonoClass *vc = mono_object_get_class(v);
+                const char *vns = vc ? mono_class_get_namespace(vc) : "";
+                const char *vnm = vc ? mono_class_get_name(vc) : "?";
+                fprintf(stderr, "[host]   StackTrace(对象类型): %s.%s\n",
+                        vns ? vns : "", vnm ? vnm : "?");
+            }
+        }
+    }
+    fflush(NULL);
+
+    // 递归内层：TypeInitializationException 的真因几乎总在 InnerException
+    MonoClassField *fi = nebula_find_field(c, "_innerException");
+    if (fi) {
+        MonoObject *inner = mono_field_get_value_object(dom, fi, exc);
+        if (inner) {
+            fprintf(stderr, "[host]   ---- InnerException（下层）----\n");
+            nebula_log_exception_chain(inner, depth + 1);
+        }
+    }
+}
+
 static void nebula_log_exception(MonoObject *exc) {
     if (!exc) return;
-    MonoClass *c = mono_object_get_class(exc);
-    const char *ns = c ? mono_class_get_namespace(c) : NULL;
-    const char *nm = c ? mono_class_get_name(c) : "?";
-    fprintf(stderr, "[host]   异常类型: %s.%s\n", ns ? ns : "", nm ? nm : "?");
+    fprintf(stderr, "[host] ===== 托管异常链（R88 完整诊断）=====\n");
+    nebula_log_exception_chain(exc, 0);
+    fprintf(stderr, "[host] ===== 异常链结束 =====\n");
     fflush(NULL);
 }
 
@@ -3017,11 +3110,11 @@ static void *boot_thread_impl(void *arg) {
         snprintf(p, sizeof(p), "/var/mobile/Documents/nebula_host.txt"); log_try(p);
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
-        hlog("[host][r87] ===== 版本标记 R87：宿主 BCL 的 System.Runtime.dll 补 TypeForwardedTo(System.Runtime.InteropServices.Marshal) -> System.Private.CoreLib，修 net6 typeref 在 .NET 8 facade 上的 TypeLoadException；模组 DLL 零改动、BepInEx 原生加载 =====");
-        hlog("[host][r87] 根因：Il2CppInterop/BepInEx 用 .NET 6 ref pack 编译，typeref scope 写死 System.Runtime 6.0.0.0 的 Marshal；官方 .NET 8 System.Runtime.dll(43344B) 把 InteropServices 全交给 System.Runtime.InteropServices.dll 转发，自己不含 Marshal -> Mono 解析 typeref 01000059 失败，Harmony.PatchAll 全灭(含 NebulaPlugin.LoadInternal)");
-        hlog("[host][r87] 继承 R86：路径基准全改 Documents(GameRootPath 可写，NOS 的 NebulaLibs 不再往只读 .app 建)；继承 R85：kernel32.dll -> no-op stub；GC 只在宿主层(MONO_GC_PARAMS=major=marksweep)管");
-        hlog("[host][r87] 真机验收：Loading [AutoSave]/[AUI Server Scroll]/[NebulaLoader] 之后不应再出现 Could not resolve type with token 01000059 / System.Runtime.InteropServices.Marshal；NebulaPlugin.LoadInternal 应继续往下走，出现 NOS 自身启动日志");
-        hlog("[host][r87] 提示：若仍出现 UnauthorizedAccessException: .../AmongUs.app/NebulaLibs 或 DllNotFoundException: kernel32.dll，说明跑的是旧包(R86 及以前)，请用 R87 重新 build 的 dylib");
+        hlog("[host][r88] ===== 版本标记 R88：宿主 BCL System.Runtime.dll 改 PE 保真补丁版（官方 43344B PE 骨架 + Cecil 的 Marshal 转发 metadata），消除 R87 Cecil 全量重写 PE 的变量；异常日志升级为打印完整 InnerException 链 =====");
+        hlog("[host][r88] R87 真机复盘：Marshal token 01000059 已消失，但连 NebulaManualExecute ENTER 都没出现，mono_runtime_invoke 直接抛 TypeInitializationException，内层真因被旧版异常打印（只打类型名）吞掉");
+        hlog("[host][r88] R88 两点改动：① facade 用 pe_restore.py 保留官方 checksum/SecurityDir/Authenticode overlay/强名一致性(43344B)，IL 只多一行 Marshal 转发；② nebula_log_exception 逐层打印 Message/TypeName/StackTraceString/InnerException，下次再崩可直接看到真因");
+        hlog("[host][r88] 真机验收：版本标记 R88；内存加载 System.Runtime.dll (43344 bytes)；Loading [AutoSave]/[AUI Server Scroll]/[NebulaLoader] 恢复；不再出现 token 01000059；NebulaPlugin.LoadInternal 继续往下并出现 NOS 自身启动日志");
+        hlog("[host][r88] 若仍失败：看 [host] ===== 托管异常链（R88 完整诊断）===== 里最内层的异常类型 + Message，那就是真正要修的下一关");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE

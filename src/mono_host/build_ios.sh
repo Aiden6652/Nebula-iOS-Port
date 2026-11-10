@@ -112,6 +112,26 @@ fi
 echo "MONO_ROOT: $MONO_ROOT"
 
 # ---------------------------------------------------------------------------
+# [R88] 沿用 R87「补 Marshal 转发」的修法，但把预生成补丁版换成 PE 保真版。
+#
+# R87 真机日志(1794303911228467452) 实证：Cecil 的 mod.Write() 全量重写
+#   System.Runtime.dll，语义上只多一行 TypeForwardedTo(Marshal)，却把官方 PE
+#   改得面目全非：43344B -> 33280B（剥掉 10064B Authenticode overlay）、
+#   checksum 归零、强名签名 128B 清零却仍保留 CLI flags 的 STRONGNAMESIGNED 位、
+#   DebugDir 缩小、#~ 流整段重排。真机上 R87 比 R86 更早崩：连
+#   NebulaManualExecute ENTER 都没打出来，mono_runtime_invoke 直接抛
+#   TypeInitializationException（内层真因被宿主 nebula_log_exception() 吞掉）。
+#   高度怀疑「声明已强名签名却签名为空」这种自相矛盾的 PE 让 iOS .NET 8
+#   MonoVM 在加载 facade 时翻车（本地 Mono 6.12 宽松，LoadFile 能过，沙箱没暴露）。
+# R88 的预生成版改为以【官方 43344B 原版 PE】为骨架，只覆盖 Cecil 补丁的
+#   metadata（含 Marshal 转发）、同步 CLI header 的 MetaData.Size、清
+#   STRONGNAMESIGNED 位并清空强名签名区：完整保留官方 checksum / SecurityDir /
+#   Authenticode overlay / section 布局，IL 语义仍只多一行 Marshal 转发。
+#   生成脚本见 tools/patch_facade_marshal/pe_restore.py（字节级手术、带校验）。
+# 同时宿主 nebula_log_exception() 升级为打印完整异常链（InnerException /
+#   Message / StackTraceString / TypeName），下次真机若仍崩可直接看到内层真因。
+#
+# ---------------------------------------------------------------------------
 # [R87] 修 net6 typeref -> .NET 8 facade 的 Marshal 转发断链（NOS 加载主因）
 #
 # R86 真机日志 1655/1683/1758：AutoSave / AUI.ServerScroll / NebulaLoader 全崩在
@@ -150,39 +170,55 @@ FACADE_SHA_MARK="$OUT/.facade_marshal.sha"
 FINAL_SHA=""   # [R87] 预初始化，确保下方 echo 永不为 unbound（任何分支都安全）
 PREBUILT="$ROOT/facade-patch/System.Runtime.net8.0.32.patched.dll"
 ORIG_SHA_8032="c6fd93aa8bb5016fb1766525940353c9a7723425152d2812a84dd679630c1f38"
-PATCHED_SHA_8032="b2b0f39a8ba03cca70bd810814a4be8d82bf410ce6072a8e1328fb5d063b755c"
-R87_PATCH_PROJ="$ROOT/../../tools/patch_facade_marshal/patch_facade_marshal.csproj"
+# [R88] 预生成版 = PE 保真版(43344B)：官方 PE 骨架 + Cecil 补丁 metadata。
+#   不再是 R87 那个 Cecil 全量重写版(33280B, sha b2b0f39a…)。
+PATCHED_SHA_8032="61e74e928980ea680959584d4f826864b26ddf95e8eea2c8b6dfa4765a7ae4a9"
+R88_PATCH_PROJ="$ROOT/../../tools/patch_facade_marshal/patch_facade_marshal.csproj"
+R88_PE_RESTORE="$ROOT/../../tools/patch_facade_marshal/pe_restore.py"
 
 sha256_of() {
     python3 -c 'import sys,hashlib;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
 }
 
-[ -f "$FACADE" ] || { echo "✗ [R87] 找不到 $FACADE" >&2; exit 1; }
+[ -f "$FACADE" ] || { echo "✗ [R88] 找不到 $FACADE" >&2; exit 1; }
 CUR_SHA="$(sha256_of "$FACADE")"
-echo "   [R87] 官方 System.Runtime.dll: $(wc -c < "$FACADE") bytes, sha=$CUR_SHA"
+echo "   [R88] 官方 System.Runtime.dll: $(wc -c < "$FACADE") bytes, sha=$CUR_SHA"
 
 if [ "$CUR_SHA" = "$PATCHED_SHA_8032" ]; then
-    echo "   [R87] ✓ 已是补丁版（缓存/重复构建命中），跳过写入"
+    echo "   [R88] ✓ 已是 PE 保真补丁版（缓存/重复构建命中），跳过写入"
 elif [ "$CUR_SHA" = "$ORIG_SHA_8032" ] && [ -f "$PREBUILT" ] && \
      [ "$(sha256_of "$PREBUILT")" = "$PATCHED_SHA_8032" ]; then
     cp "$PREBUILT" "$FACADE"
-    echo "   [R87] ✓ 已换为预生成补丁版（含 Marshal 转发，零 dotnet 依赖）"
+    echo "   [R88] ✓ 已换为预生成 PE 保真补丁版（含 Marshal 转发，零 dotnet 依赖）"
 else
-    echo "   [R87] 原版 sha 与 8.0.32 基准不符或预生成版缺失 -> 走 dotnet 现场补丁" >&2
-    command -v dotnet >/dev/null 2>&1 || { echo "✗ [R87] 需要 dotnet 现场补转发，但 dotnet 不可用" >&2; exit 1; }
-    [ -f "$R87_PATCH_PROJ" ] || { echo "✗ [R87] 补丁工具缺失: $R87_PATCH_PROJ" >&2; exit 1; }
-    dotnet run --project "$R87_PATCH_PROJ" -c Release -- \
-        "$FACADE" "$FACADE_SHA_MARK" || { echo "✗ [R87] 现场补丁/语义校验失败，拒绝产出" >&2; exit 1; }
+    # 兜底：BCL 版本变了（原版 sha 不符）或预生成版缺失 -> 现场用 Cecil 补语义，
+    # 再用 pe_restore.py 把补丁 metadata 合回【官方原版 PE 骨架】。
+    # Cecil 工具是原地覆盖 FACADE，所以必须先留一份官方原版当骨架。
+    echo "   [R88] 原版 sha 与 8.0.32 基准不符或预生成版缺失 -> 走现场补转发 + PE 保真" >&2
+    command -v dotnet >/dev/null 2>&1 || { echo "✗ [R88] 需要 dotnet 现场补转发，但 dotnet 不可用" >&2; exit 1; }
+    [ -f "$R88_PATCH_PROJ" ] || { echo "✗ [R88] 补丁工具缺失: $R88_PATCH_PROJ" >&2; exit 1; }
+    [ -f "$R88_PE_RESTORE" ] || { echo "✗ [R88] PE 保真脚本缺失: $R88_PE_RESTORE" >&2; exit 1; }
+    ORIG_BAK="$OUT/.System.Runtime.orig.dll"
+    CECIL_OUT="$OUT/.System.Runtime.cecil.dll"
+    PE_OUT="$OUT/.System.Runtime.pe.dll"
+    cp "$FACADE" "$ORIG_BAK"
+    dotnet run --project "$R88_PATCH_PROJ" -c Release -- \
+        "$FACADE" "$FACADE_SHA_MARK" || { echo "✗ [R88] Cecil 语义补丁失败，拒绝产出" >&2; exit 1; }
+    cp "$FACADE" "$CECIL_OUT"
+    python3 "$R88_PE_RESTORE" "$ORIG_BAK" "$CECIL_OUT" "$PE_OUT" || \
+        { echo "✗ [R88] PE 保真合成失败，拒绝产出" >&2; exit 1; }
+    cp "$PE_OUT" "$FACADE"
+    echo "   [R88] ✓ 现场补转发 + PE 保真合成完成"
 fi
 
-# 主路径（含缓存命中）也写 sha 标记；dotnet 路径由工具自己写好，不覆盖
-if [ ! -s "$FACADE_SHA_MARK" ]; then
-    sha256_of "$FACADE" > "$FACADE_SHA_MARK"
-fi
+# [R88] 无条件以「当前 FACADE 的实际 sha」重写标记：dotnet 工具写的是 Cecil 版 sha，
+# 缓存目录也可能残留 R87 的旧标记，一律纠正，避免 blob 校验误判（R87 的 ! -s 条件写入
+# 在缓存复用时会漏改）。
+sha256_of "$FACADE" > "$FACADE_SHA_MARK"
 FINAL_SHA="$(sha256_of "$FACADE")"
 [ "$(cat "$FACADE_SHA_MARK")" = "$FINAL_SHA" ] || {
-    echo "✗ [R87] sha 标记与当前 facade 不一致（blob 可能内嵌错版本）" >&2; exit 1; }
-echo "   [R87] ✓ 待内嵌 facade sha=${FINAL_SHA:-UNKNOWN}（Marshal -> System.Private.CoreLib）"
+    echo "✗ [R88] sha 标记与当前 facade 不一致（blob 可能内嵌错版本）" >&2; exit 1; }
+echo "   [R88] ✓ 待内嵌 facade sha=${FINAL_SHA:-UNKNOWN}（PE 保真 + Marshal -> System.Private.CoreLib）"
 
 echo "=== 生成嵌入式 blob（BCL + 可选 BepInEx/core，全部内存加载，无散文件）==="
 BLOB="$OUT/.nebula_bcl.blob"
@@ -230,9 +266,10 @@ def add(name, data):
     seen.add(name); entries.append((name, data))
 
 # 1) .NET 8 BCL（托管程序集，含 System.Private.CoreLib）
-# [R87] 强校验：内嵌的 System.Runtime.dll 必须是上面补过 Marshal 转发的那份。
-# sha 标记由 build_ios.sh 的 R87 段写入（主路径=预生成补丁版；兜底=dotnet 现场
-# 补丁工具语义校验通过后自己写）。不一致直接 sys.exit(1)，绝不出会崩的包。
+# [R88] 强校验：内嵌的 System.Runtime.dll 必须是上面那份「PE 保真 + Marshal 转发」版。
+# sha 标记由 build_ios.sh 的 R88 段无条件以最终 FACADE 实际 sha 写入（主路径=预生成
+# PE 保真版；兜底=dotnet 现场补丁 + pe_restore.py 合成后重写）。不一致直接
+# sys.exit(1)，绝不出会崩的包。
 import hashlib
 expected_facade_sha = ""
 if facade_sha_mark and os.path.isfile(facade_sha_mark):
@@ -245,11 +282,11 @@ if os.path.isdir(bcl_dir):
             if f == "System.Runtime.dll":
                 actual = hashlib.sha256(data).hexdigest()
                 if not expected_facade_sha or actual != expected_facade_sha:
-                    print("!! [R87] blob 内 System.Runtime.dll 不是补过 Marshal 转发的版本 "
+                    print("!! [R88] blob 内 System.Runtime.dll 不是 PE 保真补丁版 "
                           "(expected=%s actual=%s) —— 拒绝产出" %
                           (expected_facade_sha[:16] or "<无标记>", actual[:16]), file=sys.stderr)
                     sys.exit(1)
-                print("   [R87] ✓ blob System.Runtime.dll sha=%s (%d bytes, 含 Marshal 转发)"
+                print("   [R88] ✓ blob System.Runtime.dll sha=%s (%d bytes, PE 保真 + Marshal 转发)"
                       % (actual[:16], len(data)))
             add(f, data)
 else:
