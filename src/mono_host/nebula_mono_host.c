@@ -604,23 +604,30 @@ static void nebula_log_paths(MonoDomain *domain) {
     MonoClass *paths = mono_class_from_name(img, "BepInEx", "Paths");
     if (!paths) return;
 
-    MonoProperty *pGR = mono_class_get_property_from_name(paths, "GameRootPath");
-    MonoProperty *pGD = mono_class_get_property_from_name(paths, "GameDataPath");
-    MonoMethod *gGR = pGR ? mono_property_get_get_method(pGR) : NULL;
-    MonoMethod *gGD = pGD ? mono_property_get_get_method(pGD) : NULL;
-    MonoObject *exc = NULL;
-    if (gGR) {
-        MonoObject *gr = mono_runtime_invoke(gGR, NULL, NULL, &exc);
-        if (gr) { char *c = mono_string_to_utf8((MonoString *)gr);
-                  printf("[host] Paths.GameRootPath = %s\n", c ? c : "(null)"); if (c) free(c); }
-        else fprintf(stderr, "[host] 读 GameRootPath 失败（未初始化？）\n");
-        exc = NULL;
-    }
-    if (gGD) {
-        MonoObject *gd = mono_runtime_invoke(gGD, NULL, NULL, &exc);
-        if (gd) { char *c = mono_string_to_utf8((MonoString *)gd);
-                  printf("[host] Paths.GameDataPath = %s\n", c ? c : "(null)"); if (c) free(c); }
-        else fprintf(stderr, "[host] 读 GameDataPath 失败（未初始化？）\n");
+    /* [R89] 除了两个根路径，把 SetExecutablePath 后半段才会赋值的属性也全部打出来。
+       R88 真机真因：SetExecutablePath 在 GameDataPath 校验处抛异常，导致前面两个
+       有值、后面这些全是 null -> ConfigFile.cctor ArgumentNullException。
+       只要下面出现 (null)，就说明 Paths 只初始化了一半，直接看 Data 链接诊断。 */
+    static const char *const props[] = {
+        "GameRootPath", "GameDataPath", "BepInExRootPath",
+        "ConfigPath", "BepInExConfigPath", "PluginPath",
+        "PatcherPluginPath", "CachePath", "ManagedPath",
+    };
+    for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); i++) {
+        MonoProperty *p = mono_class_get_property_from_name(paths, props[i]);
+        MonoMethod *g = p ? mono_property_get_get_method(p) : NULL;
+        if (!g) { printf("[host] Paths.%s = <无 getter>\n", props[i]); continue; }
+        MonoObject *exc = NULL;
+        MonoObject *v = mono_runtime_invoke(g, NULL, NULL, &exc);
+        if (exc) { printf("[host] Paths.%s = <getter 抛异常>\n", props[i]); continue; }
+        if (v) {
+            char *c = mono_string_to_utf8((MonoString *)v);
+            printf("[host] Paths.%s = %s\n", props[i], (c && *c) ? c : "(空/null)");
+            if (c) free(c);
+        } else {
+            printf("[host] Paths.%s = (null)   <<< SetExecutablePath 未跑完 / Data 链接悬空\n",
+                   props[i]);
+        }
     }
     fflush(NULL);
 }
@@ -1197,26 +1204,77 @@ static int nebula_init_bepinex_paths(MonoDomain *domain, const char *root) {
     // [R86] NOS 会在这里 CreateDirectory + 释放依赖 dll，提前建好（幂等）
     snprintf(tmp, sizeof(tmp), "%s/NebulaLibs", doc);     mkdir(tmp, 0755);
 
-    /* [R86] GameDataPath 兜底：GameRootPath 改到 Documents 后，BepInEx 的
-       SetExecutablePath 会把 GameDataPath 算成 Documents/Data、ManagedPath 算成
-       Documents/Data/Managed。真实游戏数据在只读 .app/Data —— 用符号链接把
-       两者接上，让这些路径仍命中游戏本体（不改 IL、不改 BepInEx）。
-       这是「本该指向 .app」的只读资源，链接后逻辑上仍从 .app 读。
-       幂等：链接/目录已存在就不动，绝不覆盖用户自己放的内容。 */
+    /* [R89] GameDataPath 兜底 —— 修「悬空 Data 链接」导致的 chainloader 全灭。
+       R88 真机(1794309171815977252) 复盘：每次侧载重装 / 迁移 Documents 后，
+       .app 的 Bundle UUID 与容器 UUID 都会变（R86 86562C63 → R87 56C3166C →
+       R88 6CFB7CCB），而 Documents/Data 这个符号链接仍指向【上一轮】.app/Data。
+       R86 旧实现用 lstat(linkp)==0 判断「已存在就跳过」，但 lstat 对悬空 symlink
+       同样返回成功 —— 坏链接永远不会被重建（R86 日志 618 行成功打印过
+       「Data 链接:...」，R87/R88 都没有，正因如此）。
+       后果链（已用 ikdasm 反汇编 BepInEx.Core.dll 的 Paths::SetExecutablePath 坐实）：
+         它先 set_GameRootPath / set_GameDataPath，再校验 Directory.Exists(GameDataPath)
+         失败 -> throw DirectoryNotFoundException；抛错点之前的赋值只到 GameDataPath，
+         ConfigPath / BepInExConfigPath / PluginPath / CachePath / DllSearchPaths 全停在 null。
+         -> IL2CPPChainloader.cctor -> ConfigFile.cctor -> ArgumentNullException
+         -> chainloader 起不来，Loading [...] 一条都没有，NOS 没加载。
+       修法：每轮都校验链接目标是否等于【本次】.app/Data 且可达，不是就 unlink 重建；
+       最后无论如何都保证 Documents/Data 是真实存在的目录，让 Directory.Exists 恒为 true。
+       本该指向 .app 的只读游戏数据，链接后逻辑上仍从 .app 读；普通目录（用户自有）不动。 */
     {
         char linkp[PATH_MAX], target[PATH_MAX];
         snprintf(linkp,  sizeof(linkp),  "%s/Data", doc);
         snprintf(target, sizeof(target), "%s/Data", root);
+
         struct stat lst;
-        if (lstat(linkp, &lst) != 0) {          // 不存在才建
+        int exists = (lstat(linkp, &lst) == 0);
+        int is_link = exists && S_ISLNK(lst.st_mode);
+        int need_fix = 0;
+        char oldtgt[PATH_MAX] = {0};
+
+        if (is_link) {
+            ssize_t n = readlink(linkp, oldtgt, sizeof(oldtgt) - 1);
+            if (n > 0) oldtgt[n] = '\0';
+            struct stat tst;
+            if (strcmp(oldtgt, target) != 0) {
+                printf("[host][r89] Data 链接目标过期（指向上一轮 .app）: 现=%s  应为=%s -> 重建\n",
+                       oldtgt, target);
+                need_fix = 1;
+            } else if (stat(linkp, &tst) != 0 || !S_ISDIR(tst.st_mode)) {
+                printf("[host][r89] Data 链接悬空/不可达: %s -> 重建\n", oldtgt);
+                need_fix = 1;
+            } else {
+                printf("[host][r89] Data 链接有效: %s -> %s\n", linkp, target);
+            }
+        } else if (!exists) {
+            printf("[host][r89] Data 不存在，准备建立链接\n");
+            need_fix = 1;
+        } else {
+            printf("[host][r89] Data 是普通目录(用户自有)，保留不动: %s\n", linkp);
+        }
+
+        if (need_fix) {
+            if (is_link) unlink(linkp);
             struct stat tst;
             if (stat(target, &tst) == 0 && S_ISDIR(tst.st_mode)) {
                 if (symlink(target, linkp) == 0)
-                    printf("[host][r86] Data 链接: %s -> %s（游戏数据仍从只读 .app 读）\n", linkp, target);
+                    printf("[host][r89] ✓ Data 链接已重建: %s -> %s（游戏数据仍从只读 .app 读）\n",
+                           linkp, target);
                 else
-                    printf("[host][r86] !! Data 链接失败 errno=%d（interop 已预生成 + cfg 绝对路径兜底，不影响）\n", errno);
+                    printf("[host][r89] !! symlink 失败 errno=%d，走目录兜底\n", errno);
             } else {
-                printf("[host][r86] .app/Data 不存在，跳过 Data 链接（cfg 中 GlobalMetadataPath 是绝对路径，不受影响）\n");
+                printf("[host][r89] !! 本次 .app/Data 不存在: %s，走目录兜底\n", target);
+            }
+            /* 兜底：无论如何保证 Documents/Data 是真实存在的目录，让 BepInEx 的
+               Directory.Exists(GameDataPath) 不会失败。cfg 里 GlobalMetadataPath
+               是绝对路径，不依赖此目录内容；若上一步留下了坏链接，先删再建。 */
+            struct stat fst;
+            if (stat(linkp, &fst) != 0 || !S_ISDIR(fst.st_mode)) {
+                struct stat lst2;
+                if (lstat(linkp, &lst2) == 0 && S_ISLNK(lst2.st_mode)) unlink(linkp);
+                if (mkdir(linkp, 0755) == 0 || errno == EEXIST)
+                    printf("[host][r89] ✓ Data 目录兜底就绪: %s\n", linkp);
+                else
+                    printf("[host][r89] !! Data 目录兜底失败 errno=%d\n", errno);
             }
         }
     }
@@ -1750,6 +1808,7 @@ static void nebula_log_exception_chain(MonoObject *exc, int depth) {
     // 字符串字段：两套 CoreLib 的并集，缺哪个就静默跳过（不会崩）
     const char *str_fields[][2] = {
         {"_message",          "Message"},
+        {"_paramName",        "ParamName"},  // ArgumentNullException：哪个参数是 null
         {"_typeName",         "TypeName"},   // TypeInitializationException：哪个类型的 .cctor 挂了
         {"_className",        "ClassName"},  // .NET 版 Exception 有
         {"_stackTraceString", "StackTraceString"},
@@ -3110,11 +3169,11 @@ static void *boot_thread_impl(void *arg) {
         snprintf(p, sizeof(p), "/var/mobile/Documents/nebula_host.txt"); log_try(p);
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
-        hlog("[host][r88] ===== 版本标记 R88：宿主 BCL System.Runtime.dll 改 PE 保真补丁版（官方 43344B PE 骨架 + Cecil 的 Marshal 转发 metadata），消除 R87 Cecil 全量重写 PE 的变量；异常日志升级为打印完整 InnerException 链 =====");
-        hlog("[host][r88] R87 真机复盘：Marshal token 01000059 已消失，但连 NebulaManualExecute ENTER 都没出现，mono_runtime_invoke 直接抛 TypeInitializationException，内层真因被旧版异常打印（只打类型名）吞掉");
-        hlog("[host][r88] R88 两点改动：① facade 用 pe_restore.py 保留官方 checksum/SecurityDir/Authenticode overlay/强名一致性(43344B)，IL 只多一行 Marshal 转发；② nebula_log_exception 逐层打印 Message/TypeName/StackTraceString/InnerException，下次再崩可直接看到真因");
-        hlog("[host][r88] 真机验收：版本标记 R88；内存加载 System.Runtime.dll (43344 bytes)；Loading [AutoSave]/[AUI Server Scroll]/[NebulaLoader] 恢复；不再出现 token 01000059；NebulaPlugin.LoadInternal 继续往下并出现 NOS 自身启动日志");
-        hlog("[host][r88] 若仍失败：看 [host] ===== 托管异常链（R88 完整诊断）===== 里最内层的异常类型 + Message，那就是真正要修的下一关");
+        hlog("[host][r89] ===== 版本标记 R89：修悬空 Documents/Data 链接导致 BepInEx Paths 只初始化一半、IL2CPPChainloader.cctor 全灭；保留 R88 的 PE 保真 facade =====");
+        hlog("[host][r89] R88 真机复盘：TypeLoadException 已 0 次（Marshal 转发有效），但托管异常链显示 IL2CPPChainloader.cctor -> ConfigFile.cctor -> ArgumentNullException: Value cannot be null.");
+        hlog("[host][r89] 根因：每次侧载重装 .app/容器 UUID 都变，Documents/Data 符号链接仍指向上一轮 .app/Data；旧代码 lstat 判「存在就跳过」(lstat 对悬空链接也成功) -> Directory.Exists(GameDataPath) 失败 -> SetExecutablePath 抛 DirectoryNotFoundException -> ConfigPath/BepInExConfigPath/PluginPath 全为 null");
+        hlog("[host][r89] 修法：每轮校验链接目标是否等于本次 .app/Data 且可达，不是就 unlink 重建；兜底保证 Documents/Data 是真实存在目录。nebula_log_paths 扩展打印全部 Paths 属性；异常链补 ParamName");
+        hlog("[host][r89] 真机验收：出现 [host][r89] ✓ Data 链接已重建（或 Data 链接有效）；Paths.ConfigPath/BepInExConfigPath/PluginPath 不再是 (null)；不再出现托管异常链；Loading [AutoSave]/[AUI Server Scroll]/[NebulaLoader] 恢复；NebulaPlugin.LoadInternal 继续往下并出现 NOS 自身启动日志");
     }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE

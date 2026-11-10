@@ -515,3 +515,101 @@ ExportedType 892 行、`Marshal` 项 1 个、`IsForwarder: True`、Impl 指向
   此时 facade 这个变量已被排除，可把注意力转到具体类型的 `.cctor`。
 - **不变约束**：模组 DLL 保持用户 `Documents` 原样、不删不改；`.app` 只保留只读游戏资源；
   保持 BepInEx 原生加载链，不改成运行时 IL patch 用户 DLL。
+
+## §13 R89：真因反转 —— 悬空 `Documents/Data` 链接让 BepInEx `Paths` 只初始化一半
+
+### R88 真机结果（`1794309171815977252-nebula_host.txt`）
+
+| 项 | 结果 |
+|---|---|
+| 版本标记 / facade | `R88`、`内存加载 System.Runtime.dll (43344 bytes)` —— PE 保真版生效 |
+| `TypeLoadException` / `token 01000059` | **0 次** —— §11/§12 的 `Marshal` 转发**确实修好了**，R88 的 facade 保留 |
+| `NebulaManualExecute ENTER` / `Loading [...]` | 仍然**没有** —— chainloader 根本没起来 |
+| 新增异常链（R88 诊断升级的价值） | `[0] IL2CPPChainloader TypeInitializationException` → `[1] ConfigFile TypeInitializationException` → `[2] ArgumentNullException: Value cannot be null.` |
+
+**结论：R87 和 R88 是同一个原因**，跟 Cecil 全量重写 PE 无关。R87 内层被旧版异常打印吞掉，
+R88 的异常链升级只是让它现形；PE 保真消除了一个变量、也顺带确证了 `Marshal` 修复有效，
+但真正的拦路虎一直是**路径**。
+
+### 证据链（反汇编 + 三份日志对比）
+
+用 `ikdasm` 反汇编 `bepinex-core/BepInEx.Core.dll` 的 `BepInEx.Paths::SetExecutablePath`：
+
+```text
+IL_003e  set_GameRootPath
+IL_0051  set_GameDataPath
+...      多候选校验 Directory.Exists(GameDataPath)
+IL_00ae  ldstr "Failed to extract valid GameDataPath from executablePath"
+IL_00be  throw                      ← 在这里抛
+--- 以下全部不会执行 ---
+IL_00d3  set_ManagedPath      IL_00ec set_BepInExRootPath
+IL_0109  set_ConfigPath       IL_0114 set_BepInExConfigPath
+IL_0128  set_PluginPath       IL_013c set_PatcherPluginPath
+IL_018c  set_CachePath        IL_01ba set_DllSearchPaths
+```
+
+即：`GameDataPath` 校验失败时，只有 `GameRootPath`/`GameDataPath` 有值，
+**后面 8 个路径字段全部停在 null**。R88 日志 648-649 恰好只打印出这两个有值，
+随后 `IL2CPPChainloader.cctor` → `ConfigFile.cctor` 用 null 路径 → `ArgumentNullException`。
+
+三份真机日志对比（`Data 链接` 打印只在 R86 出现过）：
+
+| 日志 | `Data 链接:` | `.app` Bundle UUID | 容器 UUID | chainloader |
+|---|---|---|---|---|
+| R86 | ✅ 618 行新建 | `86562C63` | `4F4F6D4B` | 正常，`Loading [...]` ×5 |
+| R87 | ❌ 无 | `56C3166C` | `D3BFEEDA` | 挂（内层被吞） |
+| R88 | ❌ 无 | `6CFB7CCB` | `F85AB11E` | 挂（`ConfigFile` → `ArgumentNullException`） |
+
+每次侧载重装 / 迁移 Documents，`.app` 与容器 UUID 都变，而 `Documents/Data`
+符号链接仍指向**上一轮** `.app/Data`。
+
+### 根因：`lstat()` 的悬空 symlink 陷阱
+
+R86 的链接逻辑是：
+
+```c
+if (lstat(linkp, &lst) != 0) {          // 不存在才建
+    symlink(target, linkp);
+}
+```
+
+`lstat()` 对**悬空符号链接同样返回成功**（它不跟随链接），于是坏链接一旦留下，
+「已存在就跳过」会让它**永远不被重建** → `Directory.Exists(Documents/Data)` 为 false →
+`SetExecutablePath` 抛 `DirectoryNotFoundException`（该异常被 Doorstop 吞进
+`preloader.log`，R88 日志 627 行还读到了 R87 容器的残留记录）→ `Paths` 半初始化 →
+`ConfigFile.cctor` 抛 `ArgumentNullException` → chainloader 全灭 → 无 `Loading [...]` → NOS 不加载。
+
+### 修法（`src/mono_host/nebula_mono_host.c`，纯宿主 C 层）
+
+- `nebula_init_bepinex_paths()` 的 Data 链接块改为**每轮自愈**：
+  - `lstat` 判定是否已存在；是 symlink 时 `readlink` 读出现目标，与**本次** `root/Data`
+    比较，不一致 → `unlink` + 重建；一致但 `stat(linkp)` 不可达（悬空）→ 同样重建。
+  - 目标是【本次】`.app/Data` 的绝对路径，游戏数据逻辑上仍从只读 `.app` 读。
+  - 普通目录（用户自有）一律不动。
+  - **兜底**：无论哪种情况，最后保证 `Documents/Data` 是真实存在的目录
+    （坏链接先 `unlink` 再 `mkdir`），让 `Directory.Exists(GameDataPath)` 恒为 true。
+    `BepInEx.cfg` 里 `IL2CPP.GlobalMetadataPath` 是绝对路径，不依赖此目录内容。
+- `nebula_log_paths()` 从只打印 2 个属性扩展为打印 9 个
+  （含 `ConfigPath`/`BepInExConfigPath`/`PluginPath`/`CachePath`），
+  出现 `(null)` 即说明 `SetExecutablePath` 未跑完，一眼定位。
+- 异常链字段表补 `_paramName`（`ArgumentNullException` 的参数名）。
+- 版本标记 → **R89**。
+
+### 真机怎么验
+
+1. 首屏出现 `[host][r89] ✓ Data 链接已重建: ... -> <本次 .app>/Data`
+   （或 `Data 链接有效` / `Data 目录兜底就绪`）。
+2. `[host] Paths.ConfigPath` / `BepInExConfigPath` / `PluginPath` 等**不再是 `(null)`**。
+3. **不再出现** `[host] ===== 托管异常链`；`Loading [AutoSave]` /
+   `[AUI Server Scroll]` / `[NebulaLoader]` 恢复。
+4. `Marshal` 的 `token 01000059` 不回归（R88 的 PE 保真 facade 保留）。
+5. `NebulaPlugin.LoadInternal` 继续往下，出现 **NOS 自身启动日志**。
+
+### 若 R89 仍失败
+
+- 若 `Paths.*` 仍有 `(null)` → 说明 `SetExecutablePath` 还在更早处抛，
+  看 `[host][r89]` 的链接诊断与 `preloader.log` 全文。
+- 若 `Paths.*` 全部有值但仍异常 → 用异常链最内层的 `Message` + `ParamName` 继续定位，
+  此时路径这个变量已排除。
+- **不变约束**：模组 DLL 保持用户 `Documents` 原样、不删不改；`.app` 只保留只读游戏资源；
+  保持 BepInEx 原生加载链，不做运行时 IL patch。
