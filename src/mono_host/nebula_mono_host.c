@@ -807,6 +807,82 @@ static int nebula_blob_extract_dir(const char *prefix, const char *dest) {
     return written;
 }
 
+/* [R91] 带内容指纹的强制释放：解决「旧 interop dll 被永久复用」。
+ *
+ * R89 真机日志 691 行 "Interop assemblies are possibly out of date"、618 行强制
+ * UpdateInteropAssemblies=false 复用设备端 131 个 interop dll。根因就在上面的
+ * nebula_blob_extract_dir：只用 stat().st_size 判等，旧 dll 只要【体积相同】就跳过，
+ * 于是换包后设备端永远留着上一次的旧文件 —— 元数据/桥接与新版不同步。
+ *
+ * 做法：把本 dylib 内嵌的 prefix 条目（名字 + 长度 + 全字节）算一个 FNV-1a 64 指纹，
+ * 写到 dest/.nebula_fingerprint。启动时先比指纹：
+ *   - 相同 -> 一个字节都不写（零 IO，与原来一样快）；
+ *   - 不同 -> 无条件覆盖全部文件并更新指纹（换包立即生效，旧文件不再有机会残留）。
+ * 指纹只在内存里遍历 g_entries 计算，不额外读磁盘。 */
+static unsigned long long nebula_blob_fingerprint(const char *prefix) {
+    unsigned long long h = 1469598103934665603ULL;   /* FNV offset basis */
+    size_t plen = strlen(prefix);
+    for (int i = 0; i < g_n; i++) {
+        const char *nm = g_entries[i].name;
+        if (strncmp(nm, prefix, plen)) continue;
+        for (const unsigned char *q = (const unsigned char *)nm; *q; q++) {
+            h ^= *q; h *= 1099511628211ULL;
+        }
+        const unsigned char *d = (const unsigned char *)g_entries[i].data;
+        for (size_t k = 0; k < g_entries[i].size; k++) {
+            h ^= d[k]; h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+static int nebula_blob_extract_dir_checked(const char *prefix, const char *dest) {
+    if (!g_n) return 0;
+    struct stat st;
+    if (stat(dest, &st) != 0 && neb_mkdir_p(dest) != 0) return 0;
+
+    unsigned long long fp = nebula_blob_fingerprint(prefix);
+    char stamp[PATH_MAX];
+    snprintf(stamp, sizeof(stamp), "%s/.nebula_fingerprint", dest);
+
+    int same = 0;
+    FILE *sf = fopen(stamp, "rb");
+    if (sf) {
+        unsigned long long old = 0;
+        if (fread(&old, sizeof(old), 1, sf) == 1 && old == fp) same = 1;
+        fclose(sf);
+    }
+    if (same) {
+        printf("[host][r91] %s 指纹一致(%016llx)，跳过释放（设备端已是本包版本）\n",
+               dest, fp);
+        return 0;
+    }
+
+    /* 指纹不符：无条件覆盖，绝不因「大小相同」跳过 */
+    size_t plen = strlen(prefix);
+    int written = 0;
+    for (int i = 0; i < g_n; i++) {
+        const char *nm = g_entries[i].name;
+        if (strncmp(nm, prefix, plen)) continue;
+        const char *bn = strrchr(nm, '/'); bn = bn ? bn + 1 : nm;
+        if (!*bn) continue;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", dest, bn);
+        FILE *f = fopen(p, "wb");
+        if (!f) continue;
+        if (fwrite(g_entries[i].data, 1, g_entries[i].size, f) != g_entries[i].size) {
+            fclose(f); remove(p); continue;
+        }
+        fclose(f);
+        written++;
+    }
+    sf = fopen(stamp, "wb");
+    if (sf) { fwrite(&fp, sizeof(fp), 1, sf); fclose(sf); }
+    printf("[host][r91] %s 指纹变更(%016llx) -> 强制覆盖 %d 个文件（清除过期 interop）\n",
+           dest, fp, written);
+    return written;
+}
+
 /* [R80] 把 blob 里的 BCL 散程序集 + BepInEx/core 托管 dll 落盘到
    Documents/BepInEx/core。BepInEx 的 Cecil TypeLoader【只读文件系统】：
    阶段B 扫 plugins 时 MetadataHelper.GetCustomAttributes(inherit=true) 会
@@ -922,8 +998,9 @@ static void nebula_r60_extract_bundle(const char *root) {
     const char *doc = nebula_doc_root(root);
 
     snprintf(dest, sizeof(dest), "%s/BepInEx/interop", doc);
-    int n = nebula_blob_extract_dir("interop/", dest);
-    printf("[host][r60] 预生成 interop -> %s（本次新写 %d，已存在则跳过）\n", dest, n);
+    /* [R91] 改用内容指纹释放：换包后不再因「大小相同」而复用设备端过期 interop dll */
+    int n = nebula_blob_extract_dir_checked("interop/", dest);
+    printf("[host][r91] 预生成 interop -> %s（本次新写 %d，指纹一致则跳过）\n", dest, n);
 
     // native shim 只投可写目录
     snprintf(dest, sizeof(dest), "%s/nebula_native", doc);
@@ -1130,8 +1207,8 @@ static void nebula_fix_il2cpp_paths(const char *root) {
         {
             char ip[PATH_MAX];
             snprintf(ip, sizeof(ip), "%s/BepInEx/interop", wbase[i]);
-            /* 幂等兜底：已存在且大小一致就跳过，不覆盖不删除 */
-            nebula_blob_extract_dir("interop/", ip);
+            /* [R91] 与主路径同用指纹释放，保证两处口径一致、过期 dll 必被刷新 */
+            nebula_blob_extract_dir_checked("interop/", ip);
             struct stat ist;
             int nip = 0;
             if (stat(ip, &ist) == 0 && S_ISDIR(ist.st_mode)) {
@@ -1149,9 +1226,10 @@ static void nebula_fix_il2cpp_paths(const char *root) {
 
             if (neb_mkdir_p(cfgd) != 0) continue;
             if (nip > 0) {
-                // 预生成 interop 已就位：直接复用，绝不在设备端重新生成
+                // [R91] 这里复用的是【本包刚按指纹强制刷新过】的 interop，不是设备端残留旧版。
+                // 绝不在设备端重新生成（iOS 上 Cpp2IL 会卡死），但仍要保证文件是新版。
                 neb_cfg_set(cfgp, "IL2CPP", "UpdateInteropAssemblies", "false", 1);
-                printf("[host][r60] interop 已就位(%d dll)，设 UpdateInteropAssemblies=false 直接复用（设备端不生成、无需手动放）\n", nip);
+                printf("[host][r91] interop 已就位(%d dll，已按本包指纹刷新)，设 UpdateInteropAssemblies=false 直接复用（设备端不生成、无需手动放）\n", nip);
             } else {
                 // 极端情况（blob 没带 interop）：仍不生成（会卡死），明确报错，游戏原版可玩
                 printf("[host][r60] 警告: BepInEx/interop 仍为空 —— 本 dylib 未内嵌 interop，NOS 无法加载\n");

@@ -737,7 +737,21 @@ else
   echo "    MONO_IOS_JIT 未开启，保留标准 DISABLE_JIT 构建（standard 安全）"
 fi
 
-echo "=== [3.7/5] R90: 元数据损坏兜底（FieldMarshal 列宽非法不再 g_assert_not_reached 崩）==="
+echo "=== [3.7/5] R91: 元数据损坏兜底（列宽非法不再 g_assert_not_reached 崩）===
+# [R91 更正] 之前认定的根因（169 个 DLL 缺失 256 字节 size_bitfield / 表布局损坏）
+#   是【误判】：tools/scan_metadata_integrity.py 把 mono 表结构写错了（表 35 AssemblyRef
+#   少算 12 字节/行、表 38/39/40/42 全错、漏掉 30/31/33/34/36/37、HasCustomAttribute
+#   目标表多写）。用 mono 8.0 真实 TableSchemas 重算后 169 个 DLL 全部合法、零损坏。
+#   且 ECMA-335 的 #~ 流里根本不存在「256 字节 size_bitfield」——size_bitfield 是 mono
+#   在内存里由 mono_metadata_compute_size() 从内置 TableSchemas 算出来的，不存于文件。
+#   所以「给 DLL 插入 256 字节」既无效又会把合法元数据改坏，该方案作废。
+# R90 兜底仍然必要（真机可能加载设备端 out-of-date 的旧 interop dll），但 R90 自身有两处 bug：
+#   ① get_marshal_info 守卫写成 `_nw == 0 || _nw > 4`，而 mono_metadata_table_size 宏值域
+#      恒为 1/2/4（=((bf>>(col*2))&3)+1），条件永远为假 -> 死代码，告警永远打不出来。
+#      真正的非法值是 3（2bit 编码为 2）。
+#   ② 只兜底了 decode_row_col_raw，decode_row_raw 里同样的 g_assert_not_reached 没覆盖。
+# R91 加第 ③ 层【源头校正】：compute_size 生成 size_bitfield 后，把所有非法的 2bit 编码
+#   夹到合法值，一处修复覆盖全部 decode 调用点，而不是逐个打补丁。"
 # 真机 R89 崩点（nebula_host.txt）：Harmony 给游戏类型(EndGameManager)打补丁 ->
 # Il2CppClassPointerStore<T>.cctor -> il2cpp_class_from_name -> 宿主 JIT 编译某方法 ->
 # mono_marshal_get_native_wrapper -> mono_method_get_marshal_info -> mono_metadata_get_marshal_info
@@ -758,32 +772,69 @@ p = sys.argv[1]
 s = open(p, encoding='utf-8', errors='replace').read()
 T = "\t"
 
-# (1) decode_row_col_raw 的 switch(n) default：g_assert_not_reached() -> return 0
+# ---------- (0)【R91 源头校正】compute_size 写 size_bitfield 前，夹掉非法列宽编码 ----------
+# mono_metadata_table_size(bf,col) = ((bf >> (col*2)) & 3) + 1，值域恒为 1/2/3/4。
+# compute_size 只写 (field_size-1) ∈ {0,1,3}（对应列宽 1/2/4）。若某列出现编码 2，
+# 解码得 n=3，decode_row* 的 switch 落 default -> g_assert_not_reached 直接崩。
+# 在源头把编码 2 夹成 1(=2 字节)，一处修复覆盖全部 decode 调用点，并打出表号+image 名。
+old0 = (T+"*result_bitfield = (i << 24) | bitfield;\n"+T+"return size;\n}")
+assert old0 in s, "compute_size 结尾未匹配（mono 源码可能已改结构）"
+new0 = (T+"/* [Nebula iOS R91] 源头校正：非法列宽编码(2)夹成合法值，杜绝 decode_row* 崩 */\n"
+        +T+"{\n"
+        +T+T+"guint32 _bf = bitfield;\n"
+        +T+T+"for (int _c = 0; _c < 12; _c++) {\n"
+        +T+T+T+"if (((_bf >> (_c * 2)) & 3) == 2) {\n"
+        +T+T+T+T+'g_warning ("[Nebula] 表 %d 列 %d 列宽编码非法(n=3)，已夹为 2 字节 (image=%s)", tableindex, _c, meta->name ? meta->name : "?");\n'
+        +T+T+T+T+"_bf = (_bf & ~(3u << (_c * 2))) | (1u << (_c * 2));\n"
+        +T+T+T+"}\n"
+        +T+T+"}\n"
+        +T+T+"bitfield = _bf;\n"
+        +T+"}\n"
+        +T+"*result_bitfield = (i << 24) | bitfield;\n"
+        +T+"return size;\n}")
+s = s.replace(old0, new0, 1)
+
+# ---------- (1) decode_row_col_raw 的 default：g_assert_not_reached() -> return 0 ----------
 old1 = (T+"switch (n) {\n"+T+"case 1:\n"+T+T+"return *data;\n"
         +T+"case 2:\n"+T+T+"return read16 (data);\n"
         +T+"case 4:\n"+T+T+"return read32 (data);\n"
         +T+"default:\n"+T+T+"g_assert_not_reached ();\n"+T+"}")
-assert old1 in s, "decode_row_col_raw switch 未匹配（mono 源码可能已改结构）"
+assert old1 in s, "decode_row_col_raw switch 未匹配"
 new1 = (T+"switch (n) {\n"+T+"case 1:\n"+T+T+"return *data;\n"
         +T+"case 2:\n"+T+T+"return read16 (data);\n"
         +T+"case 4:\n"+T+T+"return read32 (data);\n"
-        +T+"default:\n"+T+T+"/* [Nebula iOS R90] 列宽非法=元数据损坏，按 0 处理而非崩 */\n"
+        +T+"default:\n"+T+T+"/* [Nebula iOS R91] 列宽非法=元数据损坏，按 0 处理而非崩 */\n"
         +T+T+"return 0;\n"+T+"}")
 s = s.replace(old1, new1, 1)
 
-# (2) get_marshal_info：FieldMarshal.NativeType 列宽非法 -> 告警(image 名) + return NULL
+# ---------- (1b)【R91 新增】decode_row_raw 里同样的 g_assert_not_reached 也要兜底 ----------
+# R90 只改了 decode_row_col_raw，漏了这个批量解码函数；n=3 时 data += 3 还会错位。
+old1b = (T+T+"switch (n){\n"+T+T+"case 1:\n"+T+T+T+"res [i] = *data; break;\n"
+         +T+T+"case 2:\n"+T+T+T+"res [i] = read16 (data); break;\n"
+         +T+T+"case 4:\n"+T+T+T+"res [i] = read32 (data); break;\n"
+         +T+T+"default:\n"+T+T+T+"g_assert_not_reached ();\n"+T+T+"}")
+assert old1b in s, "decode_row_raw switch 未匹配"
+new1b = (T+T+"switch (n){\n"+T+T+"case 1:\n"+T+T+T+"res [i] = *data; break;\n"
+         +T+T+"case 2:\n"+T+T+T+"res [i] = read16 (data); break;\n"
+         +T+T+"case 4:\n"+T+T+T+"res [i] = read32 (data); break;\n"
+         +T+T+"default:\n"+T+T+T+"/* [Nebula iOS R91] 列宽非法，按 2 字节 0 处理，避免崩与指针错位 */\n"
+         +T+T+T+"n = 2; res [i] = 0; break;\n"+T+T+"}")
+s = s.replace(old1b, new1b, 1)
+
+# ---------- (2) get_marshal_info 定向诊断，修正恒假条件 ----------
+# 旧条件 `_nw == 0 || _nw > 4` 永远不成立（宏值域 1..4）。真正的非法值是 3。
 old2 = (T+"return mono_metadata_blob_heap (meta, mono_metadata_decode_row_col (tdef, loc.result, MONO_FIELD_MARSHAL_NATIVE_TYPE));\n"
         +"}\n\nMonoMethod*")
-assert old2 in s, "get_marshal_info return 未匹配（mono 源码可能已改结构）"
+assert old2 in s, "get_marshal_info return 未匹配"
 new2 = (T+"{\n"+T+T+"guint32 _nw = mono_metadata_table_size (tdef->size_bitfield, MONO_FIELD_MARSHAL_NATIVE_TYPE);\n"
-        +T+T+"if (_nw == 0 || _nw > 4) {\n"
-        +T+T+T+'g_warning ("[Nebula] FieldMarshal.NativeType 列宽非法(%u)，跳该 marshal 信息(元数据损坏? image=%s)", _nw, meta->name ? meta->name : "?");\n'
+        +T+T+"if (_nw == 3) {\n"
+        +T+T+T+'g_warning ("[Nebula] FieldMarshal.NativeType 列宽非法(%u)，跳该 marshal 信息(image=%s)", _nw, meta->name ? meta->name : "?");\n'
         +T+T+T+"return NULL;\n"+T+T+"}\n"+T+"}\n"
         +old2)
 s = s.replace(old2, new2, 1)
 
 open(p, 'w', encoding='utf-8').write(s)
-print("    R90 补丁已应用到 metadata.c（decode_row_col_raw 兜底 + get_marshal_info 定向诊断）")
+print("    R91 补丁已应用：compute_size 源头校正 + decode_row_col_raw/decode_row_raw 双兜底 + get_marshal_info 条件修正")
 PY
 
 echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="

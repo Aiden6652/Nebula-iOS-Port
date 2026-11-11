@@ -630,50 +630,101 @@ if (lstat(linkp, &lst) != 0) {          // 不存在才建
 - 日志 691 行 `Interop assemblies are possibly out of date`、618 行强制
   `UpdateInteropAssemblies=false` 复用设备端 131 个 interop dll（可能 out-of-date）。
 
-### 根因
+### 根因（R91 更正：此前的结论是误判）
 
-被 JIT 的方法所属 assembly 的 **`FieldMarshal(0x0D)` 表列宽非法**（元数据损坏 /
-堆尺寸错位 / 表行列布局算错）。mono 原版在 `mono_metadata_decode_row_col_raw` 里对列宽 `n`
-只认 `1/2/4`，否则 `g_assert_not_reached()` 直接崩。这套程序集多为 **Il2CppInterop 运行时生成 /
-Cecil 重写产物**，元数据不完美是常态。
+> **重要**：R90 当时写下的「169 个 DLL 缺失 ECMA 强制的 256 字节 size_bitfield /
+> 表行列布局损坏」是**错误结论**，源于 `tools/scan_metadata_integrity.py` 自己把
+> mono 表结构写错了。R91 已用 dotnet/runtime release/8.0 的
+> `metadata.c:mono_metadata_compute_size()` + `tabledefs.h` 重新核对，结论如下。
+
+**事实 1：这 169 个 DLL 的元数据全部合法，零损坏。** 用 mono 真实表结构重算，
+169/169 的表区都精确等于 `#~` 流末尾（或仅差 0~4 字节的全零对齐填充）。此前脚本的错误：
+
+| 表号 | 实际（mono 8.0） | 旧脚本误写 | 后果 |
+|---|---|---|---|
+| 35 AssemblyRef | 9 列 / 20 字节 | `[U16,BLOB,STR,STR]` / 8 字节 | 每行少算 12 字节，BepInEx.Core 6 行凑成「尾区缺 72」假象 |
+| 38 File / 39 ExportedType / 40 ManifestResource / 42 GenericParam | 各自标准布局 | 全错 | 累计偏差 |
+| 30/31/33/34/36/37 | 标准表 | 完全漏掉 | 含这些表的文件全错 |
+| HasCustomAttribute 编码索引 | 22 张目标表，取 MAX | 多写目标表（含 CustomAttribute 自身） | 行数 ≥2048 时列宽 2 误判成 4（Cpp2IL.Core +4118） |
+
+旧脚本还把编码索引宽度规则写成了 SUM（正确是 **MAX**）。
+
+**事实 2：ECMA-335 的 `#~` 流里不存在「256 字节 size_bitfield」。** `size_bitfield`
+是 mono **在内存里**由 `mono_metadata_compute_size()` 从内置 `TableSchemas` /
+`table_description` 算出来的，不存于文件。unity-libs 里的正常程序集与本批 DLL 的
+`#~` 布局完全一致（Module 行计数都在 +24），进一步印证 mono 从不读文件里的 bitfield。
+因此「给 DLL 插入 256 字节」既无效、又会把**合法**元数据整体错位 256 字节改坏。**该方案作废。**
+
+**事实 3：真机为何会崩 —— 设备端复用了过期 interop dll。** R89 日志 691 行
+`Interop assemblies are possibly out of date`、618 行强制 `UpdateInteropAssemblies=false`。
+宿主 `nebula_blob_extract_dir()` 只用 `stat().st_size` 判等，**旧 dll 只要体积相同就跳过**，
+于是换包后设备端永远留着上一版的 131 个 interop dll。沙箱里这 169 个是新版合格品，
+真机加载的却是设备残留旧版 —— 这就是「沙箱全合法、真机崩」的原因链。
+
+**事实 4：直接崩溃点**仍是 mono 的健壮性缺陷：`size_bitfield` 里某列出现非法的
+2bit 编码（值 2）时，`mono_metadata_table_size()` 解出 `n=3`，
+`decode_row_col_raw` / `decode_row_raw` 的 `switch(n)` 落 `default` →
+`g_assert_not_reached()` → SIGSEGV。合法元数据不会触发，但 mono 不该因单个坏列直接崩。
 
 > **与 JIT 无关**：用户环境是 StikDebug 调试型 JIT（CS_DEBUGGED，内核允许 RWX），JIT 本身正常，
 > MAP_JIT / jit allow 那条线不需要处理。也与 facade / Marshal 转发无关（R88 的 PE 保真 facade 保留）。
 
-### 修法（在自编译 mono 源码 `metadata.c`，`scripts/build_mono_ios.sh` 的 `[3.7/5]` 段注入）
+### 修法（R91，三层防御 + 一处数据刷新）
 
-- **① 全局兜底**：`decode_row_col_raw` 的 `switch(n)` 在列宽非法（default）时由
-  `g_assert_not_reached()` 改为 **`return 0`**——不崩、不野指针（default 分支直接 return 不读 data）。
-- **② 定向诊断**：`get_marshal_info` 在 `FieldMarshal.NativeType` 列宽非法（`==0 || >4`）时，
-  先 `g_warning` 打出 **`image=` 程序集名**再 `return NULL`（=该字段无封送信息），
-  既能定位元凶程序集，又不崩。
+**A. 修扫描工具**（`tools/scan_metadata_integrity.py`）——已按 mono 8.0 真实 `TableSchemas`
+重写：45 张表全覆盖、编码索引用 MAX、正确识别流末尾 0~4 字节全零填充。
+`python3 tools/scan_metadata_integrity.py src/mono_host/bepinex-core src/mono_host/prebuilt-interop`
+应输出 **169 个 dll、异常 0 个**。**不再对 DLL 做任何字节手术。**
 
-```c
-/* [Nebula iOS R90] decode_row_col_raw 列宽非法=元数据损坏，按 0 处理而非崩 */
-default:
-    return 0;
+**B. 修运行时兜底**（`scripts/build_mono_ios.sh` 的 `[3.7/5]` 段注入 `metadata.c`）——
+R90 的补丁有两个真 bug，一并修正并加源头校正：
 
-/* get_marshal_info 内：NativeType 列宽非法时告警并跳过 */
-guint32 _nw = mono_metadata_table_size (tdef->size_bitfield, MONO_FIELD_MARSHAL_NATIVE_TYPE);
-if (_nw == 0 || _nw > 4) {
-    g_warning ("[Nebula] FieldMarshal.NativeType 列宽非法(%u)，跳该 marshal 信息(元数据损坏? image=%s)", _nw, meta->name ? meta->name : "?");
-    return NULL;
-}
-```
+- **⓪ 源头校正（新增）**：`mono_metadata_compute_size()` 写 `size_bitfield` 前，
+  扫 12 列的 2bit 编码，把非法值 `2` 夹成 `1`（=2 字节），并 `g_warning` 打出表号 +
+  `image=` 名。**一处修复覆盖所有 decode 调用点**，不再逐个打补丁。
+- **① `decode_row_col_raw`**：`default` 由 `g_assert_not_reached()` 改 `return 0`（R90 已有，保留）。
+- **①b `decode_row_raw`（新增）**：R90 漏了这个批量解码函数；改为
+  `n = 2; res[i] = 0; break;`，既避免崩也避免 `data += 3` 的指针错位。
+- **② 修正恒假条件**：`mono_metadata_table_size()` 值域恒为 `1/2/3/4`，
+  旧的 `if (_nw == 0 || _nw > 4)` **永远不成立**，是死代码，告警从没打出来过。
+  真正的非法值是 **3**，改为 `if (_nw == 3)`。
 
-### 真机怎么验
+**C. 强制刷新过期 interop**（`src/mono_host/nebula_mono_host.c`）——新增
+`nebula_blob_extract_dir_checked()`：把 blob 内 `interop/` 全部条目（名字 + 字节）
+算 FNV-1a 64 指纹写到 `BepInEx/interop/.nebula_fingerprint`。启动时比对：
+一致则零 IO 跳过；**不一致就无条件覆盖全部文件**（不再看文件大小）。
+主路径与 3d) 兜底路径两处调用口径统一。换包立即生效，旧 dll 不再有机会残留。
 
-1. **不再出现** `Got a SIGSEGV` + `mono_metadata_decode_row_col_raw.cold.2`。
-2. 若 JIT 仍触到损坏元数据，会看到
-   `[Nebula] FieldMarshal.NativeType 列宽非法(N) image=<某程序集>` 告警，
-   **`image=` 指向的那个程序集就是要重生成 / 修正元数据的那份**（多半是 out-of-date 的 interop dll）。
+> 与 JIT 无关（StikDebug 调试型 JIT 正常）；与 facade / Marshal 转发无关（R88 的 PE 保真 facade 保留）。
+
+### 真机怎么验（R91）
+
+推一次 `main` 触发 `build-ios.yml` 重建 `libnebula_standard.dylib`（含 R91 的 mono 补丁
+与宿主指纹释放），换包后：
+
+1. **宿主日志出现** `[host][r91] ... 指纹变更(...) -> 强制覆盖 131 个文件`，
+   或第二次启动出现 `指纹一致(...)，跳过释放` —— 证明设备端旧 interop 已被本包版本替换，
+   `Interop assemblies are possibly out of date` 应消失。
+2. **不再出现** `Got a SIGSEGV` / `mono_metadata_decode_row_col_raw.cold.2`。
+   即便仍读到坏列，源头校正会打出
+   `[Nebula] 表 N 列 M 列宽编码非法(n=3)，已夹为 2 字节 (image=...)` 而不崩。
 3. chainloader / NOS 继续往下走，出现 NOS 自身启动日志。
 4. R88 的 `Marshal token 01000059` 与 R89 的 `✓ Data 链接已重建` 都不回归。
 
-### 若 R90 仍失败
+### 若仍失败
 
-- 若崩栈**不再是** `mono_metadata_decode_row_col_raw.cold.2` → 说明元数据兜底这关已过，
-  进入下一个崩溃点，按新的崩溃栈继续定位（用 `image=` 告警把元凶程序集揪出来后，
-  重生成或替换该 interop dll 的元数据即可从根上消除告警）。
-- 若仍出现 `decode_row_col_raw.cold.2` → 说明坏元数据走的是别的列宽路径没被守卫覆盖，
-  需要扩展 `get_marshal_info` 之外的 `decode_row_col` 调用点兜底。
+- 崩栈**不再是** `decode_row_col_raw.cold.2` → 元数据这关已过，按新崩溃栈继续定位。
+- 仍崩在列宽相关 → 说明还有 `decode_row_checked` 等路径未覆盖（该函数本身已安全返回
+  `bad image` 错误，通常不会崩），按新栈把兜底补到对应函数即可。
+- **不要再回到「改 DLL / 插 256 字节」的方向**：169 个 DLL 已验证合法，改它们只会引入损坏。
+
+### 本地自检（改动后必跑）
+
+```bash
+# 1) 元数据校验：应为 169 个 dll、异常 0 个
+python3 tools/scan_metadata_integrity.py \
+    src/mono_host/bepinex-core src/mono_host/prebuilt-interop
+
+# 2) mono 补丁锚点冒烟（用下载的 mono 8.0 metadata.c 验证四处替换都能命中）
+#    见 scripts/build_mono_ios.sh [3.7/5] 段
+```
