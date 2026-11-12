@@ -7,6 +7,20 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 OUT="$ROOT/out"
 mkdir -p "$OUT"
 
+# [R92] 生成构建标签头：host 源 #include "nebula_build_tag.h"，本地/桌面构建也必须先产出该头，
+#   否则编译期 'nebula_build_tag.h' file not found。优先用 CI 注入的 sha，否则回退本地 git / UNKNOWN。
+R92_TAG_SHA="${GITHUB_SHA:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
+R92_TAG_SHA="${R92_TAG_SHA:0:12}"
+R92_TAG_DATE="$(date -u +%Y%m%d)"
+R92_BUILD_TAG="${R92_TAG_SHA}-${R92_TAG_DATE}"
+cat > "$ROOT/nebula_build_tag.h" <<HDR
+#ifndef NEBULA_BUILD_TAG_H
+#define NEBULA_BUILD_TAG_H
+#define NEBULA_BUILD_TAG_STR "$R92_BUILD_TAG"
+#endif
+HDR
+echo "[build] 构建标签: $R92_BUILD_TAG"
+
 echo "[build] 1/2 编译托管侧 Engine.dll (+Roslyn) ..."
 dotnet publish "$ROOT/Engine.csproj" -c Release -o "$OUT" >/dev/null
 cp "$ROOT/script.cs.txt" "$OUT/"
@@ -25,7 +39,7 @@ if pkg-config --exists mono-2 2>/dev/null; then
     # + fishhook(rebind_symbols 实现，仅 Darwin 可用)。漏编任一都会链接期报 undefined symbol。
     SRC="$ROOT/nebula_mono_host.c $ROOT/case_insensitive_fs.c $ROOT/fishhook.c"
     # 1) 可执行（桌面验证用，走 main()）
-    cc $SRC -o "$OUT/nebula_mono_host" $CFLAGS
+    cc -I"$ROOT" $SRC -o "$OUT/nebula_mono_host" $CFLAGS
     # 2) 动态库：按平台命名（macOS=.dylib / Linux=.so）；必须 -DBUILD_AS_LIB 才会挂
     #    __attribute__((constructor)) 入口——被游戏进程 dlopen 时自动异步 boot Mono。
     #    （之前漏了 -DBUILD_AS_LIB，产出的 .so 没有 constructor，dlopen 后不会启动。）
@@ -33,7 +47,7 @@ if pkg-config --exists mono-2 2>/dev/null; then
       Darwin*) LIB="$OUT/libnebula_mono_host.dylib" ;;
       *)       LIB="$OUT/libnebula_mono_host.so" ;;
     esac
-    cc -shared -fPIC -DBUILD_AS_LIB $SRC -o "$LIB" $CFLAGS
+    cc -shared -fPIC -DBUILD_AS_LIB -I"$ROOT" $SRC -o "$LIB" $CFLAGS
     echo "[build] OK (desktop Mono) -> 可执行=$OUT/nebula_mono_host 动态库=$LIB"
 else
     echo "[build] 未检测到桌面 Mono（pkg-config mono-2 不存在）。"
