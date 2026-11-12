@@ -74,16 +74,9 @@ for k, v in kept.items():
     print(f"    {k}: {v} 个文件")
 PY
 
-echo "=== [2.2/5] R95: Cecil resolver 核心 BCL（给 NebulaLibs，修 NOS 加载时 CoreLib 解析失败）==="
-CORELIBS_ART="$ART/nebula_corelibs"
-if [ -d "$CORELIBS_ART" ]; then
-  mkdir -p "$OUT/NebulaLibs"
-  cp -a "$CORELIBS_ART/." "$OUT/NebulaLibs/"
-  N_CORE=$(ls "$OUT/NebulaLibs/" 2>/dev/null | grep -c '\.dll$' || true)
-  echo "    已植入核心 BCL: $N_CORE 个 dll 到 NebulaLibs/（含 System.Private.CoreLib.dll）"
-else
-  echo "    ⚠ 未找到 $CORELIBS_ART（R95 resolver 可能失效，NOS 仍崩）"
-fi
+# [R95c] 不再拷 nebula_corelibs 进 NebulaLibs：宿主 R80 启动时已把 blob 里的
+#   全套 BCL（含 System.Private.CoreLib.dll）释放到 <HOME>/Documents/BepInEx/core，
+#   注入的 Cecil resolver 指的就是那个目录。交付保持单一 dylib，无额外散文件。
 
 echo "=== [2.5/5] 预生成 iOS 版 interop（随包发布，设备端不再现场生成）==="
 # R58 教训：iPad 现场跑 Cpp2IL 分析 ~96MB UnityFramework 会卡死/整夜跑不完 → 永久黑屏。

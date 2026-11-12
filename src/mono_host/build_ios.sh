@@ -222,9 +222,9 @@ echo "   [R88] ✓ 待内嵌 facade sha=${FINAL_SHA:-UNKNOWN}（PE 保真 + Mars
 
 echo "=== 生成嵌入式 blob（BCL + 可选 BepInEx/core，全部内存加载，无散文件）==="
 BLOB="$OUT/.nebula_bcl.blob"
-# [R95] 核心 BCL 落盘目录：把 net8.0 托管 DLL 平铺到这里，随 artifact 产出，
-#   最终由 package_ios.sh 拷进成品的 NebulaLibs/，给 Cecil resolver 解析 System.Private.CoreLib 用。
-CORELIBS_OUT="$OUT/nebula_corelibs"
+# [R95c] 不再产出 nebula_corelibs 散文件：宿主 R80 启动时会把 blob 里的全套 BCL
+#   （含 System.Private.CoreLib.dll）释放到 <HOME>/Documents/BepInEx/core，
+#   Cecil resolver 只需 AddSearchDirectory 指过去即可，交付保持单一 dylib。
 # BepInEx/core 默认取 vendored 目录（与星云包锁版本）；可用 BEPINEX_CORE_DIR 覆盖
 if [ -z "${BEPINEX_CORE_DIR:-}" ] && [ -d "$ROOT/bepinex-core" ]; then
   BEPINEX_CORE_DIR="$ROOT/bepinex-core"
@@ -255,33 +255,33 @@ if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
   fi
 fi
 
-# [R95] Cecil resolver 注入：给 MonoMod.Utils.ReflectionHelper.Load 的临时模块设可解析
-#   核心程序集的 resolver（搜 HOME/Documents/NebulaLibs 等），修 NOS 加载时
-#   System.Private.CoreLib 解析失败（AssemblyResolutionException -> HarmonyException: IL Compile Error）。
-#   必须在 marshal 补丁之后、blob 生成之前执行；工具幂等，重复跑安全。
+# [R95c] Cecil resolver 注入：给 MonoMod.Utils.ReflectionHelper.Load 里 module.Write()
+#   之前的【模块自带】DefaultAssemblyResolver AddSearchDirectory(<HOME>/Documents/BepInEx/core)。
+#   宿主 R80 已把 blob 里的全套 BCL（含 System.Private.CoreLib.dll）释放到该目录，
+#   Cecil 即可解析，修 NOS 加载时的 AssemblyResolutionException -> IL Compile Error。
+#   R95b 复盘：旧注入用了不存在的 ModuleDefinition.set_AssemblyResolver（该属性只读），
+#   Mono 一 JIT 就 MissingMethodException，比原问题更早崩。现只读 get + AddSearchDirectory。
+#   必须在 marshal 补丁之后、blob 生成之前执行；工具幂等；失败硬中止（无兜底 dll）。
 if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
   R95_PROJ="$ROOT/../../tools/patch_cecil_resolver/patch_cecil_resolver.csproj"
   if [ -f "$R95_PROJ" ]; then
-    echo "   [R95] 给 MonoMod.Utils.dll 注入 Cecil resolver（幂等）..."
-    # [R95] 硬失败：R95 注入无「预提交兜底 dll」，失败必须中止构建，
-    #   绝不产出「注入缺失 → NOS 仍崩」的 dylib（此前 net6.0 运行时缺失导致静默失败）。
+    echo "   [R95c] 给 MonoMod.Utils.dll 注入 Cecil 搜索目录（幂等）..."
     dotnet run --project "$R95_PROJ" -c Release -- "$BEPINEX_CORE_DIR"/MonoMod.Utils.dll || \
-      { echo "   [R95] ✗ resolver 注入失败，拒绝产出会崩的包" >&2; exit 1; }
+      { echo "   [R95c] ✗ resolver 注入失败，拒绝产出会崩的包" >&2; exit 1; }
   else
-    echo "   [R95] ✗ 找不到 $R95_PROJ，拒绝产出" >&2; exit 1
+    echo "   [R95c] ✗ 找不到 $R95_PROJ，拒绝产出" >&2; exit 1
   fi
 else
-  echo "   [R95] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 resolver，拒绝产出" >&2; exit 1
+  echo "   [R95c] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 resolver，拒绝产出" >&2; exit 1
 fi
 
-python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" "$CORELIBS_OUT" <<'PY'
+python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
 bepinex_core = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else ""
 blob_path = sys.argv[3]
 root_dir = sys.argv[4] if len(sys.argv) > 4 else "."
 facade_sha_mark = sys.argv[5] if len(sys.argv) > 5 else ""
-corelibs_out = sys.argv[6] if len(sys.argv) > 6 else ""
 
 entries = []; seen = set()
 def add(name, data):
@@ -312,10 +312,8 @@ if os.path.isdir(bcl_dir):
                 print("   [R88] ✓ blob System.Runtime.dll sha=%s (%d bytes, PE 保真 + Marshal 转发)"
                       % (actual[:16], len(data)))
             add(f, data)
-            if corelibs_out:   # [R95] 落盘核心 BCL 给 Cecil resolver（HOME/Documents/NebulaLibs）
-                os.makedirs(corelibs_out, exist_ok=True)
-                with open(os.path.join(corelibs_out, f), "wb") as _cf:
-                    _cf.write(data)
+            # [R95c] 不再额外落盘：宿主 R80 会在运行时把 blob 里的 BCL 释放到
+            #   <HOME>/Documents/BepInEx/core，resolver 指过去即可，交付保持单 dylib。
 else:
     print("!! 没找到 lib/net8.0，BCL 未嵌入", file=sys.stderr)
 
