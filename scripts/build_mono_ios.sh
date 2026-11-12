@@ -44,7 +44,9 @@ MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 #   decode_row_raw / get_marshal_info 守卫）全部没进二进制 —— 真机照样在缺兜底的旧 mono
 #   上 SIGSEGV。mono 侧补丁只改 runtime/src/mono/.../metadata.c，不 bump 本号就会因
 #   缓存跳过编译，白改。今后任何 mono 源码补丁都必须 bump 本号！
-CACHE_VERSION="${CACHE_VERSION:-33}"
+# [R94] 新增 loader.c 补丁（mono_method_get_marshal_info 的 g_assert(tp) 改 NULL 安全跳过），
+#   必须 bump 本号强制重编，否则旧 mono 静态库仍带 g_assert 崩。
+CACHE_VERSION="${CACHE_VERSION:-34}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -845,6 +847,43 @@ s = s.replace(old2, new2, 1)
 
 open(p, 'w', encoding='utf-8').write(s)
 print("    R92 补丁已应用：compute_size 源头校正 + decode_row_col_raw/decode_row_raw 双兜底 + get_marshal_info 源头守卫(宽度非2/4即跳)")
+PY
+
+echo "=== [3.8/5] R94: loader.c 元数据损坏兜底（g_assert(tp) 改 NULL 安全跳过）==="
+# R93 真机 nebula_host.txt 复盘：崩点根本不在 mono_metadata_decode_row_col_raw，而在
+# loader.c 的 mono_method_get_marshal_info：它为标注 HAS_FIELD_MARSHAL 的参数调
+# mono_metadata_get_marshal_info，原版随后 g_assert(tp)——只要 tp 为 NULL（该 param 的
+# FieldMarshal 表无匹配行 / 块越界 / EnC 路径）就 SIGSEGV。R90/R91/R92 全改在 metadata.c
+# 的 decode 层，从未碰这个 g_assert。某参数元数据损坏（Il2CppInterop/Cecil 重写程序集）
+# 标注了 HAS_FIELD_MARSHAL 却取不到合法 marshal 信息时，原版必崩。
+# 修法：tp 为 NULL 时告警打出 image 名 + param 序号，跳过该参数（mspecs 保持 NULL），不崩。
+F="$WORK/runtime/src/mono/mono/metadata/loader.c"
+[ -f "$F" ] || { echo "!! 找不到 $F" >&2; exit 1; }
+python3 - "$F" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='replace').read()
+T = "\t"
+
+# mono_method_get_marshal_info 里：param 标注 HAS_FIELD_MARSHAL 时取 marshal 信息，原版 g_assert(tp) 崩
+old3 = (T*4 + "tp = mono_metadata_get_marshal_info (klass_image, i - 1, FALSE);\n"
+        + T*4 + "g_assert (tp);\n"
+        + T*4 + "mspecs [cols [MONO_PARAM_SEQUENCE]]= mono_metadata_parse_marshal_spec (klass_image, tp);\n")
+assert old3 in s, "loader.c g_assert(tp) 块未匹配（mono 源码可能已改结构）"
+new3 = (T*4 + "tp = mono_metadata_get_marshal_info (klass_image, i - 1, FALSE);\n"
+        + T*4 + "/* [Nebula iOS R94] 元数据损坏兜底：param 标注 HAS_FIELD_MARSHAL 但 FieldMarshal\n"
+        + T*4 + "   表无匹配行/块越界导致 mono_metadata_get_marshal_info 返回 NULL 时，原版\n"
+        + T*4 + "   g_assert(tp) 直接 SIGSEGV（R93 真机：EndGameManager:.cctor -> il2cpp_class_from_name\n"
+        + T*4 + "   -> mono_marshal_get_native_wrapper -> mono_method_get_marshal_info -> g_assert(tp)）。\n"
+        + T*4 + "   改为跳过该参数(mspecs 保持 NULL)不崩，由 Il2CppInterop/Cecil 重写程序集元数据损坏触发。 */\n"
+        + T*4 + "if (!tp) {\n"
+        + T*4 + T + 'g_warning ("[Nebula] param %d 标注 HAS_FIELD_MARSHAL 但 marshal 信息 NULL(元数据损坏)，跳该参数(image=%s)", (int)(i-1), klass_image->name ? klass_image->name : "?");\n'
+        + T*4 + T + "continue;\n"
+        + T*4 + "}\n"
+        + T*4 + "mspecs [cols [MONO_PARAM_SEQUENCE]]= mono_metadata_parse_marshal_spec (klass_image, tp);\n")
+s = s.replace(old3, new3, 1)
+open(p, 'w', encoding='utf-8').write(s)
+print("    R94 补丁已应用：loader.c mono_method_get_marshal_info 的 g_assert(tp) 改 NULL 安全跳过")
 PY
 
 echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="

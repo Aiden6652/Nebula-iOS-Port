@@ -3262,6 +3262,15 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r92] 另：get_marshal_info 源头守卫从「只查 _nw==3」改为「宽度非 2 非 4 即跳」，任何非法列宽都在解码前拦下，不依赖改 switch 是否生效。");
         hlog("[host][r92] 真机验收：boot 首行必须打印 BUILD=<12位sha>-<日期>（与本次提交一致）；不再出现 mono_metadata_decode_row_col.cold.2 的 SIGSEGV；");
         hlog("[host][r92]   若仍崩，看 [Nebula] FieldMarshal.NativeType 列宽非法(...) 告警里的 image= 是哪个程序集，那就是要重生成/修的那份元数据");
+        hlog("[host][r94] ===== 版本标记 R94：修 R93 仍崩——崩点根本不在 decode_row_col_raw，而在 loader.c 的 g_assert(tp) =====");
+        hlog("[host][r94] R93 真机复盘：BUILD=87799cbd2267 确认是最新 dylib，且 dylib 内含 [Nebula] FieldMarshal 补丁串——证明 R92 的 4 个 mono 补丁这次真进了二进制。");
+        hlog("[host][r94]   但日志全程无 [Nebula] 列宽非法 告警，却崩在 mono_method_get_marshal_info.cold.2 -> g_assert(tp) 的 assert 上：");
+        hlog("[host][r94]   R90/R91/R92 全改在 metadata.c 的 decode 层；而崩点是 loader.c mono_method_get_marshal_info 为标注 HAS_FIELD_MARSHAL 的参数");
+        hlog("[host][r94]   取 marshal 信息后原版 g_assert(tp)——只要 tp 为 NULL(该 param 的 FieldMarshal 表无匹配行/块越界/EnC 路径)就 SIGSEGV。");
+        hlog("[host][r94]   根因：某参数元数据损坏(Il2CppInterop/Cecil 重写程序集)，标了 HAS_FIELD_MARSHAL 却取不到合法 marshal 信息。");
+        hlog("[host][r94]   修法：loader.c 把 g_assert(tp) 改为 tp 为 NULL 时告警(image+param 序号)并跳过该参数(mspecs 保持 NULL)，不崩。另 bump CACHE_VERSION(33->34) 强制重编。");
+        hlog("[host][r94]   真机验收：boot 首行 BUILD= 与本次提交一致；不再出现 mono_method_get_marshal_info.cold.2 / g_assert(tp) 的 SIGSEGV；");
+        hlog("[host][r94]   若出现 [Nebula] param N 标注 HAS_FIELD_MARSHAL 但 marshal 信息 NULL(...) 告警，说明仍是无害跳过，崩点已除。");
         hlog("[host][r89] ===== 版本标记 R89：修悬空 Documents/Data 链接导致 BepInEx Paths 只初始化一半、IL2CPPChainloader.cctor 全灭；保留 R88 的 PE 保真 facade =====");
         hlog("[host][r89] R88 真机复盘：TypeLoadException 已 0 次（Marshal 转发有效），但托管异常链显示 IL2CPPChainloader.cctor -> ConfigFile.cctor -> ArgumentNullException: Value cannot be null.");
         hlog("[host][r89] 根因：每次侧载重装 .app/容器 UUID 都变，Documents/Data 符号链接仍指向上一轮 .app/Data；旧代码 lstat 判「存在就跳过」(lstat 对悬空链接也成功) -> Directory.Exists(GameDataPath) 失败 -> SetExecutablePath 抛 DirectoryNotFoundException -> ConfigPath/BepInExConfigPath/PluginPath 全为 null");
