@@ -263,9 +263,15 @@ if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
   R95_PROJ="$ROOT/../../tools/patch_cecil_resolver/patch_cecil_resolver.csproj"
   if [ -f "$R95_PROJ" ]; then
     echo "   [R95] 给 MonoMod.Utils.dll 注入 Cecil resolver（幂等）..."
+    # [R95] 硬失败：R95 注入无「预提交兜底 dll」，失败必须中止构建，
+    #   绝不产出「注入缺失 → NOS 仍崩」的 dylib（此前 net6.0 运行时缺失导致静默失败）。
     dotnet run --project "$R95_PROJ" -c Release -- "$BEPINEX_CORE_DIR"/MonoMod.Utils.dll || \
-      echo "   [R95] ⚠ resolver 注入失败（继续，NOS 可能仍崩）" >&2
+      { echo "   [R95] ✗ resolver 注入失败，拒绝产出会崩的包" >&2; exit 1; }
+  else
+    echo "   [R95] ✗ 找不到 $R95_PROJ，拒绝产出" >&2; exit 1
   fi
+else
+  echo "   [R95] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 resolver，拒绝产出" >&2; exit 1
 fi
 
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" "$CORELIBS_OUT" <<'PY'
