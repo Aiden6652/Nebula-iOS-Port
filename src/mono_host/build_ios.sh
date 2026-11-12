@@ -222,6 +222,9 @@ echo "   [R88] ✓ 待内嵌 facade sha=${FINAL_SHA:-UNKNOWN}（PE 保真 + Mars
 
 echo "=== 生成嵌入式 blob（BCL + 可选 BepInEx/core，全部内存加载，无散文件）==="
 BLOB="$OUT/.nebula_bcl.blob"
+# [R95] 核心 BCL 落盘目录：把 net8.0 托管 DLL 平铺到这里，随 artifact 产出，
+#   最终由 package_ios.sh 拷进成品的 NebulaLibs/，给 Cecil resolver 解析 System.Private.CoreLib 用。
+CORELIBS_OUT="$OUT/nebula_corelibs"
 # BepInEx/core 默认取 vendored 目录（与星云包锁版本）；可用 BEPINEX_CORE_DIR 覆盖
 if [ -z "${BEPINEX_CORE_DIR:-}" ] && [ -d "$ROOT/bepinex-core" ]; then
   BEPINEX_CORE_DIR="$ROOT/bepinex-core"
@@ -252,13 +255,27 @@ if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
   fi
 fi
 
-python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
+# [R95] Cecil resolver 注入：给 MonoMod.Utils.ReflectionHelper.Load 的临时模块设可解析
+#   核心程序集的 resolver（搜 HOME/Documents/NebulaLibs 等），修 NOS 加载时
+#   System.Private.CoreLib 解析失败（AssemblyResolutionException -> HarmonyException: IL Compile Error）。
+#   必须在 marshal 补丁之后、blob 生成之前执行；工具幂等，重复跑安全。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  R95_PROJ="$ROOT/../../tools/patch_cecil_resolver/patch_cecil_resolver.csproj"
+  if [ -f "$R95_PROJ" ]; then
+    echo "   [R95] 给 MonoMod.Utils.dll 注入 Cecil resolver（幂等）..."
+    dotnet run --project "$R95_PROJ" -c Release -- "$BEPINEX_CORE_DIR"/MonoMod.Utils.dll || \
+      echo "   [R95] ⚠ resolver 注入失败（继续，NOS 可能仍崩）" >&2
+  fi
+fi
+
+python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" "$CORELIBS_OUT" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
 bepinex_core = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else ""
 blob_path = sys.argv[3]
 root_dir = sys.argv[4] if len(sys.argv) > 4 else "."
 facade_sha_mark = sys.argv[5] if len(sys.argv) > 5 else ""
+corelibs_out = sys.argv[6] if len(sys.argv) > 6 else ""
 
 entries = []; seen = set()
 def add(name, data):
@@ -289,6 +306,10 @@ if os.path.isdir(bcl_dir):
                 print("   [R88] ✓ blob System.Runtime.dll sha=%s (%d bytes, PE 保真 + Marshal 转发)"
                       % (actual[:16], len(data)))
             add(f, data)
+            if corelibs_out:   # [R95] 落盘核心 BCL 给 Cecil resolver（HOME/Documents/NebulaLibs）
+                os.makedirs(corelibs_out, exist_ok=True)
+                with open(os.path.join(corelibs_out, f), "wb") as _cf:
+                    _cf.write(data)
 else:
     print("!! 没找到 lib/net8.0，BCL 未嵌入", file=sys.stderr)
 
