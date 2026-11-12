@@ -63,3 +63,7 @@ tools/*/obj/
 
 # 已废弃的老 Mono 方案占位目录（按设备从 ipa 提取；含其 README，见目录内说明，不入库）
 src/mono_host_mono/
+
+# [R92] 构建期由 build_ios.sh 生成的构建标签头（含 git sha + 日期），不入库
+src/mono_host/nebula_build_tag.h
+src/mono_host/out-ios/

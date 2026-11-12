@@ -38,7 +38,13 @@ WORK="${WORK:-$HOME/mono-src}"
 INSTALL="${INSTALL:-$HOME/mono-installs}"
 MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 # 产物结构变更时 bump 这个版本号：旧缓存即使 key 命中也会因版本不符被判定残缺、强制重编
-CACHE_VERSION="${CACHE_VERSION:-32}"
+#
+# 【R92 教训】R90->R91 时本号没 bump，导致 CI 复用 R90（或更早）的缓存 mono 静态库，
+#   而 R91 的 4 个 mono 侧补丁（compute_size 夹取 / decode_row_col_raw->return 0 /
+#   decode_row_raw / get_marshal_info 守卫）全部没进二进制 —— 真机照样在缺兜底的旧 mono
+#   上 SIGSEGV。mono 侧补丁只改 runtime/src/mono/.../metadata.c，不 bump 本号就会因
+#   缓存跳过编译，白改。今后任何 mono 源码补丁都必须 bump 本号！
+CACHE_VERSION="${CACHE_VERSION:-33}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -827,14 +833,18 @@ old2 = (T+"return mono_metadata_blob_heap (meta, mono_metadata_decode_row_col (t
         +"}\n\nMonoMethod*")
 assert old2 in s, "get_marshal_info return 未匹配"
 new2 = (T+"{\n"+T+T+"guint32 _nw = mono_metadata_table_size (tdef->size_bitfield, MONO_FIELD_MARSHAL_NATIVE_TYPE);\n"
-        +T+T+"if (_nw == 3) {\n"
+        +T+T+"/* [Nebula iOS R92] 源头守卫：FieldMarshal.NativeType 是 blob 列，合法宽度只可能是 2 或 4。\n"
+        +T+T+"   若被运行时重写/污染成其它值（如编码 2 -> 宽度 3），decode 会 g_assert_not_reached 崩。\n"
+        +T+T+"   这里在解码前先拦下，告警打出 image 名再 return NULL（=该字段无封送信息），\n"
+        +T+T+"   不依赖 decode_row_col_raw 改 switch 是否生效，双保险。 */\n"
+        +T+T+"if (_nw != 2 && _nw != 4) {\n"
         +T+T+T+'g_warning ("[Nebula] FieldMarshal.NativeType 列宽非法(%u)，跳该 marshal 信息(image=%s)", _nw, meta->name ? meta->name : "?");\n'
         +T+T+T+"return NULL;\n"+T+T+"}\n"+T+"}\n"
         +old2)
 s = s.replace(old2, new2, 1)
 
 open(p, 'w', encoding='utf-8').write(s)
-print("    R91 补丁已应用：compute_size 源头校正 + decode_row_col_raw/decode_row_raw 双兜底 + get_marshal_info 条件修正")
+print("    R92 补丁已应用：compute_size 源头校正 + decode_row_col_raw/decode_row_raw 双兜底 + get_marshal_info 源头守卫(宽度非2/4即跳)")
 PY
 
 echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="

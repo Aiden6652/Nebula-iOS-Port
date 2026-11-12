@@ -451,6 +451,21 @@ if [ ${#ICU_A[@]} -gt 0 ]; then
   for a in "${ICU_A[@]}"; do echo "      $(basename "$a")"; done
 fi
 
+echo "=== [R92] 生成构建标签头（git sha + 日期，boot 日志打印 BUILD= 确认版本）==="
+# 优先用 CI 注入的提交 sha，否则回退到本地 git；都拿不到则 UNKNOWN。
+R92_TAG_SHA="${GITHUB_SHA:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
+R92_TAG_SHA="${R92_TAG_SHA:0:12}"
+R92_TAG_DATE="$(date -u +%Y%m%d)"
+R92_BUILD_TAG="${R92_TAG_SHA}-${R92_TAG_DATE}"
+# host 源已 #include "nebula_build_tag.h"；本地无 CI/HEAD 时也必须有该头，否则编译失败。
+cat > "$ROOT/nebula_build_tag.h" <<HDR
+#ifndef NEBULA_BUILD_TAG_H
+#define NEBULA_BUILD_TAG_H
+#define NEBULA_BUILD_TAG_STR "$R92_BUILD_TAG"
+#endif
+HDR
+echo "   [R92] 构建标签: $R92_BUILD_TAG (sha=${R92_TAG_SHA} date=${R92_TAG_DATE})"
+
 echo "=== 编译 iOS arm64 dylib（把 blob 嵌进 __DATA,__nebulabcl 段）==="
 
 # [R60] 强制全量链入：
@@ -498,6 +513,7 @@ do_link() {
     -dynamiclib -fPIC \
     -DBUILD_AS_LIB \
     -I"$MONO_INC" \
+    -I"$ROOT" \
     -o "$OUT/libnebula_standard.dylib" \
     "$ROOT/nebula_mono_host.c" \
     "$ROOT/case_insensitive_fs.c" \

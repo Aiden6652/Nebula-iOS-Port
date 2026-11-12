@@ -67,6 +67,13 @@ extern void mono_setmmapjit (int flag);
 #include <errno.h>
 #include <dlfcn.h>                 // dlsym 探测翻转符号（冒烟）
 #include <unistd.h>                // getpid
+// [R92] 构建标签：build_ios.sh 在编译期生成 nebula_build_tag.h（含 git sha + 日期），
+//   启动打印 BUILD= 以便真机日志一眼确认跑的是哪版（R91 曾因 CI 缓存复用旧 mono 库而
+//   崩，却因宿主 banner 写死 R90 文本导致版本误判）。本地无该头时回退 UNKNOWN。
+#include "nebula_build_tag.h"
+#ifndef NEBULA_BUILD_TAG_STR
+#define NEBULA_BUILD_TAG_STR "UNKNOWN"
+#endif
 // sys/codesign.h 在 iOS SDK 中被 Apple 剥离（交叉编译会 'file not found'），
 // 故手动声明 csops 及其常量。csops 是 libSystem 真实导出的符号，运行/链接均可用。
 extern int csops(int pid, unsigned int ops, void *useraddr, unsigned long usersize);
@@ -3247,6 +3254,14 @@ static void *boot_thread_impl(void *arg) {
         snprintf(p, sizeof(p), "/var/mobile/Documents/nebula_host.txt"); log_try(p);
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
+        hlog("[host] BUILD=%s", NEBULA_BUILD_TAG_STR);
+        hlog("[host][r92] ===== 版本标记 R92：修 R91 因 CI 缓存复用旧 mono 库导致 4 个 mono 侧兜底补丁全没进二进制、真机照崩的坑 =====");
+        hlog("[host][r92] R91 复盘：日志同时含 [host][r90] 历史 banner 文本 + [host][r91] 指纹逻辑，看似 R91，实则 mono 静态库是 R90（或更早）缓存产物——");
+        hlog("[host][r92]   build_mono_ios.sh 顶部缓存命中逻辑在 CACHE_VERSION 未变时直接 exit 0 跳过整个 mono 编译与打补丁，R90->R91 没 bump 版本号，");
+        hlog("[host][r92]   于是 compute_size 夹取 / decode_row_col_raw->return 0 / decode_row_raw / get_marshal_info 守卫 一个都没进。本次 bump CACHE_VERSION(32->33) 强制重编。");
+        hlog("[host][r92] 另：get_marshal_info 源头守卫从「只查 _nw==3」改为「宽度非 2 非 4 即跳」，任何非法列宽都在解码前拦下，不依赖改 switch 是否生效。");
+        hlog("[host][r92] 真机验收：boot 首行必须打印 BUILD=<12位sha>-<日期>（与本次提交一致）；不再出现 mono_metadata_decode_row_col.cold.2 的 SIGSEGV；");
+        hlog("[host][r92]   若仍崩，看 [Nebula] FieldMarshal.NativeType 列宽非法(...) 告警里的 image= 是哪个程序集，那就是要重生成/修的那份元数据");
         hlog("[host][r89] ===== 版本标记 R89：修悬空 Documents/Data 链接导致 BepInEx Paths 只初始化一半、IL2CPPChainloader.cctor 全灭；保留 R88 的 PE 保真 facade =====");
         hlog("[host][r89] R88 真机复盘：TypeLoadException 已 0 次（Marshal 转发有效），但托管异常链显示 IL2CPPChainloader.cctor -> ConfigFile.cctor -> ArgumentNullException: Value cannot be null.");
         hlog("[host][r89] 根因：每次侧载重装 .app/容器 UUID 都变，Documents/Data 符号链接仍指向上一轮 .app/Data；旧代码 lstat 判「存在就跳过」(lstat 对悬空链接也成功) -> Directory.Exists(GameDataPath) 失败 -> SetExecutablePath 抛 DirectoryNotFoundException -> ConfigPath/BepInExConfigPath/PluginPath 全为 null");
