@@ -206,6 +206,38 @@ static const blob_entry *blob_find(const char *aname) {
     return NULL;
 }
 
+/* [R95d] 启动自证：直接扫描【当前 dylib 内嵌 blob 里】的 MonoMod.Utils.dll 字节，
+   判定注入 IL 究竟是 R95b（幽灵 set_AssemblyResolver）还是 R95c/R95d
+   （get_AssemblyResolver + AddSearchDirectory）。
+   关键：这不依赖 BUILD 字符串——BUILD 只证明 dylib 是哪个 commit 编的，
+   这里证明的是【实际会被加载的那份托管 DLL】内容，一锤定音，不必再猜换没换包。 */
+static void hlog(const char *fmt, ...);   // [R95d] 前向声明：hlog 定义在本文件后段（2200 行），自证函数需提前用
+static int blob_bytes_contain(const uint8_t *hay, uint32_t n, const char *needle) {
+    size_t m = strlen(needle);
+    if (!m || n < m) return 0;
+    for (uint32_t i = 0; i + m <= n; i++)
+        if (!memcmp(hay + i, needle, m)) return 1;
+    return 0;
+}
+static void r95d_selfcheck(void) {
+    blob_load();                                  // 幂等；banner 阶段提前初始化
+    const blob_entry *e = blob_find("MonoMod.Utils");
+    if (!e) { hlog("[host][r95d][自证] !! blob 内找不到 MonoMod.Utils.dll"); return; }
+    int ghost = blob_bytes_contain(e->data, e->size, "set_AssemblyResolver");
+    int getr  = blob_bytes_contain(e->data, e->size, "get_AssemblyResolver");
+    int addd  = blob_bytes_contain(e->data, e->size, "AddSearchDirectory");
+    hlog("[host][r95d][自证] 当前 dylib 内嵌 MonoMod.Utils.dll: %u B | "
+         "set_AssemblyResolver=%s get_AssemblyResolver=%s AddSearchDirectory=%s",
+         e->size, ghost ? "有" : "无", getr ? "有" : "无", addd ? "有" : "无");
+    if (ghost)
+        hlog("[host][r95d][自证] ✗✗ 仍是 R95b 幽灵 setter 版 —— 设备上跑的不是修好的 dylib，"
+             "必报 MissingMethodException，请检查 IPA 内实际被 dyld 加载的 dylib");
+    else if (getr && addd)
+        hlog("[host][r95d][自证] ✓✓ 是 R95c/R95d 修好版（自带 resolver + 搜索目录），不会再 MissingMethodException");
+    else
+        hlog("[host][r95d][自证] ⚠ 两种特征都不匹配，需人工看 IL");
+}
+
 // 从 blob 内存加载一个程序集（open image from data + load from full）
 static MonoAssembly *blob_load_assembly(const blob_entry *e) {
     MonoImageOpenStatus status;
@@ -901,6 +933,28 @@ static int nebula_blob_extract_dir_checked(const char *prefix, const char *dest)
    落盘，这里补上 BCL/core 这一半。
    注意：只投 BepInExAssemblyDirectory(core)，绝不投 plugins/ —— 那边 *.dll
    会被 TypeLoader 当插件扫描。 */
+/* [R95d] 内容判等：原来只比 stat().st_size，「换包但 DLL 体积不变」就会跳过覆盖。
+   典型就是 R95b->R95c 的 MonoMod.Utils.dll（两版都 192512 B），磁盘上一直残留
+   带幽灵 set_AssemblyResolver 的旧 DLL；用户手动删掉后，宿主又从（旧）dylib 的
+   blob 补回同名同大小的旧内容 —— 换包等于没换。R82/R91 已各自踩过并修过这个坑，
+   这里补齐 R80 的 core/BCL 这一半：逐字节比对，内容不同立即覆盖。 */
+static int nebula_file_same(const char *p, const uint8_t *data, uint32_t size) {
+    struct stat st;
+    if (stat(p, &st) != 0 || st.st_size != (off_t)size) return 0;
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    uint8_t buf[4096];
+    uint32_t off = 0;
+    int same = 1;
+    while (off < size) {
+        size_t n = (size - off < sizeof(buf)) ? (size_t)(size - off) : sizeof(buf);
+        if (fread(buf, 1, n, f) != n || memcmp(buf, data + off, n) != 0) { same = 0; break; }
+        off += (uint32_t)n;
+    }
+    fclose(f);
+    return same;
+}
+
 static int nebula_blob_extract_cecil_refs(const char *dest) {
     if (!g_n) return 0;
     struct stat st;
@@ -917,7 +971,8 @@ static int nebula_blob_extract_cecil_refs(const char *dest) {
         const char *bn = strrchr(nm, '/'); bn = bn ? bn + 1 : nm;
         char p[PATH_MAX];
         snprintf(p, sizeof(p), "%s/%s", dest, bn);
-        if (stat(p, &st) == 0 && st.st_size == (off_t)g_entries[i].size) { skipped++; continue; }
+        /* [R95d] 逐字节判等（原为体积判等，同大小换包会漏覆盖） */
+        if (nebula_file_same(p, g_entries[i].data, g_entries[i].size)) { skipped++; continue; }
         FILE *f = fopen(p, "wb");
         if (!f) continue;
         if (fwrite(g_entries[i].data, 1, g_entries[i].size, f) != g_entries[i].size) {
@@ -926,7 +981,7 @@ static int nebula_blob_extract_cecil_refs(const char *dest) {
         fclose(f);
         written++;
     }
-    printf("[host][r80] 释放 Cecil 参考程序集 -> %s（新写 %d，已存在跳过 %d）\n",
+    printf("[host][r80][r95d] 释放 Cecil 参考程序集 -> %s（内容判等：覆盖 %d，内容一致跳过 %d）\n",
            dest, written, skipped);
     char chk[PATH_MAX];
     snprintf(chk, sizeof(chk), "%s/System.Runtime.dll", dest);
@@ -3255,6 +3310,8 @@ static void *boot_thread_impl(void *arg) {
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
         hlog("[host] BUILD=%s", NEBULA_BUILD_TAG_STR);
+        hlog("[host][r95d] ===== R95d 自证版：修『同大小换包不覆盖磁盘 DLL』+ 启动即报内嵌 MonoMod.Utils.dll 真伪 =====");
+        r95d_selfcheck();   // [R95d] 直接判当前 dylib 内嵌托管 DLL 是 R95b 幽灵版还是修好版
         hlog("[host][r92] ===== 版本标记 R92：修 R91 因 CI 缓存复用旧 mono 库导致 4 个 mono 侧兜底补丁全没进二进制、真机照崩的坑 =====");
         hlog("[host][r92] R91 复盘：日志同时含 [host][r90] 历史 banner 文本 + [host][r91] 指纹逻辑，看似 R91，实则 mono 静态库是 R90（或更早）缓存产物——");
         hlog("[host][r92]   build_mono_ios.sh 顶部缓存命中逻辑在 CACHE_VERSION 未变时直接 exit 0 跳过整个 mono 编译与打补丁，R90->R91 没 bump 版本号，");
