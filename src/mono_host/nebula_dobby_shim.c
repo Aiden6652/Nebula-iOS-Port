@@ -178,14 +178,22 @@
 #include <stdlib.h>
 #include <dlfcn.h>               /* dladdr：仅用于打印归属 image，不参与判定 */
 #include <sys/time.h>            /* [R98] gettimeofday：每 32 个 patch 打印累计耗时 */
+#include <sys/mman.h>            /* [R100c] mprotect：POSIX，iOS/Linux 通用 */
+#include <unistd.h>              /* [R100c] getpagesize() */
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>  /* [R99] CFRunLoopRunInMode：分时让出主线程 */
 #include <mach/mach.h>
-#include <mach/vm_map.h>
-#include <mach/mach_vm.h>           /* [R100] mach_vm_region / mach_vm_protect */
-#include <mach/vm_region.h>         /* [R100] VM_REGION_BASIC_INFO_64 */
+#include <mach/vm_map.h>            /* r97_safe_read 的 vm_read（R97 起真机验证） */
 #include <libkern/OSCacheControl.h> /* [R100] sys_icache_invalidate */
-#include <unistd.h>                /* [R100] getpagesize() */
+/* [R100c] 为什么是 mprotect 而不是 mach_vm_protect / vm_protect：
+   iOS SDK 的 <mach/mach_vm.h> 首行 #error "unsupported"，mach_vm_protect /
+   mach_vm_region 在 iOS 用户态不存在（R100 首轮 CI 编译失败即因此）；
+   vm_protect 又牵涉 vm_address_t 宽度与 VM_PROT_COPY 可用性。
+   mprotect(void*, size_t, int) 是 POSIX：iOS 必然可用、地址是 64 位 void*
+   （可承载 0x1_xxxxxxxx 代码地址）、prot 用 PROT_READ/PROT_WRITE/PROT_EXEC，
+   且 Linux 本地能真编译同一分支，不用 stub 猜。
+   补 READ 是「只读、不改内容」，根本不需要 VM_PROT_COPY/COW 私有副本；
+   Dobby 自己写 detour 时会处理可写（R97b 86 个真 hook 已实证）。 */
 #endif
 
 #ifdef __cplusplus
@@ -306,89 +314,62 @@ static int r97_safe_read(void *addr, unsigned char *out, size_t n) {
  *      这一步从头到尾【没有 W】，TXM 完全没有触发条件。
  *
  * 三档（按安全性排序，前两档是纯 RX、永不产生 W+X）：
- *   A 主路径  READ|EXECUTE|COPY  —— COW 私有副本 + 补 R，不碰签名共享页
- *   B 退化    READ|EXECUTE       —— 内核不接受 COPY 时直接补 R
- *   C 兜底    READ|WRITE（无 X，COPY 优先） —— 仅当 A/B 后 vm_read 仍读不到，
- *             用一次 memcpy 读 32B，【立刻】r100_restore_rx 翻回严格 RX，
- *             然后才调 DobbyHook。写态窗口 = 一次 memcpy，且无 X。
+ *   A 主路径  mprotect(PROT_READ|PROT_EXEC) —— 把 --x 页补成 r-x，全程无 W，
+ *             不写内容、不改签名 hash，TXM/SPTM 完全没有触发条件。
+ *   B 退化    mprotect(PROT_READ|PROT_EXEC) 再试一次（含 icache 同步）
+ *   C 兜底    mprotect(PROT_READ|PROT_WRITE)【无 PROT_EXEC】 —— 仅当 A/B 后
+ *             vm_read 仍读不到，用一次 memcpy 读 32B，【立刻】r100_restore_rx
+ *             翻回严格 RX，然后才调 DobbyHook。写态窗口=一次 memcpy 且无 X。
  *
  * 安全：
  *   - 任何时刻都不存在 W+X 同时态：A/B 无 W；C 无 X；翻回后无 W。
  *   - 只对 [target, target+32) 覆盖到的页改属性，不整段 region。
- *   - 页大小运行时 getpagesize()，不写死 16384。
- *   - VM_PROT_COPY 让本进程页表指向私有副本，进程内所有线程（含 Unity
- *     worker）都看到同一副本，detour 生效；签名共享 __TEXT 不被写坏。
+ *   - 页大小运行时 getpagesize()，不写死 16384；无需 region 查询。
+ *   - 只补 READ、不写任何字节，因此不需要 VM_PROT_COPY / COW 私有副本；
+ *     进程内所有线程（含 Unity worker）看同一份页表，Dobby 的 detour 生效。
+ *   - [R100c] 用 POSIX mprotect（iOS 禁用 mach_vm_protect）。
  *   - 全部失败也不降级/不跳过：仍照常送 DobbyHook，由真机日志说话。
  * ========================================================================= */
 static int r100_promote_rx(void *addr, size_t len,
-                           uint64_t *base, uint64_t *size_out, int *orig) {
-#ifdef __APPLE__
-    if (!addr || !base || !size_out || !orig) return 0;
-    mach_vm_address_t p = (mach_vm_address_t)(uintptr_t)addr;
-    mach_vm_address_t q = p;
-    mach_vm_size_t   rsz = 0;
-    vm_region_basic_info_data_64_t info;
-    memset(&info, 0, sizeof(info));
-    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &q, &rsz,
-                        VM_REGION_BASIC_INFO_64,
-                        (vm_region_info_t)&info, &cnt, &obj);
-    if (kr != KERN_SUCCESS || rsz == 0) return 0;
-    *orig = (int)info.protection;
-
+                           uint64_t *base, uint64_t *size_out) {
+    if (!addr || !base || !size_out) return 0;
     long pg = (long)getpagesize();       /* iOS arm64 = 16384，运行时探测不写死 */
     if (pg <= 0) pg = 16384;
-    mach_vm_address_t mask = (mach_vm_address_t)(pg - 1);
-    mach_vm_address_t start = p & ~mask;
-    mach_vm_address_t end   = (p + (mach_vm_address_t)len + mask) & ~mask;
-    if (end > q + rsz) end = q + rsz;    /* 不越出该 region */
+    uint64_t mask  = (uint64_t)(pg - 1);
+    uint64_t p     = (uint64_t)(uintptr_t)addr;
+    uint64_t start = p & ~mask;
+    uint64_t end   = (p + (uint64_t)len + mask) & ~mask;
     if (end <= start) return 0;
-    *base = (uint64_t)start; *size_out = (uint64_t)(end - start);
+    *base = start; *size_out = end - start;
 
-    /* A：COW 私有副本 + READ|EXECUTE。补 R、绝不加 W。 */
-    kr = mach_vm_protect(mach_task_self(), start, end - start, FALSE,
-             VM_PROT_READ | VM_PROT_EXECUTE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS)
-        /* B：内核不接受 COPY 时，直接把当前映射补 R（仍不加 W） */
-        kr = mach_vm_protect(mach_task_self(), start, end - start, FALSE,
-                 VM_PROT_READ | VM_PROT_EXECUTE);
-    return kr == KERN_SUCCESS;
-#else
-    (void)addr; (void)len; (void)base; (void)size_out; (void)orig;
-    return 0;
-#endif
+    /* A：补 READ，页变 r-x（无 W）。只读不改内容，签名 hash 不变。 */
+    int rc = mprotect((void *)(uintptr_t)start, (size_t)(end - start),
+                      PROT_READ | PROT_EXEC);
+    if (rc != 0)
+        /* B：再试一次（某些页需先同步 icache） */
+        rc = mprotect((void *)(uintptr_t)start, (size_t)(end - start),
+                      PROT_READ | PROT_EXEC);
+    return rc == 0;
 }
 
-/* C 档兜底：把页切到「无 X 写态」READ|WRITE，仅供一次 memcpy 读指令。
+/* C 档兜底：把页切到「无 X 写态」PROT_READ|PROT_WRITE，仅供一次 memcpy 读指令。
    写态没有任何执行权限，因此即便 worker 撞上也不会触发 TXM 的 W+X 违规。 */
 static int r100_make_rw(uint64_t base, uint64_t size) {
-#ifdef __APPLE__
     if (!base || !size) return 0;
-    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)base,
-             (mach_vm_size_t)size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS)
-        kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)base,
-                 (mach_vm_size_t)size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
-    return kr == KERN_SUCCESS;
-#else
-    (void)base; (void)size;
-    return 0;
-#endif
+    return mprotect((void *)(uintptr_t)base, (size_t)size,
+                    PROT_READ | PROT_WRITE) == 0;   /* 无 PROT_EXEC */
 }
 
-/* 执行态：显式清 W、补 R+X，刷干净整段 icache 后再翻回。
-   绝不套用 orig（orig 可能 --x 无 R），而是重建严格 RX，杜绝任何路径留 W+X。 */
+/* 执行态：显式清 W、补 R+X，刷干净整段 icache 后再翻回（纯 RX、无 W）。 */
 static void r100_restore_rx(uint64_t base, uint64_t size) {
-#ifdef __APPLE__
     if (!base || !size) return;
-    vm_prot_t rx = VM_PROT_READ | VM_PROT_EXECUTE;   /* 无 W，纯 RX */
+#ifdef __APPLE__
     sys_icache_invalidate((void *)(uintptr_t)base, (size_t)size);
-    mach_vm_protect(mach_task_self(), (mach_vm_address_t)base,
-                    (mach_vm_size_t)size, FALSE, rx);
 #else
-    (void)base; (void)size;
+    __builtin___clear_cache((char *)(uintptr_t)base,
+                            (char *)(uintptr_t)(base + size));
 #endif
+    mprotect((void *)(uintptr_t)base, (size_t)size, PROT_READ | PROT_EXEC);
 }
 
 /* dladdr 只作取证打印。返回 image 名；不在任何 image 内返回 "(jit/none)"。 */
@@ -468,6 +449,7 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
         printf("[r100][boot] 用户硬红线①：所有 patch 真 hook，不降级不跳过（版本额度放宽到 R110）\n");
         printf("[r100][boot] 用户硬红线②：绝不在可写页上执行（W^X）；主路径把 --x 代码页补成纯 RX，兜底写态无 X 且立刻翻回\n");
         printf("[r100][boot] 本版只改这一个变量：闸门时序沿用 R99b 不动（RunStartUp 真机计数=0，锚它已证伪），便于崩了干净归因\n");
+        printf("[r100c][boot] CI 修复：iOS 禁用 mach_vm.h，改用 POSIX mprotect 补 READ（无 W，签名 hash 不变）\n");
         printf("[r99b][boot] ===== R99b：删分时让出(证伪) + 信号驱动闸门(等 BeginAsync 再冻结) =====\n");
         printf("[r99][boot] (R99 分时主线程已默认禁用，真机 seq=10 SIGBUS+double fault 证伪)\n");
         printf("[host][r98] ===== R98：判定沿用 R97（vm_read 硬门槛），砍逐 patch dladdr/取证 IO，主线程 QoS 抬档 =====\n");
@@ -504,10 +486,10 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
        补完用 vm_read 重读；只有仍读不到才短暂切「无 X 写态」读一次并
        【立刻】r100_restore_rx 翻回严格 RX。DobbyHook 之前页一定是 RX。 */
     uint64_t r100_base = 0, r100_size = 0;
-    int      r100_orig = 0, r100_promoted = 0, r100_wstate = 0;
+    int      r100_promoted = 0, r100_wstate = 0;
     if (!got_target && !nullish && !misalign) {
         r100_promoted = r100_promote_rx(target, sizeof(head),
-                                        &r100_base, &r100_size, &r100_orig);
+                                        &r100_base, &r100_size);
         if (r100_promoted)
             got_target = r97_safe_read(target, head, sizeof(head));  /* 补 R 后重读 */
         if (!got_target && r100_promoted && r100_make_rw(r100_base, r100_size)) {
@@ -519,10 +501,9 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
         }
         if ((seq % 16u) == 0u || seq < 4u)
             printf("[r100][wx] #%u target=0x%llx 补RX=%d 无X写态=%d 读到指令=%d "
-                   "（页=0x%llx/%lluB 原prot=0x%x）-> %s\n",
+                   "（页=0x%llx/%lluB）-> %s\n",
                    seq, t, r100_promoted, r100_wstate, got_target,
                    (unsigned long long)r100_base, (unsigned long long)r100_size,
-                   (unsigned)r100_orig,
                    got_target ? "真 hook" : "仍照常送 DobbyHook（不降级不跳过）");
     }
 
