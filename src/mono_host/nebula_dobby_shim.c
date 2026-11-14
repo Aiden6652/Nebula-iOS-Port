@@ -22,39 +22,43 @@
  *   同轮 NOS 加载器已创建自己的 NebulaLog.txt，说明主体已进初始化入口。
  *
  * 真机对四个机制的判定（证实 / 证伪）：
- *  【证实·保留】DobbyDestroy no-op：崩点已从 R95f 的 Destroy 移到 Prepare，
- *          R96 的修复有效。iOS 代码签名页不可写回，进程内不撤销 detour
- *          是唯一稳妥语义。
- *  【证实·保留】vm_read 直接从 addr 读（不再按 16KB 页首对齐）：#1~#8 全部
- *          可读，R95f 那 34 个「合法但被错杀」的页对齐假阴性已消除。
- *  【证实·保留】已 hook 地址表复用：Destroy 变 no-op 后避免同 target 二次
- *          DobbyHook。
- *  【证伪·删除】「in_image 放行」：dladdr 命中 Mach-O image 只说明地址落在
- *          image 的映射范围，不等于该地址开头 32 字节指令可读。#9 正是
- *          「读不到却命中 UnityFramework」的坏地址，dobby 读它做指令重定位
- *          必崩。R95f 硬拒绝时不会崩在 relo_relocate（只是错杀合法 patch）；
- *          R96 为救假阴性加的这条放行，反而把真坏地址放进去 => 恢复硬门槛。
+ *  【证实·保留】DobbyDestroy no-op：崩点已从 R95f 的 Destroy 移到 Prepare。
+ *  【证实·保留】vm_read 直接从 addr 读（不再按 16KB 页首对齐）：#1~#8 全可读。
+ *  【证实·保留】已 hook 地址表复用：Destroy 变 no-op 后避免同 target 二次 hook。
+ *  【证伪·删除】「in_image 放行」：dladdr 命中只说明地址落在 image 映射范围，
+ *          不等于该地址开头 32 字节指令可读。#9 正是坏地址，送进 dobby 必崩。
  *  【证伪·删除】SIGSEGV/SIGBUS 信号兜底：iOS 上 EXC_BAD_ACCESS 由 Mach 异常
- *          先转 mono 的 Mach exception handler（native stack 实锤
- *          mono_sigsegv_signal_handler_debug 抢先），BSD sigaction 抢不到；
- *          实证 #9 崩溃时没有打印「DobbyHook 内部 SIGSEGV」，兜底完全没触发。
- *          且 guard_restore 会把 mono 后续重装的 handler 覆盖回旧值，有隐患。
+ *          先转 mono handler，BSD sigaction 抢不到，实证完全没触发。
  *
- * R97 修法（只改判定，不加新机制、不加诊断层）：
- *   vm_read 能读满 target 32B 且地址合法且指令头非垃圾 -> 真调 DobbyHook
- *          （#1~#8 已真机实证：可读地址进 dobby 重定位不会崩）
+ * R97 修法（只改判定，不加新机制）：
+ *   vm_read 能读满 target 32B 且地址合法且指令头非垃圾 -> 真调 DobbyHook。
  *   其余一律降级：*prepared = 原函数，return 0，绝不调 DobbyHook。
  *   降级对 Harmony 完全合法：R95f 降级 34 个 patch 时 PatchAll 照常推进到
  *   NebulaPlugin.LoadInternal，只是该 patch 不生效，NOS 仍能完成加载。
- *   DobbyCommit no-op / DobbyDestroy no-op / 已 hook 表复用 全部保留。
  *
  * 架构前提（用户实锤，R95e 的 PAC 误判已彻底删除）：
  *   AU = Among Us 是纯 arm64 上架包，进程内不存在 PAC / PACIASP / BTI / RETAA。
  *   iPad M4 芯片兼容 arm64e 不代表本进程有 PAC 签名指针。
  *   NOS = Nebula on the Ship。
  *
- * 保持单 dylib：本版只改这个 C 文件；build_ios.sh 沿用 R96b
- *   （llvm-ar d 删 dobby.cpp.o + force_load 整包），不再改动链接方式。
+ * ============================================================================
+ * [R97b] 本版唯一改动：诊断数据源 + 砍同步 IO（判定逻辑一行不动）
+ * ----------------------------------------------------------------------------
+ * R97 真机（BUILD=e3595bcfeefa-20261114）：进程【首次不崩】走完 PatchAll
+ *   (#202，86 真 hook / 112 降级 / 0 SIGSEGV)，但 Innersloth 动画后长时间黑屏，
+ *   用户手动杀进程。两次运行日志停在不同编号(#202 / #128)，无法区分是
+ *   「慢加载(33MB NOS 首次 JIT)」还是「卡死(含 NOS 劫持自旋假设)」。
+ *
+ * 本版做两件事，均为零风险改动：
+ *  ① 把 patch 进度写进宿主导出的共享计数（g_r97b_patch_seq/ok/down），
+ *     由宿主 R97b 心跳线程每秒打印 stage + seq + 静止时长 —— 一次真机即可
+ *     客观定性「在加载 / 静止」，不再靠猜，也不再靠「日志零增长几秒」。
+ *  ② 砍掉逐 patch 的 printf+fflush：R97 每个 patch 做 2~3 次同步 fflush，
+ *     202 个 patch 累计 600+ 次同步 IO（stdio 已重定向到 nebula_host.txt），
+ *     是主线程被拖住的直接嫌疑。改为：首条 banner + 每 32 个 patch 一行汇总
+ *     + 降级原因/异常仍单条打印（不打 32B hexdump）。判定结果完全不变。
+ *
+ * 保持单 dylib：只改这个 C 文件；build_ios.sh 沿用 R96b，不动链接方式。
  */
 /* Linux 本地语法检查需要 _GNU_SOURCE 才暴露 Dl_info/dladdr；Darwin 无条件提供。 */
 #ifndef _GNU_SOURCE
@@ -80,6 +84,15 @@ int DobbyHook(void *address, void *replace_func, void **origin_func);
 #ifdef __cplusplus
 }
 #endif
+
+/* ---------------------------------------------------------------------------
+ * [R97b] 宿主 nebula_mono_host.c 导出的共享计数（同一 dylib 内链接）。
+ * 心跳线程是裸 pthread，只 printf 不碰 mono；这几个 volatile 计数是它与
+ * 主线程之间唯一的、无锁的进展信号。写丢失无所谓，只要能观察到推进即可。
+ * ------------------------------------------------------------------------- */
+extern volatile unsigned g_r97b_patch_seq;
+extern volatile unsigned g_r97b_patch_ok;
+extern volatile unsigned g_r97b_patch_down;
 
 /* ---------------------------------------------------------------------------
  * 安全读：直接从 addr 读 n 字节，绝不直接 deref。
@@ -144,14 +157,18 @@ static void r97_remember(void *target, void *trampoline) {
 
 /* ---------------------------------------------------------------------------
  * DobbyPrepare：vm_read 硬门槛 + 真 hook
+ * 判定逻辑与 R97 完全一致，仅：① 更新共享计数 ② 日志节流、去掉 fflush。
  * ------------------------------------------------------------------------- */
 __attribute__((visibility("default")))
 int DobbyPrepare(void *target, void *replace, void **prepared) {
     static unsigned seq = 0;
     seq++;
 
+    /* [R97b] 每个 patch 都推进心跳看到的序号 —— 这是「是否在加载」的数据源。 */
+    g_r97b_patch_seq = seq;
+
     if (seq == 1)
-        printf("[host][r97] ===== R97：vm_read 硬门槛（读不到即降级）/ 删 in_image 放行 / 删失效信号兜底 =====\n");
+        printf("[host][r97b] ===== R97b：vm_read 硬门槛（R97 判定不变）/ 共享进度计数 / 日志节流去 fflush =====\n");
 
     unsigned long long t = (unsigned long long)(uintptr_t)target;
     unsigned long long r = (unsigned long long)(uintptr_t)replace;
@@ -163,9 +180,7 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     void *saved_tramp = NULL;
     if (r97_lookup(target, &saved_tramp)) {
         if (prepared) *prepared = saved_tramp;
-        printf("[r97][dob] #%u target=0x%llx 复用 trampoline=0x%llx（不二次 hook）\n",
-               seq, t, (unsigned long long)(uintptr_t)saved_tramp);
-        fflush(stdout);
+        /* 复用属正常路径，交给 32 步长汇总，不单独刷盘 */
         return 0;
     }
 
@@ -178,25 +193,6 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
 
     const char *tn = r97_image_of(target);
     const char *rn = r97_image_of(replace);
-
-    printf("[r97][dob] #%u target=0x%llx [%s] replace=0x%llx [%s] readT=%d readR=%d\n",
-           seq, t, tn, r, rn, got_target, got_replace);
-    fflush(stdout);
-
-    if (got_target) {
-        printf("[r97][dob] #%u head=%02x%02x%02x%02x %02x%02x%02x%02x "
-               "%02x%02x%02x%02x %02x%02x%02x%02x "
-               "%02x%02x%02x%02x %02x%02x%02x%02x "
-               "%02x%02x%02x%02x %02x%02x%02x%02x\n",
-               seq,
-               head[0],  head[1],  head[2],  head[3],  head[4],  head[5],  head[6],  head[7],
-               head[8],  head[9],  head[10], head[11], head[12], head[13], head[14], head[15],
-               head[16], head[17], head[18], head[19], head[20], head[21], head[22], head[23],
-               head[24], head[25], head[26], head[27], head[28], head[29], head[30], head[31]);
-    } else {
-        printf("[r97][dob] #%u head=<vm_read 失败：目标指令不可读>\n", seq);
-    }
-    fflush(stdout);
 
     /* —— 硬门槛（R97：不再有 dladdr/in_image 放行、不再有 PAC 相关判定）——
      * R96b 真机实锤：readT=0 的地址（#9）进 DobbyHook 必崩在 relo_relocate。
@@ -213,27 +209,34 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     int garbage = got_target && (insn0 == 0u || insn0 == 0xffffffffu);
 
     if (nullish || misalign || !got_target || garbage) {
-        printf("[r97][dob] #%u 降级：readT=%d nullish=%d misalign=%d garbage=%d "
-               "-> 不调 DobbyHook，*prepared=原函数（PatchAll 继续，NOS 照常加载）\n",
-               seq, got_target, nullish, misalign, garbage);
-        fflush(stdout);
+        g_r97b_patch_down++;
+        /* 降级原因保留单条（无 fflush），供真机定位坏地址来源 */
+        printf("[r97b][dob] #%u 降级 target=0x%llx [%s] readT=%d nullish=%d misalign=%d garbage=%d\n",
+               seq, t, tn, got_target, nullish, misalign, garbage);
         return 0;
     }
 
     int rc = DobbyHook(target, replace, prepared);
     if (rc != 0) {
-        printf("[r97][dob] #%u DobbyHook rc=%d（失败）-> 兜底 *prepared=原函数\n", seq, rc);
-        fflush(stdout);
+        printf("[r97b][dob] #%u DobbyHook rc=%d（失败）-> 兜底 *prepared=原函数\n", seq, rc);
         if (prepared) *prepared = target;
+        g_r97b_patch_down++;
     } else if (prepared && *prepared == NULL) {
-        printf("[r97][dob] #%u DobbyHook 成功但 trampoline=NULL -> 兜底 *prepared=原函数\n", seq);
-        fflush(stdout);
+        printf("[r97b][dob] #%u DobbyHook 成功但 trampoline=NULL -> 兜底 *prepared=原函数\n", seq);
         *prepared = target;
+        g_r97b_patch_down++;
     } else {
         r97_remember(target, prepared ? *prepared : NULL);
-        printf("[r97][dob] #%u DobbyHook 成功 trampoline=0x%llx（共 %u 个）\n",
-               seq, (unsigned long long)(uintptr_t)(prepared ? *prepared : NULL), g_r97_hook_n);
-        fflush(stdout);
+        g_r97b_patch_ok++;
+    }
+
+    /* [R97b] 每 32 个 patch 一条汇总（替代 R97 每个 patch 2~3 次同步 fflush）。
+       心跳线程另有独立的 1s stdout 刷新，日志不会因节流而看不到进展。 */
+    if ((seq % 32u) == 0u) {
+        printf("[r97b][dob] --- 进度 seq=%u ok=%u down=%u hooks=%u "
+               "last_target=0x%llx [%s] replace=0x%llx [%s] readR=%d ---\n",
+               seq, g_r97b_patch_ok, g_r97b_patch_down, g_r97_hook_n,
+               t, tn, r, rn, got_replace);
     }
     return rc;
 }
@@ -245,7 +248,7 @@ int DobbyCommit(void *prepared) {
 }
 
 /* ---------------------------------------------------------------------------
- * 接管 DobbyDestroy（R96 修复，真机已证实有效，R97 保留）
+ * 接管 DobbyDestroy（R96 修复，真机已证实有效，R97/R97b 保留）
  * BepInEx DobbyDetour.UndoImpl 会 P/Invoke Destroy(OriginalMethodPtr)，
  * 上游实现会 DobbyCodePatch(memcpy) 写回代码页，在 iOS 上必崩。
  * 游戏进程生命周期内 Harmony 不需要真撤销 detour，no-op 是唯一稳妥语义。
@@ -254,8 +257,7 @@ __attribute__((visibility("default")))
 int DobbyDestroy(void *address) {
     static unsigned dseq = 0;
     dseq++;
-    printf("[r97][destroy] #%u address=0x%llx -> no-op（不写回代码页）\n",
+    printf("[r97b][destroy] #%u address=0x%llx -> no-op（不写回代码页）\n",
            dseq, (unsigned long long)(uintptr_t)address);
-    fflush(stdout);
     return 0;   /* 0 = 成功，BepInEx UndoImpl 直接 pop 丢弃 */
 }

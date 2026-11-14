@@ -1597,6 +1597,49 @@ static void *nebula_r54_tail_thread(void *arg) {
 static MonoDomain *g_r56_domain     = NULL;   // Mono 根域（boot_thread 里 init，主线程需 attach）
 static MonoImage  *g_r56_il2cpp_img = NULL;   // BepInEx.Unity.IL2CPP 的 image
 
+/* ==========================================================================
+ * [R97b] 加载诊断探针 —— 回答「到底在加载还是卡死 / 卡在哪一段」
+ * --------------------------------------------------------------------------
+ * R97 真机（BUILD=e3595bcfeefa）两种表象互相矛盾：同一包一次停在 #202、一次
+ * 停在 #128；挂机 6 分钟日志 248453 字节一行没多，进程活着但完全静止。
+ * 逐 patch 日志是异步管道，无法区分「在跑 JIT」与「死锁」。故加独立心跳线程：
+ *   · 裸 pthread + sleep，绝不 mono_thread_attach / 绝不碰 GC（R64e 教训：常驻
+ *     usleep 线程登记 GC 会让 coop stop-the-world 扫栈崩）；只 printf 不进 mono。
+ *   · 每 1s 读共享计数，打印 stage + patch 序号 + 「进度静止秒数」。
+ *   · 心跳在跳、seq 不动 >=8s → 明确打印「疑似卡死（卡在 stage/序号）」；
+ *     seq 持续推进 → 明确打印「加载中」。一次真机即可定性，不用再猜。
+ * 共享变量由 nebula_dobby_shim.c 用 extern 更新（同一 dylib 内链接，export_list=*）。
+ * ========================================================================== */
+volatile unsigned g_r97b_patch_seq   = 0;   /* 已处理的 DobbyPrepare 次数（最后进展） */
+volatile unsigned g_r97b_patch_ok    = 0;   /* 真 hook 成功数 */
+volatile unsigned g_r97b_patch_down  = 0;   /* 降级数 */
+volatile int      g_r97b_stage       = 0;   /* 当前阶段，见下 */
+volatile unsigned g_r97b_prewarm_ms  = 0;   /* NOS 加载链 JIT 预编译耗时(ms) */
+
+#define R97B_ST_BOOT     1   /* on_load/boot_thread 早期 */
+#define R97B_ST_STARTED  2   /* BepInEx Start() 已返回 */
+#define R97B_ST_PHASE_B  3   /* 阶段B：dobby 手动启动，准备装插件 */
+#define R97B_ST_EXEC     4   /* NebulaManualExecute 已调用（扫 plugins） */
+#define R97B_ST_PATCH    5   /* Harmony PatchAll 进行中（保留定义；实际靠 seq 推进观测，未单独置位） */
+#define R97B_ST_DONE     6   /* NebulaManualExecute 返回 */
+#define R97B_ST_READY    7   /* NOS 就绪 / 占位销毁 */
+
+static void  nebula_r97b_heartbeat_start(void);   /* 定义在文件后段 */
+static void  nebula_r97b_prewarm_nos(void);       /* 定义在文件后段 */
+
+static const char *r97b_stage_name(int s) {
+    switch (s) {
+        case R97B_ST_BOOT:    return "boot/mono_init";
+        case R97B_ST_STARTED: return "Start返回";
+        case R97B_ST_PHASE_B: return "阶段B/dobby";
+        case R97B_ST_EXEC:    return "Execute(扫plugins)";
+        case R97B_ST_PATCH:   return "PatchAll";
+        case R97B_ST_DONE:    return "Execute返回";
+        case R97B_ST_READY:   return "NOS就绪";
+        default:              return "(未开始)";
+    }
+}
+
 // [R70] boot 线程 → 主线程 交接：boot 线程只做 mono_jit_init + 环境准备，把 domain/root
 // 交给主线程（先 mono_thread_attach 再跑 Start()），规避裸 pthread 上 MonoMod trampoline
 // 生成引发的 coop sgen 崩。主线程已验证可跑通（R56 靠它跑到 Innersloth）。
@@ -3370,6 +3413,10 @@ static void *boot_thread_impl(void *arg) {
     hlog("[host] step: trap+stdio 捕获已装（mono 遗言将现形）");
     neb_install_mach_trap();   // [第十五轮] thread 级 mach 端口：先于 BSD signal 抓真实 fault 地址
 #endif
+    /* [R97b] stdio 捕获完成后立刻启动加载心跳，覆盖后续全部阶段。
+       必须在 capture 之后：心跳用 printf，早于此写不进 nebula_host.txt。 */
+    g_r97b_stage = R97B_ST_BOOT;
+    nebula_r97b_heartbeat_start();
 
     // [R73] 启动画面：无条件强制播放 "AUI Mod Loader by Aiden" 满 5 秒（原 R60 = 3s）。
     //   ① 不再是「正在生成interop」占位 —— R60 设备端永不生成 interop，那个文案会误导；
@@ -3757,6 +3804,173 @@ static void nebula_prewarm_jit(void) {
     hlog("[host][r73] ===== JIT 预热完成：共 %d 方法，编译成功 %d，跳过 %d =====", total, ok, fail);
 }
 
+/* ==========================================================================
+ * [R97b] 加载心跳诊断线程
+ * --------------------------------------------------------------------------
+ * 裸 pthread + nanosleep，【绝不】 mono_thread_attach / 【绝不】 碰 GC / 不调任何
+ * mono API —— R64e 真机实锤：常驻 usleep 的裸线程登记成 GC 参与线程后，coop
+ * stop-the-world 扫栈越界会崩。本线程只读 volatile 计数 + printf，完全旁路。
+ *
+ * 作用：R97 黑屏期间日志是异步管道，分不清「在跑 JIT」还是「死锁」。心跳每秒
+ * 打印 stage / patch 序号 / 进度静止时长：seq 持续变 = 加载中；心跳仍在但 seq
+ * 8s 不动 = 卡死，且直接给出卡在哪个 stage、第几个 patch。一次真机即可定性。
+ * ========================================================================== */
+static void *nebula_r97b_heartbeat_thread(void *arg) {
+    (void)arg;
+    struct timespec t0, now, last_progress;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    last_progress = t0;
+    unsigned last_seq = 0;
+    int      last_stg = -1;
+    for (;;) {
+        struct timespec delay = { 1, 0 };
+        nanosleep(&delay, NULL);                 /* 裸 pthread，不 attach mono、不碰 GC */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long el = (long)((now.tv_sec - t0.tv_sec) * 1000
+                       + (now.tv_nsec - t0.tv_nsec) / 1000000);
+        unsigned seq = g_r97b_patch_seq;
+        int      stg = g_r97b_stage;
+        unsigned ok  = g_r97b_patch_ok, dn = g_r97b_patch_down;
+        /* patch 序号或阶段任一推进都算「有进展」 */
+        if (seq != last_seq || stg != last_stg) {
+            last_seq = seq; last_stg = stg; last_progress = now;
+        }
+        long idle = (long)((now.tv_sec - last_progress.tv_sec) * 1000
+                         + (now.tv_nsec - last_progress.tv_nsec) / 1000000);
+        /* 关键：加载走完后 seq 本就不再增长，不能一律判卡死。
+           只有仍处在加载窗口(BOOT..PATCH)且进度静止 >=8s 才判卡死。 */
+        /* [R97b] 只报客观数据，不替用户下「卡死」结论：2 分钟零日志增长
+           不足以区分「慢 JIT」与「死锁」，定性交给看日志的人。 */
+        const char *verdict;
+        if (stg >= R97B_ST_DONE)
+            verdict = "[完成] Execute 已返回（是否进 NOS 看主菜单）";
+        else if (stg == 0)
+            verdict = "[等待] boot 尚未开始";
+        else if (idle >= 8000)
+            verdict = "[静止] 进度未推进（可能慢 JIT / 可能卡死，看后续是否恢复）";
+        else
+            verdict = "[活动中] 加载在推进 / 刚起步";
+        printf("[r97b][hb] t+%ldms stage=%d(%s) seq=%u ok=%u down=%u "
+               "idle=%ldms prewarm=%ums -> %s\n",
+               el, stg, r97b_stage_name(stg), seq, ok, dn,
+               idle, g_r97b_prewarm_ms, verdict);
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+static void nebula_r97b_heartbeat_start(void) {
+    static int started = 0;
+    if (started) return;
+    started = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, nebula_r97b_heartbeat_thread, NULL) == 0)
+        pthread_detach(t);
+    printf("[r97b][hb] 心跳已启动（1s 一次；seq 静止 >=8s 判定卡死并定位 stage）\n");
+    fflush(stdout);
+}
+
+/* ==========================================================================
+ * [R97b] JIT 预编译「部分 NOS」加载链 —— 优化加载速度
+ * --------------------------------------------------------------------------
+ * R97 真机卡在 PatchAll 中（#128 后无输出），历史注释亦记录「iPad Mono JIT 下
+ * interop/大方法首次编译能把加载拖到 20 分钟、进程活着却像卡死」。33MB 的
+ * Nebula.dll 采用 lazy JIT，首次调用大方法时才编译，正好落在黑屏窗口里。
+ *
+ * 与 R73/R75 的区别（关键安全性）：
+ *   R73 用 mono_class_get_methods 【遍历类里全部方法】批量编译，踩到泛型/抽象/
+ *   pinvoke/icall 方法 -> mono_method_to_ir 的 unreachable 断言 -> abort。
+ *   本版【绝不遍历】：只用 mono_class_get_method_from_name 按「类名+方法名+参数数」
+ *   精确取白名单方法，全部来自 ikdasm 实证的 cil managed 具体方法，取不到就跳过。
+ *   逐方法打印编译前后耗时，任何一步异常都能从日志定位。
+ *
+ * 加载方式：mono_domain_assembly_open（宿主在 1798/2122/2149 已多次安全使用），
+ * CWD 恒为 Documents（R86），NOS 相对路径 "BepInEx/nebula/Nebula.dll" 可命中。
+ * 只打开程序集 + 编译方法体，不执行任何 NOS 代码、不触发 cctor。
+ *
+ * 回退：NEBULA_PREWARM_NOS=0 -> 完全等价 R97 基线（不加载、不编译）。
+ * ========================================================================== */
+static void nebula_r97b_prewarm_nos(void) {
+    const char *off = getenv("NEBULA_PREWARM_NOS");
+    if (off && !strcmp(off, "0")) {
+        printf("[r97b][jit] NOS 预编译已关闭（NEBULA_PREWARM_NOS=0，等价 R97 基线）\n");
+        fflush(stdout);
+        return;
+    }
+    extern MonoAssembly *mono_domain_assembly_open(MonoDomain *domain, const char *name);
+    extern void         *mono_compile_method(MonoMethod *method);
+
+    MonoDomain *dom = g_boot_domain ? g_boot_domain : g_r56_domain;
+    if (!dom) {
+        printf("[r97b][jit] 跳过：Mono 域尚未就绪\n"); fflush(stdout); return;
+    }
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+
+    /* [R97b] R81 真机实锤：相对路径 "BepInEx/nebula/Nebula.dll" 曾报
+       "Assembly Is Not Found."（真文件 33.9MB 在 HOME/Documents 下）。
+       mono_domain_assembly_open 不保证走 CWD，故显式拼绝对路径。*/
+    char nos_path[PATH_MAX];
+    snprintf(nos_path, sizeof(nos_path), "%s/BepInEx/nebula/Nebula.dll",
+             nebula_doc_root(NULL));
+    printf("[r97b][jit] NOS 程序集绝对路径: %s\n", nos_path);
+    fflush(stdout);
+    MonoAssembly *as = mono_domain_assembly_open(dom, nos_path);
+    if (!as) {
+        printf("[r97b][jit] 跳过：NOS 程序集未能打开（不影响后续正常加载）\n");
+        fflush(stdout); return;
+    }
+    MonoImage *img = mono_assembly_get_image(as);
+    if (!img) {
+        printf("[r97b][jit] 跳过：取不到 NOS image\n"); fflush(stdout); return;
+    }
+    printf("[r97b][jit] NOS 程序集已打开，开始白名单预编译（不执行任何 NOS 代码）\n");
+    fflush(stdout);
+
+    /* 白名单：全部由 ikdasm 实证为 cil managed 具体方法，按 轻量 -> 重量 排序。
+       绝不含泛型/抽象/pinvoke/icall（R73 abort 的元凶）。 */
+    struct pw { const char *ns; const char *cls; const char *m; int argc; };
+    /* [R97b] 只留 3 个纯 getter。绝不预编译 Load / LoadInternal / DataSaver.Load：
+       它们的方法体会解析 il2cpp 类型 -> 触发 Il2CppClassPointerStore<T>.cctor
+       （R90 崩点），且 R73 实锤批量 mono_compile_method 会撞 mono 断言 abort。
+       本版加速主项其实是「提前把 33MB 程序集装进 domain（省掉黑屏窗口里的一次
+       完整元数据解析）」+ shim 砍掉 600 次同步 fflush；JIT 预热只是顺带。*/
+    static const struct pw w[] = {
+        { "Nebula",          "NebulaPlugin", "GetNebulaVersionString",     0 },
+        { "Nebula",          "NebulaPlugin", "get_IsPreferential",         0 },
+        { "Nebula",          "NebulaPlugin", "get_AllowHttpCommunication", 0 },
+    };
+    const int nw = (int)(sizeof(w) / sizeof(w[0]));
+    int ok = 0, miss = 0;
+    for (int i = 0; i < nw; i++) {
+        MonoClass  *k = mono_class_from_name(img, w[i].ns, w[i].cls);
+        MonoMethod *m = k ? mono_class_get_method_from_name(k, w[i].m, w[i].argc) : NULL;
+        if (!m) {
+            printf("[r97b][jit]   [%d/%d] %s.%s::%s(%d) 未找到，跳过\n",
+                   i + 1, nw, w[i].ns, w[i].cls, w[i].m, w[i].argc);
+            fflush(stdout); miss++; continue;
+        }
+        struct timespec c, d;
+        clock_gettime(CLOCK_MONOTONIC, &c);
+        void *code = mono_compile_method(m);
+        clock_gettime(CLOCK_MONOTONIC, &d);
+        long ms = (long)((d.tv_sec - c.tv_sec) * 1000
+                       + (d.tv_nsec - c.tv_nsec) / 1000000);
+        if (code) ok++;
+        printf("[r97b][jit]   [%d/%d] %s.%s::%s(%d) -> %s  耗时 %ldms\n",
+               i + 1, nw, w[i].ns, w[i].cls, w[i].m, w[i].argc,
+               code ? "已编译" : "跳过(NULL)", ms);
+        fflush(stdout);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    long total = (long)((b.tv_sec - a.tv_sec) * 1000
+                      + (b.tv_nsec - a.tv_nsec) / 1000000);
+    g_r97b_prewarm_ms = (unsigned)(total < 0 ? 0 : total);
+    printf("[r97b][jit] ===== NOS 预编译完成：白名单 %d，编译成功 %d，未找到 %d，总耗时 %ldms =====\n",
+           nw, ok, miss, total);
+    fflush(stdout);
+}
+
 /* [R82] 进程过滤器：改为【纯诊断】，不再硬编码修改 Paths.ProcessName。
  *
  * 背景：BepInProcess("Among Us.exe") 过滤器在 iOS 上永远不匹配 —— 主可执行名
@@ -3850,8 +4064,15 @@ static void nebula_r56_invoke_manual_execute(void) {
 
     printf("[host][r56] 已定位 NebulaManualExecute()，开始 mono_runtime_invoke（扫 plugins / 加载 NOS）\n");
     fflush(NULL);
+    g_r97b_stage = R97B_ST_EXEC;                 /* [R97b] 心跳：进入扫 plugins / PatchAll */
+    printf("[r97b][stage] 进入 NebulaManualExecute（此后 seq 是否推进，由心跳每秒自证）\n");
+    fflush(NULL);
     MonoObject *exc = NULL;
     mono_runtime_invoke(m, NULL, NULL, &exc);
+    g_r97b_stage = R97B_ST_DONE;                 /* [R97b] Execute 已返回 */
+    printf("[r97b][stage] NebulaManualExecute 已返回，patch 终值 seq=%u ok=%u down=%u\n",
+           g_r97b_patch_seq, g_r97b_patch_ok, g_r97b_patch_down);
+    fflush(NULL);
     if (exc) {
         fprintf(stderr, "[host][r56] !! managed 抛出异常（类型见下）：\n");
         nebula_log_exception(exc);
@@ -3959,6 +4180,10 @@ static void boot(void) {
                    必须在下面阶段B（挂 dobby + NebulaManualExecute 起线程池 worker）之前
                    完成，让新线程执行已编译代码、不再首次 JIT 崩。 */
                 nebula_prewarm_jit();
+                /* [R97b] Start() 已返回、主线程安全窗口内，预编译部分 NOS 加载链方法，
+                   把 lazy JIT 从黑屏窗口提前到这里（可用 NEBULA_PREWARM_NOS=0 回退）。 */
+                g_r97b_stage = R97B_ST_STARTED;
+                nebula_r97b_prewarm_nos();
                 /* [R75] 不再在这里置 g_boot_complete（R74 死锁根源，见 boot_thread 注释）。
                    放行早已由 boot_thread 结束触发、on_load 已返回、Unity 已起；这里只是
                    在「Start() 之后、阶段B 装插件之前」的同一主线程安全窗口做 JIT 预热，
@@ -3973,6 +4198,7 @@ static void boot(void) {
                     nebula_enable_dobby_dllmap();           // 手动启动 dobby
                     g_r56_domain = g_boot_domain;           // 手动 Execute 依赖（boot_bepinex 已设 g_r56_il2cpp_img）
                     hlog("[host][r72] 阶段B: dobby 已手动启动 + g_r56_domain 已登记，开始扫 plugins 装 NOS");
+                    g_r97b_stage = R97B_ST_PHASE_B;         // [R97b] 心跳阶段
                     nebula_r56_invoke_manual_execute();
                 });
                 free(g_boot_root); g_boot_root = NULL;
