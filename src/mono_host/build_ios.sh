@@ -517,36 +517,53 @@ if [ ! -f "$DOBBY_A" ]; then
   exit 1
 fi
 
-# [R96] 关键修复：把 dobby 归档【展开成裸 .o 列表】再链入，而不是 -force_load 整包。
-#   原因：归档里 dobby.cpp.o 定义了上游 _DobbyDestroy / _DobbyGetVersion。
+# [R96b] 关键修复：从 dobby 归档里【删掉 dobby.cpp.o 这一个成员】，其余
+#   原样 -force_load 整包链入（绝不展开成裸 .o！）。
+#   为什么必须删：dobby.cpp.o 定义上游 _DobbyDestroy / _DobbyGetVersion。
 #   BepInEx 的 DobbyDetour.UndoImpl -> DobbyLib.Destroy(OriginalMethodPtr) 会
-#   P/Invoke DobbyDestroy，命中这个上游实现后做 DobbyCodePatch(memcpy) 写回
-#   代码页，在 iOS 上 SIGSEGV（R95f 真机 native stack 实锤：memcpy <- DobbyCodePatch
-#   <- DobbyDestroy）。本版 shim 提供 no-op 的 DobbyDestroy，必须排除同名上游符号。
-#   llvm-nm 全量核验：归档内没有任何其它 .o 引用 _DobbyDestroy/_DobbyGetVersion，
-#   排除 dobby.cpp.o 安全、不会产生未定义符号。
-#   裸 .o 直接作为输入文件传给 clang = 无条件全量链入，与 -force_load 等价，
-#   且不依赖 ar 符号表重建（GNU ar 对 Mach-O 归档 ar d 会 malformed，展开法跨平台稳）。
-DOBBY_OBJ_DIR="$OUT/dobby_objs_r96"
-rm -rf "$DOBBY_OBJ_DIR"; mkdir -p "$DOBBY_OBJ_DIR"
-( cd "$DOBBY_OBJ_DIR" && ar x "$DOBBY_A" )
-if [ -f "$DOBBY_OBJ_DIR/dobby.cpp.o" ]; then
-  rm -f "$DOBBY_OBJ_DIR/dobby.cpp.o"
-  echo "    [R96] 已排除 dobby.cpp.o::_DobbyDestroy/_DobbyGetVersion（shim no-op 版接管）"
+#   P/Invoke DobbyDestroy，命中上游实现后做 DobbyCodePatch(memcpy) 写回代码页，
+#   在 iOS 上 SIGSEGV（R95f 真机 native stack 实锤：memcpy <- DobbyCodePatch
+#   <- DobbyDestroy）。本版 shim 提供 no-op 的 DobbyDestroy，必须排除同名上游符号
+#   （两个强符号会 duplicate symbol）。llvm-nm 全量核验：dobby.cpp.o 只定义这
+#   两个符号，归档内没有任何其它 .o 引用它们，删除安全、无未定义符号。
+#
+#   [R96 首版教训]：曾把归档 ar x 展开成裸 .o 列表再链入，结果 CI 挂
+#   "vtable for InstructionInstrumentRouting undefined"。根因是归档里有
+#   【两个同名的 RoutingImpl.cc.o】，ar x 展开时后者覆盖前者，丢掉了
+#   InstructionInstrumentRouting 的 vtable 定义。故必须保持 -force_load 整包
+#   （归档内部重名成员可共存、符号解析完整），只做 ar d 精确删一个成员。
+#   macOS/CI 的 ar 与 llvm-ar 都支持 ar d 单个成员；实测删后 57 个成员完好、
+#   DobbyHook/DobbyCodePatch/DobbyInstrument/vtable 符号全部保留。
+# 工具探测：Mach-O 归档必须用 llvm-ar / Apple ar；GNU binutils ar 会把
+# Mach-O 归档 ar d 成 malformed（Linux 本地实测成员数变 0）。CI(macOS) 的
+# /usr/bin/ar 是 Apple 原生，能正确处理；但优先用 llvm-ar 更保险。
+AR_BIN="ar"
+if command -v llvm-ar >/dev/null 2>&1; then AR_BIN="llvm-ar"; fi
+NM_BIN="nm"
+if command -v llvm-nm >/dev/null 2>&1; then NM_BIN="llvm-nm"; fi
+echo "    [R96b] ar=$AR_BIN nm=$NM_BIN"
+DOBBY_A_R96B="$OUT/libdobby_r96b.a"
+cp -f "$DOBBY_A" "$DOBBY_A_R96B"
+if "$AR_BIN" t "$DOBBY_A_R96B" 2>/dev/null | grep -qx "dobby.cpp.o"; then
+  "$AR_BIN" d "$DOBBY_A_R96B" dobby.cpp.o
+  echo "    [R96b] 已从归档删除 dobby.cpp.o（shim no-op DobbyDestroy 接管）"
 else
-  echo "    [R96] ⚠ 归档内未找到 dobby.cpp.o，检查上游 DobbyDestroy 是否仍会冲突" >&2
+  echo "    [R96b] ⚠ 归档内未找到 dobby.cpp.o，检查上游 DobbyDestroy 是否仍会冲突" >&2
 fi
-FORCE_DOBBY=()
-for o in "$DOBBY_OBJ_DIR"/*.o; do
-  [ -e "$o" ] || continue
-  FORCE_DOBBY+=("$o")
-done
-# FORCE_DOBBY 至少有 30+ 个 .o，永不为空 —— 避免 bash 3.2 + set -u 下展开空数组。
-if [ ${#FORCE_DOBBY[@]} -eq 0 ]; then
-  echo "!! [R96] dobby 归档展开后没有任何 .o，无法链接" >&2
+# 复核：删后归档必须仍完好（成员数 > 50）且 DobbyDestroy 已不在，否则
+# shim 会 duplicate symbol 或归档损坏导致 vtable undefined。
+MEMBERS=$("$AR_BIN" t "$DOBBY_A_R96B" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$MEMBERS" -lt 50 ]; then
+  echo "!! [R96b] 删成员后归档异常（成员数=$MEMBERS），可能被 GNU ar 破坏" >&2
   exit 1
 fi
-echo "    [R96] dobby 裸 .o 链入: ${#FORCE_DOBBY[@]} 个目标文件"
+if "$NM_BIN" -g "$DOBBY_A_R96B" 2>/dev/null | grep -q "T _DobbyDestroy"; then
+  echo "!! [R96b] 归档内仍有 _DobbyDestroy，无法链接（会 duplicate symbol）" >&2
+  exit 1
+fi
+echo "    [R96b] 归档完好：$MEMBERS 个成员，DobbyDestroy 已排除，DobbyHook/vtable 保留"
+# FORCE_DOBBY 恒有 1 个元素，永不为空 —— 避免 bash 3.2 + set -u 下展开空数组。
+FORCE_DOBBY=("-Wl,-force_load,$DOBBY_A_R96B")
 FORCE_NATIVE=()
 if [ ${#NATIVE_A[@]} -gt 0 ]; then
   for a in "${NATIVE_A[@]}"; do FORCE_NATIVE+=("-Wl,-force_load,$a"); done
@@ -554,7 +571,7 @@ fi
 if [ ${#ICU_A[@]} -gt 0 ]; then
   for a in "${ICU_A[@]}"; do FORCE_NATIVE+=("-Wl,-force_load,$a"); done
 fi
-echo "    [R60] dobby 静态链: $(basename "$DOBBY_A") ($(wc -c < "$DOBBY_A") bytes)"
+echo "    [R96b] dobby 静态链: $(basename "$DOBBY_A_R96B") ($(wc -c < "$DOBBY_A_R96B") bytes, 源自 $(basename "$DOBBY_A"))"
 echo "    [R60] 全量 force_load 条目: $(( 1 + ${#FORCE_NATIVE[@]} )) 个"
 
 # 单一编译器（JIT）版：解释器已废除，standard / pro 合并为一份。
@@ -667,7 +684,7 @@ esac
 # 且上游 dobby.cpp.o::_DobbyGetVersion 必须已排除，否则会 duplicate symbol 或
 # 命中上游 DobbyDestroy -> DobbyCodePatch(memcpy) 写回代码页 SIGSEGV。
 case "$SYMS" in
-  *DobbyDestroy*) echo "    ✓ DobbyDestroy（R96 shim no-op 版已接管，UndoImpl 不再写回代码页）" ;;
+  *DobbyDestroy*) echo "    ✓ DobbyDestroy（R96b shim no-op 版已接管，UndoImpl 不再写回代码页）" ;;
   *) echo "    ✗ DobbyDestroy 缺失！UndoImpl 会 P/Invoke 落空或命中上游崩" >&2; exit 1 ;;
 esac
 case "$SYMS" in
