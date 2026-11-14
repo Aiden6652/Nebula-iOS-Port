@@ -72,7 +72,49 @@
  *   #160 降级行，无法确定是 #161/#162/#163 之后崩。把汇总间隔 32->16，
  *   并给 seq>=150 加每 8 个 patch 一条极简编号日志（不打 image / 不 fflush），
  *   若再崩可精确锁定停在哪一号之后，供 R99 精准处理。
- */
+ *
+ * ============================================================================
+ * [R99] 唯一改动：分时主线程（cooperative patching），破「同步 PatchAll 冻结 Unity」死锁
+ * ----------------------------------------------------------------------------
+ * R98 / R98b 两次真机崩在完全相同的位置 seq=162（BUILD=ad0443cec1be / 4d7aef27f68）：
+ *   nebula_r56_invoke_manual_execute() 是同步 mono_runtime_invoke，在主线程独占
+ *   约 40s 跑完 202 个 Harmony patch。这 40s 里 Unity 主循环被整段冻死：
+ *     ① Unity 日志永远停在 Addressables 早期（R98b 17:08:49.366，相对 t≈1.9s），
+ *        0 条 Begin async loading MainMenu / RunStartUp；#162 反射读静态字段触发
+ *        Il2CppClassPointerStore<T>.cctor -> il2cpp 类取不到 -> libsystem_platform
+ *        SIGSEGV。R97b（Unity 跑到 RunStartUp t≈9.1s 才 PatchAll）跑完 #202 不崩，
+ *        唯一差异就是 Unity 启动进度，不是时间窗口大小。
+ *     ② Innersloth 动画停摆。
+ *     ③ NOS 的 NebulaPlugin.LoadInternal() 在 Harmony.PatchAll() 之后才
+ *        set_sceneLoaded 注册回调，回调要靠 Unity 场景切换（sceneLoaded）触发，
+ *        再由 NebulaManager.StartCoroutine 逐帧推进加载链；Unity 一冻结，
+ *        回调触发不了、协程饿死 -> NebulaLog.txt 永远只有标题行。
+ *   R98b 给 2000ms 窗口仍崩在 #162：只要 PatchAll 同步占住主线程，
+ *   「冻结」与「Unity 推进」就不可兼得，给 0 / 2000 / 9000ms 都逃不出这个死锁。
+ *
+ * 修法：不碰 PatchAll 的单线程顺序（Harmony 有顺序依赖、共享 detour 表、
+ *   改同一代码页，并行必崩），而是在每个 patch 的 C 层回调 DobbyPrepare 里
+ *   周期性把主线程还给 Unity 主循环跑几帧（嵌套 CFRunLoopRunInMode），
+ *   让 Unity 启动进度 / il2cpp 类型 / 动画 / 异步场景加载 / NOS 协程持续推进。
+ *
+ * 两段式让出（默认按 R97b 真机时间线标定，全部可用环境变量微调，无需重打包）：
+ *   - 前段 seq<=100：每 4 个 patch 让出 80ms（25 次 = 2.0s）。叠加阶段A 窗口
+ *     Unity 已跑的 ~1.1s -> 累计 ~3.1s，越过 Begin async loading MainMenu
+ *     （R97b 实测 t≈2.2s，il2cpp 类型可访问 -> #162 不崩）。
+ *   - 后段 seq>100：每 4 个 patch 让出 20ms（25 次 = 0.5s），只保活主循环 /
+ *     动画 / 协程，不让 Unity 快速推进到 RunStartUp（R97b 实测 t≈9.1s）。
+ *     场景切换必须留到 PatchAll 完成、set_sceneLoaded 注册好之后。
+ *   全程让出约 2.5s，PatchAll 40s -> ~43s，仍在品牌页 120s 安全兜底内。
+ *   PatchAll 完成后主线程全交还，Unity 继续走完异步加载 -> sceneLoaded 触发
+ *   -> NebulaManager + StartCoroutine 加载链自然接上（此时回调早已注册）。
+ *
+ * 安全约束：
+ *   - 让出期间若 Unity 主循环重入 DobbyPrepare，一律降级返回（不二次 patch、
+ *     不递归让出），绝不破坏 Harmony 一致性。
+ *   - R97 判定（vm_read 硬门槛 / DobbyDestroy no-op / hook 表复用）一行不动。
+ *   - NEBULA_R99_YIELD=0 一键关闭让出，完整回退 R98b 行为，便于 A/B 对照。
+ *   - 品牌页 @"AUI Mod Loader by Aiden" 页面/署名/双闸门一律不动（硬红线）。
+ * ========================================================================== */
 /* Linux 本地语法检查需要 _GNU_SOURCE 才暴露 Dl_info/dladdr；Darwin 无条件提供。 */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -84,6 +126,7 @@
 #include <dlfcn.h>               /* dladdr：仅用于打印归属 image，不参与判定 */
 #include <sys/time.h>            /* [R98] gettimeofday：每 32 个 patch 打印累计耗时 */
 #ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>  /* [R99] CFRunLoopRunInMode：分时让出主线程 */
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #endif
@@ -107,6 +150,51 @@ int DobbyHook(void *address, void *replace_func, void **origin_func);
 extern volatile unsigned g_r97b_patch_seq;
 extern volatile unsigned g_r97b_patch_ok;
 extern volatile unsigned g_r97b_patch_down;
+
+/* ---------------------------------------------------------------------------
+ * [R99] 分时主线程：PatchAll 期间把主线程还给 Unity 主循环。
+ * g_r99_yield_* 由宿主 nebula_r56_invoke_manual_execute 在结束时打印，供真机核对。
+ * ------------------------------------------------------------------------- */
+volatile unsigned g_r99_yield_count = 0;
+volatile unsigned g_r99_yield_ms    = 0;
+
+static volatile int r99_yielding = 0;   /* 嵌套 runloop 重入保护（同线程） */
+
+static void r99_pump_main_loop(double seconds) {
+#ifdef __APPLE__
+    /* 当前正处于主队列 block 内的 mono_runtime_invoke(PatchAll) 调用栈。
+       嵌套跑一次 default mode：Unity 的 CADisplayLink / 主循环 source 得以推进，
+       而 GCD 主队列是串行的，当前 block 未返回前不会重入阶段B。 */
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, false);
+#else
+    (void)seconds;   /* Linux gcc -fsyntax-only stub，不参与 iOS 构建 */
+#endif
+}
+
+static int      r99_cfg_enabled = -1;   /* -1 未初始化 / 0 关 / 1 开 */
+static unsigned r99_every       = 4;
+static unsigned r99_early_seq   = 100;
+static unsigned r99_early_ms    = 80;
+static unsigned r99_late_ms     = 20;
+
+static void r99_cfg_init(void) {
+    if (r99_cfg_enabled >= 0) return;
+    r99_cfg_enabled = 1;
+    const char *off = getenv("NEBULA_R99_YIELD");
+    if (off && !strcmp(off, "0")) r99_cfg_enabled = 0;
+    const char *e;
+    e = getenv("NEBULA_R99_YIELD_EVERY");
+    if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 64)   r99_every = (unsigned)v; }
+    e = getenv("NEBULA_R99_YIELD_EARLY_SEQ");
+    if (e && *e) { int v = atoi(e); if (v >= 0 && v <= 4096) r99_early_seq = (unsigned)v; }
+    e = getenv("NEBULA_R99_YIELD_EARLY_MS");
+    if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 1000) r99_early_ms = (unsigned)v; }
+    e = getenv("NEBULA_R99_YIELD_LATE_MS");
+    if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 1000) r99_late_ms = (unsigned)v; }
+    printf("[r99][cfg] 分时主线程 enabled=%d every=%u early_seq=%u early_ms=%u late_ms=%u "
+           "（NEBULA_R99_YIELD=0 可回退 R98b）\n",
+           r99_cfg_enabled, r99_every, r99_early_seq, r99_early_ms, r99_late_ms);
+}
 
 /* ---------------------------------------------------------------------------
  * 安全读：直接从 addr 读 n 字节，绝不直接 deref。
@@ -175,6 +263,14 @@ static void r97_remember(void *target, void *trampoline) {
  * ------------------------------------------------------------------------- */
 __attribute__((visibility("default")))
 int DobbyPrepare(void *target, void *replace, void **prepared) {
+    /* [R99] 让出期间 Unity 主循环若重入本函数：一律降级，绝不二次 patch、
+       绝不递归让出（Harmony patch 途中被 Unity 回调重入会破坏 detour 表）。 */
+    if (r99_yielding) {
+        if (prepared) *prepared = target;
+        return 0;
+    }
+    r99_cfg_init();
+
     static unsigned seq = 0;
     static struct timeval r98_t0;
     seq++;
@@ -182,8 +278,24 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     /* [R97b] 每个 patch 都推进心跳看到的序号 —— 这是「是否在加载」的数据源。 */
     g_r97b_patch_seq = seq;
 
+    /* [R99] 分时主线程：只在「两个 patch 之间」把主线程还给 Unity 主循环跑几帧。
+       前段重让出尽快越过 Unity 启动早期（il2cpp 类型可访问 -> #162 不崩），
+       后段轻让出只保活动画 / 异步加载 / NOS 协程，不提前放行场景切换。 */
+    if (r99_cfg_enabled == 1 && (seq % r99_every) == 0u) {
+        unsigned ms = (seq <= r99_early_seq) ? r99_early_ms : r99_late_ms;
+        r99_yielding = 1;
+        r99_pump_main_loop((double)ms / 1000.0);
+        r99_yielding = 0;
+        g_r99_yield_count++;
+        g_r99_yield_ms += ms;
+        if ((g_r99_yield_count % 16u) == 0u)
+            printf("[r99][yield] 已让出 %u 次 / 累计 %ums（seq=%u，Unity 主循环持续推进）\n",
+                   g_r99_yield_count, g_r99_yield_ms, seq);
+    }
+
     if (seq == 1) {
         gettimeofday(&r98_t0, NULL);
+        printf("[r99][boot] ===== R99：分时主线程（PatchAll 期间让出主循环），破同步冻结死锁 =====\n");
         printf("[host][r98] ===== R98：判定沿用 R97（vm_read 硬门槛），砍逐 patch dladdr/取证 IO，主线程 QoS 抬档 =====\n");
         printf("[host][r97b] ===== R97b：vm_read 硬门槛（R97 判定不变）/ 共享进度计数 / 日志节流去 fflush =====\n");
     }

@@ -161,6 +161,27 @@ typedef void *os_log_t;
  *   还有 ~7s 异步加载窗口 —— 2s 远不够放行，PatchAll 仍会抢在放行前占住主线程。
  *   其余 R98 机制（阶段B 0ms / 主线程 QoS / 并行准备 / 品牌页双闸门）全保留。
  *   回退：NEBULA_EXEC_DELAY_MS=0 回 R98，=4000 回 R97b。
+ *
+ * ---------------------------------------------------------------------------
+ * [R99] R98b 真机复盘（BUILD=4d7aef27f68-20261114）—— 2000ms 窗口彻底证伪
+ *   R98b 与 R98 崩在完全相同的 seq=162，崩栈逐帧一致：
+ *     mono_field_get_value_object_checked -> RuntimeHelpers.RunClassConstructor
+ *     -> mono_runtime_class_init_full -> mono_jit_runtime_invoke
+ *     -> UnityFramework(DllCanUnloadNow) -> libsystem_platform SIGSEGV。
+ *   Unity 日志仍停在 17:08:49.366 Addressables 早期（相对 t≈1.9s），
+ *   0 条 Begin async loading MainMenu / RunStartUp。心跳最后 seq=162 静止。
+ *   R97b 真机时间线：Begin async loading MainMenu t≈2.2s、
+ *   RunStartUp t≈9.1s、NebulaManualExecute t≈11s（跑完 #202 不崩）。
+ *   => 差异不是「窗口给多少 ms」，而是 PatchAll 同步独占主线程 40s 把
+ *      Unity 主循环整段冻死：il2cpp 类型停在启动早期（#162 崩）、
+ *      Innersloth 动画停摆、NOS 的 sceneLoaded / StartCoroutine 加载链饿死。
+ *      给 0 / 2000 / 9000ms 都逃不出「冻结」与「推进」不可兼得的死锁。
+ *
+ * 修法（本版）：改调度结构，不再调毫秒数。见 nebula_dobby_shim.c 的
+ *   [R99] 分时主线程 —— 每个 patch 的 C 层回调里周期性嵌套
+ *   CFRunLoopRunInMode 把主线程还给 Unity 跑几帧，PatchAll 仍单线程顺序。
+ *   阶段A 延迟、阶段B 0ms、QoS、并行准备、品牌页双闸门全部一行不动。
+ *   回退：NEBULA_R99_YIELD=0 关闭分时让出，完整回退 R98b。
  * ========================================================================== */
 /* Darwin <sys/qos.h> 的稳定枚举值（ABI 固定，不用 include 具体 SDK 头） */
 #define R98_QOS_USER_INTERACTIVE 0x21
@@ -3556,6 +3577,7 @@ static void *boot_thread_impl(void *arg) {
        必须在 capture 之后：心跳用 printf，早于此写不进 nebula_host.txt。 */
     g_r97b_stage = R97B_ST_BOOT;
     nebula_r97b_heartbeat_start();
+    printf("[r99][boot] ===== R99：分时主线程（cooperative patching）—— PatchAll 期间把主线程还给 Unity 主循环 =====\n");
     printf("[r98b][boot] ===== R98b：R98 抢跑已证「Unity 不放行」，改 2000ms 窗口修 #162 il2cpp cctor 崩 =====\n");
     printf("[r98][boot] ===== R98：抢主队列 + QoS 抬档 + 多核准备 + 品牌页双闸门 =====\n");
     printf("[r98][boot] 在线核数=%d（运行时探测，不写死 8 核）；阶段A 4000->0ms，阶段B 1500->0ms\n",
@@ -4161,6 +4183,9 @@ static void nebula_fix_process_name(MonoDomain *domain) {
 }
 
 static void nebula_r56_invoke_manual_execute(void) {
+    /* [R99] 分时让出统计（定义在 nebula_dobby_shim.c，同 dylib 内链接） */
+    extern volatile unsigned g_r99_yield_count;
+    extern volatile unsigned g_r99_yield_ms;
     printf("[host][r56] ===== Unity 主线程触发开始 =====\n");
     printf("[host][r84] 阶段B：开始扫 plugins 装 NOS。三刀 IL 补丁/滑动插件/CWD 修正(R82) 与 blittable 兜底(R83) 均在；崩溃真根因由 R84 在构建层修复(完整版 marshal-ilgen)\n");
     fflush(NULL);
@@ -4232,6 +4257,9 @@ static void nebula_r56_invoke_manual_execute(void) {
        绝不在 patch 途中放行到原版主菜单画面。 */
     printf("[r98][gate] PatchAll 完成 seq=%u ok=%u down=%u，发出 NOS 就绪信号\n",
            g_r97b_patch_seq, g_r97b_patch_ok, g_r97b_patch_down);
+    printf("[r99][gate] PatchAll 期间累计让出主线程 %u 次 / %ums；主线程全交还 Unity，"
+           "待 sceneLoaded 触发 NOS 加载协程\n",
+           g_r99_yield_count, g_r99_yield_ms);
     nebula_signal_ready();
     printf("[host][r56] ===== Unity 主线程触发结束 =====\n");
     fflush(NULL);
