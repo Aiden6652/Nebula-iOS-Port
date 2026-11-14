@@ -182,6 +182,29 @@ typedef void *os_log_t;
  *   CFRunLoopRunInMode 把主线程还给 Unity 跑几帧，PatchAll 仍单线程顺序。
  *   阶段A 延迟、阶段B 0ms、QoS、并行准备、品牌页双闸门全部一行不动。
  *   回退：NEBULA_R99_YIELD=0 关闭分时让出，完整回退 R98b。
+ *
+ * ---------------------------------------------------------------------------
+ * [R99b] R99 真机复盘 + 用户纠正（BUILD=d203bd88465e）
+ *   R99 分时让出让 Unity 真的推进到 Begin async loading MainMenu /
+ *   Done initializing refdata / InitializeRefdata 协程 MoveNext（R98/R98b 全无），
+ *   但 seq=10 即 SIGBUS + SIGSEGV + double fault：崩栈含 r99_pump_main_loop
+ *   -> DobbyPrepare，另有 QuartzCore/UnitySendMessage 与 _pthread_start 线程栈。
+ *   => Unity 渲染/worker 线程与 Harmony 改代码页并发，分时让出方向作废。
+ *   用户纠正：R97/R98/R99 都是「能看到原版主菜单加载界面，但加载时卡死」，
+ *   不是「进原版可玩」，也不是「成功不放行」；host 日志缺 BeginAsync 只是
+ *   stdout 抓取丢失，不能当 Unity 没放行。
+ *   真因：LoadInternal() 里 PatchAll(IL_0068) 早于 sceneLoaded 注册(IL_0099)，
+ *   MainMenu 场景 ~2s 就开始异步加载，PatchAll 占 40s -> 回调注册时
+ *   sceneLoaded 已触发过 -> NebulaManager 不创建 -> NOS 加载协程饿死。
+ * 修法：信号驱动闸门（nebula_r99b_wait_then_execute）——阶段A 尽早跑完
+ *   BepInEx Start()，阶段B 轮询等 Unity 打出 "Begin async loading MainMenu"
+ *   （每次只排 50ms 空主队列 block，主线程持续交还 Unity，绝不嵌套进 patch 栈），
+ *   信号一到立刻冻结主线程同步跑 PatchAll（不并发、类型已注册）；
+ *   完成后主线程交还，Unity 完成场景异步加载 -> sceneLoaded 触发 -> NOS 接上。
+ *   品牌页（@"AUI Mod Loader by Aiden"）页面/署名/双闸门一行不动（硬红线），
+ *   只把 nebula_signal_ready() 的淡出延后，盖到 NOS 加载动画起来（无缝衔接）。
+ *   回退：NEBULA_R99B_REVEAL_MS 调淡出延时；NEBULA_EXEC_DELAY_MS 调阶段A；
+ *   NEBULA_R99_YIELD=1 可开回 R99 分时让出做 A/B。
  * ========================================================================== */
 /* Darwin <sys/qos.h> 的稳定枚举值（ABI 固定，不用 include 具体 SDK 头） */
 #define R98_QOS_USER_INTERACTIVE 0x21
@@ -2589,6 +2612,44 @@ static void neb_install_mach_trap(void)
 /* —— [第十二轮] stderr/stdout 捕获：mono 的遗言第一次进日志 —— */
 static int g_stdio_pipe[2] = { -1, -1 };
 
+/* ---------------------------------------------------------------------------
+ * [R99b] 信号闸门配置：一次出包可对照多个触发窗口（省版本额度）。
+ *   NEBULA_R99B_GATE=begin   （默认）等 "Begin async loading MainMenu" /
+ *                                  "Done initializing refdata"（refdata 完成、
+ *                                  类型已注册、sceneLoaded 尚未触发的黄金窗口）
+ *   NEBULA_R99B_GATE=startup 等 "MainMenuManager.RunStartUp"（类型更全，
+ *                                  但可能已触发 sceneLoaded，作对照）
+ *   NEBULA_R99B_GATE=0       关闸门，阶段A 后立即抢跑（回退 R98b 对照）
+ *   NEBULA_R99B_GATE_EXTRA_MS=N  信号命中后再给 Unity N ms 推进（默认 0）
+ * ------------------------------------------------------------------------- */
+static int          r99b_gate_on      = 1;
+static int          r99b_gate_startup = 0;
+static int64_t      r99b_gate_extra_ms = 0;
+
+static void r99b_gate_cfg_init(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    const char *g = getenv("NEBULA_R99B_GATE");
+    if (g && *g) {
+        if (!strcmp(g, "0") || !strcasecmp(g, "off"))       r99b_gate_on = 0;
+        else if (!strcasecmp(g, "startup"))                 r99b_gate_startup = 1;
+        else                                                r99b_gate_startup = 0;  /* begin */
+    }
+    const char *e = getenv("NEBULA_R99B_GATE_EXTRA_MS");
+    if (e && *e) { long v = strtol(e, NULL, 10); if (v > 0 && v <= 10000) r99b_gate_extra_ms = (int64_t)v; }
+    printf("[r99b][cfg] 信号闸门 on=%d 关键字=%s extra=%lldms "
+           "（NEBULA_R99B_GATE=begin|startup|0, NEBULA_R99B_GATE_EXTRA_MS=N）\n",
+           r99b_gate_on,
+           !r99b_gate_on ? "关闭(立即抢跑)" : (r99b_gate_startup ? "RunStartUp" : "BeginAsync/refdata"),
+           (long long)r99b_gate_extra_ms);
+    fflush(NULL);
+}
+/* [R99b] Unity 已打出 "Begin async loading MainMenu" / "Done initializing refdata"
+   = il2cpp 类型注册完成、场景开始异步加载、sceneLoaded 尚未触发。
+   此刻冻结主线程跑 PatchAll 最安全（见 r99b_wait_then_execute）。 */
+volatile int g_unity_begin_async = 0;
+
 static void *neb_stdio_reader(void *arg)
 {
     (void)arg;
@@ -2601,6 +2662,36 @@ static void *neb_stdio_reader(void *arg)
             char c = buf[i];
             if (c == '\n' || len >= sizeof(line) - 2) {
                 line[len] = 0;
+                /* [R99b] 信号闸门：只读判定，不打印（打印会写回本 pipe 自激）。
+                   ⚠️ 必须只认「Unity 原始 NSLog 行」：本文件里 [r99b][boot] /
+                   [r99b][timing] 的 banner 文本也含 "Begin async loading MainMenu"，
+                   若不做前缀过滤会自己命中 -> 闸门第一轮就抢跑（回到 R98 死路）。
+                   Unity 真实行格式：
+                     "2026-11-14 19:44:51.880 AmongUs[3373:596343] Begin async loading MainMenu"
+                   即带 4 位年份时间戳 + "AmongUs["；Sentry 转发的第二行是纯文本副本，
+                   但第一行已命中，置一次即可。 */
+                {
+                    /* 形态①：Unity NSLog 原始行（R99 实证）
+                         "2026-11-14 19:44:51.880 AmongUs[3373:596343] Begin async loading MainMenu"
+                       形态②：Sentry 转发的纯文本副本（R99 实证）
+                         "Begin async loading MainMenu" / "Done initializing refdata"
+                       本文件的 [r99b] banner 也含这些字样，但行首是 '['，
+                       两种形态都不匹配 -> 不会自己命中。
+                       R99b：关键字按 NEBULA_R99B_GATE 切换（begin / startup）。 */
+                    int unity_nslog = (len > 4 &&
+                                       line[0] >= '0' && line[0] <= '9' &&
+                                       line[1] >= '0' && line[1] <= '9' &&
+                                       strstr(line, "AmongUs[") != NULL);
+                    int unity_plain = (len > 0 && line[0] != '[');  /* 自研日志均以 '[' 开头 */
+                    int kw_hit = r99b_gate_startup
+                        ? (strstr(line, "MainMenuManager.RunStartUp") != NULL)
+                        : (strstr(line, "Begin async loading MainMenu") != NULL ||
+                           strstr(line, "Done initializing refdata") != NULL);
+                    if (len > 0 && r99b_gate_on && !g_unity_begin_async &&
+                        (unity_nslog || unity_plain) && kw_hit) {
+                        g_unity_begin_async = 1;
+                    }
+                }
                 if (len > 0 && g_logfp) {
                     fprintf(g_logfp, "[mono-out] %s\n", line);
                     fflush(g_logfp);
@@ -2616,6 +2707,7 @@ static void *neb_stdio_reader(void *arg)
 
 static void neb_capture_stdio(void)
 {
+    r99b_gate_cfg_init();   /* [R99b] 必须在 reader 线程启动前，主线程一次性读 env */
     if (g_stdio_pipe[0] != -1) return;
     if (pipe(g_stdio_pipe) != 0) return;
     fflush(stdout);
@@ -3577,7 +3669,10 @@ static void *boot_thread_impl(void *arg) {
        必须在 capture 之后：心跳用 printf，早于此写不进 nebula_host.txt。 */
     g_r97b_stage = R97B_ST_BOOT;
     nebula_r97b_heartbeat_start();
-    printf("[r99][boot] ===== R99：分时主线程（cooperative patching）—— PatchAll 期间把主线程还给 Unity 主循环 =====\n");
+    printf("[r99b][boot] ===== R99b：删分时让出 + 信号驱动闸门 —— 等 Unity 打出 "
+           "Begin async loading MainMenu 再冻结主线程跑 PatchAll =====\n");
+    printf("[r99b][boot] 用户纠正：R97/R98 都是「能看到原版主菜单加载界面但加载时卡死」，"
+           "不是提前劫持成功；真因是 sceneLoaded 回调注册(IL_0099)晚于 PatchAll(IL_0068) 40s\n");
     printf("[r98b][boot] ===== R98b：R98 抢跑已证「Unity 不放行」，改 2000ms 窗口修 #162 il2cpp cctor 崩 =====\n");
     printf("[r98][boot] ===== R98：抢主队列 + QoS 抬档 + 多核准备 + 品牌页双闸门 =====\n");
     printf("[r98][boot] 在线核数=%d（运行时探测，不写死 8 核）；阶段A 4000->0ms，阶段B 1500->0ms\n",
@@ -3858,6 +3953,11 @@ static int64_t nebula_r56_delay_ms(void) {
        给 Unity 2s 完成到「Begin async loading MainMenu」(il2cpp 类型注册完)，
        又远小于 R97b 实测的 ~7s 异步加载窗口 -> 仍赶在放行前占住主线程。
        NEBULA_EXEC_DELAY_MS=0 回退 R98 全抢跑；=4000 回退 R97b。 */
+    /* [R99b] 此函数同时服务「非 bepinex 兜底路径」与「bepinex 两阶段」的阶段A
+       派发延迟，默认 2000ms 保留 R98b 验证过的 Start 不崩窗口。R99b 真正的变化
+       在阶段B：不再按固定毫秒抢主线程，改由信号闸门等 Unity 打出
+       Begin async loading MainMenu 后再冻结主线程跑 PatchAll
+       （见 nebula_r99b_wait_then_execute，关键字/额外窗口可经 env 配置）。 */
     if (!e || !*e) return 2000;
     long v = strtol(e, NULL, 10);
     if (v < 0) v = 0;
@@ -4255,12 +4355,27 @@ static void nebula_r56_invoke_manual_execute(void) {
     /* [R98] NebulaManualExecute 返回 == PatchAll（含 NOS 的 LoadPatch）全部装完。
        这才是放行信号：品牌页双闸门 = 最短展示时长 + 本信号，二者齐备才淡出，
        绝不在 patch 途中放行到原版主菜单画面。 */
-    printf("[r98][gate] PatchAll 完成 seq=%u ok=%u down=%u，发出 NOS 就绪信号\n",
-           g_r97b_patch_seq, g_r97b_patch_ok, g_r97b_patch_down);
-    printf("[r99][gate] PatchAll 期间累计让出主线程 %u 次 / %ums；主线程全交还 Unity，"
-           "待 sceneLoaded 触发 NOS 加载协程\n",
-           g_r99_yield_count, g_r99_yield_ms);
-    nebula_signal_ready();
+    printf("[r98][gate] PatchAll 完成 seq=%u ok=%u down=%u（分时让出已禁用，让出次数=%u）\n",
+           g_r97b_patch_seq, g_r97b_patch_ok, g_r97b_patch_down, g_r99_yield_count);
+    /* [R99b] 此刻主线程即将交还，Unity 才继续完成场景异步加载；
+       sceneLoaded 还没触发、NOS 的 NebulaManager 尚未创建。品牌页必须继续
+       盖住，直到 NOS 加载动画起来才淡出（用户要求：放完 Innersloth 动画
+       无缝衔接 NOS 加载动画，绝不露出卡住的原版加载界面）。 */
+    int64_t reveal_ms = 3000;
+    const char *re = getenv("NEBULA_R99B_REVEAL_MS");
+    if (re && *re) { long rv = strtol(re, NULL, 10); if (rv >= 0 && rv <= 30000) reveal_ms = (int64_t)rv; }
+    printf("[r99b][gate] 信号命中=%d 闸门模式=%s；主线程全交还 Unity，"
+           "待 sceneLoaded 触发 NOS 加载协程；品牌页 %lldms 后淡出（NEBULA_R99B_REVEAL_MS 可调）\n",
+           g_unity_begin_async,
+           !r99b_gate_on ? "off(抢跑对照)" : (r99b_gate_startup ? "startup" : "begin"),
+           (long long)reveal_ms);
+    fflush(NULL);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, reveal_ms * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        nebula_signal_ready();
+        printf("[r99b][reveal] 品牌页淡出，NOS 加载动画应已接上\n");
+        fflush(NULL);
+    });
     printf("[host][r56] ===== Unity 主线程触发结束 =====\n");
     fflush(NULL);
 }
@@ -4281,6 +4396,58 @@ static void nebula_r56_schedule_execute(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, d * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
         nebula_r56_invoke_manual_execute();
+    });
+}
+
+/* ---------------------------------------------------------------------------
+ * [R99b] 信号驱动闸门：等 Unity 打出 "Begin async loading MainMenu" 再冻结主线程。
+ * ------------------------------------------------------------------------- */
+static void nebula_r99b_run_execute(void) {
+    nebula_r98_set_thread_qos(R98_QOS_USER_INTERACTIVE, "phaseB/PatchAll");
+    nebula_enable_dobby_dllmap();           // 手动启动 dobby
+    g_r56_domain = g_boot_domain;           // 手动 Execute 依赖（boot_bepinex 已设 g_r56_il2cpp_img）
+    hlog("[host][r72] 阶段B: dobby 已手动启动 + g_r56_domain 已登记，开始扫 plugins 装 NOS");
+    g_r97b_stage = R97B_ST_PHASE_B;
+    nebula_r56_invoke_manual_execute();
+}
+
+static void nebula_r99b_wait_then_execute(int ticks) {
+    /* 等待期间每次只排一个 50ms 的空主队列 block 后立刻返回，GCD/CFRunLoop
+       持续驱动 Unity 主循环：Innersloth 动画照播、refdata 照初始化、场景异步
+       加载照推进。与 R99 的本质区别：绝不嵌套进 PatchAll 的 mono 调用栈，
+       因此不会让 Unity 渲染/worker 线程在 Harmony 改代码页时并发执行。
+       R97b 实测 BeginAsync(t≈2.2s) 到 RunStartUp(t≈9.1s) 有 ~7s 异步加载窗口，
+       本闸门只要在这段窗口内冻结主线程，sceneLoaded 就会被「暂停」到
+       PatchAll 完成之后才触发 —— NOS 回调此时才注册好，加载链自然接上。 */
+    int gate_hit = (!r99b_gate_on) || g_unity_begin_async || (ticks >= 400);
+    if (gate_hit) {   /* 400 * 50ms = 20s 兜底 */
+        const char *why = !r99b_gate_on ? "闸门已关(NEBULA_R99B_GATE=0)，立即抢跑[对照]"
+                        : g_unity_begin_async ? "命中 Unity 加载信号"
+                        : "!! 超时兜底（信号未出现）";
+        printf("[r99b][signal] %s（闸门等待 %dms，关键字=%s）：%s\n",
+               why, ticks * 50,
+               r99b_gate_startup ? "RunStartUp" : "BeginAsync/refdata",
+               g_unity_begin_async
+                   ? "此刻冻结主线程跑 PatchAll（il2cpp 类型已注册 / sceneLoaded 被暂停）"
+                   : "强跑 PatchAll，可能已错过 sceneLoaded，见下方 gate 诊断");
+        fflush(NULL);
+        if (r99b_gate_extra_ms > 0 && g_unity_begin_async) {
+            printf("[r99b][extra] 信号命中后再给 Unity %lldms 推进（NEBULA_R99B_GATE_EXTRA_MS）\n",
+                   (long long)r99b_gate_extra_ms);
+            fflush(NULL);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, r99b_gate_extra_ms * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{ nebula_r99b_run_execute(); });
+        } else {
+            nebula_r99b_run_execute();
+        }
+        return;
+    }
+    if ((ticks % 20) == 0)
+        printf("[r99b][wait] 等 Unity 场景异步加载启动信号… 已等 %dms（Unity 主循环持续运行，动画不冻结）\n",
+               ticks * 50);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        nebula_r99b_wait_then_execute(ticks + 1);
     });
 }
 
@@ -4343,7 +4510,8 @@ static void boot(void) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)nebula_r56_delay_ms() * NSEC_PER_MSEC),
                            dispatch_get_main_queue(), ^{
                 nebula_r98_set_thread_qos(R98_QOS_USER_INTERACTIVE, "phaseA/Start");
-                printf("[r98b][window] 阶段A 延迟=%lldms：Unity 初始化窗口已给（il2cpp 类型注册），随后立刻占住主线程不放行\n",
+                printf("[r99b][window] 阶段A 延迟=%lldms（R98b/R99 验证过 Start 不崩，保留）；"
+                       "阶段B 不再抢主线程，改由信号闸门等 Begin async loading MainMenu\n",
                        (long long)nebula_r56_delay_ms());
                 mono_thread_attach(g_boot_domain);
                 /* [R72] 阶段A：跑 Start()（Doorstop→Preloader→IL2CPPChainloader.Initialize）。
@@ -4385,16 +4553,12 @@ static void boot(void) {
                 int64_t bdelay = 0;
                 const char *be = getenv("NEBULA_R98_PHASE_B_DELAY_MS");
                 if (be && *be) { long bv = strtol(be, NULL, 10); if (bv > 0) bdelay = (int64_t)bv; }
-                printf("[r98][timing] 阶段B 延迟=%lldms（R97b 为 1500ms）；Execute 立即抢主线程\n", (long long)bdelay);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, bdelay * NSEC_PER_MSEC),
-                               dispatch_get_main_queue(), ^{
-                    nebula_r98_set_thread_qos(R98_QOS_USER_INTERACTIVE, "phaseB/PatchAll");
-                    nebula_enable_dobby_dllmap();           // 手动启动 dobby
-                    g_r56_domain = g_boot_domain;           // 手动 Execute 依赖（boot_bepinex 已设 g_r56_il2cpp_img）
-                    hlog("[host][r72] 阶段B: dobby 已手动启动 + g_r56_domain 已登记，开始扫 plugins 装 NOS");
-                    g_r97b_stage = R97B_ST_PHASE_B;         // [R97b] 心跳阶段
-                    nebula_r56_invoke_manual_execute();
-                });
+                (void)bdelay;   /* [R99b] 阶段B 不再用固定毫秒抢跑 */
+                printf("[r99b][timing] 阶段B 改「信号驱动闸门」：等 Unity 打出 "
+                       "Begin async loading MainMenu 再冻结主线程跑 PatchAll；"
+                       "等待期间 Unity 主循环/Innersloth 动画完全不冻结\n");
+                fflush(NULL);
+                nebula_r99b_wait_then_execute(0);
                 free(g_boot_root); g_boot_root = NULL;
             });
             bepinex_dispatched = 1;

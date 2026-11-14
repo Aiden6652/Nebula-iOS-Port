@@ -114,6 +114,35 @@
  *   - R97 判定（vm_read 硬门槛 / DobbyDestroy no-op / hook 表复用）一行不动。
  *   - NEBULA_R99_YIELD=0 一键关闭让出，完整回退 R98b 行为，便于 A/B 对照。
  *   - 品牌页 @"AUI Mod Loader by Aiden" 页面/署名/双闸门一律不动（硬红线）。
+ *
+ * ============================================================================
+ * [R99b] R99 真机复盘（BUILD=d203bd88465e）—— 分时让出被证伪
+ *   ✅ 让出确实让 Unity 主循环推进了：R98/R98b 完全没有的
+ *      Begin async loading MainMenu / Done initializing refdata /
+ *      Hooked up SceneManager callback / <InitializeRefdata>d__10:MoveNext()
+ *      / settings.amogus 全部出现。
+ *   ❌ 但 seq=10（t+13s）即 Got a SIGBUS + Got a SIGSEGV + double fault。
+ *      崩栈：r99_pump_main_loop -> DobbyPrepare -> mono_jit_runtime_invoke；
+ *      另有 QuartzCore -> UnitySendMessage、以及 libsystem_pthread 的
+ *      _pthread_start 线程栈。即 Unity 渲染/worker 线程在 Harmony 改代码页
+ *      期间并发执行 il2cpp 代码 -> 撞车。
+ *   => 「PatchAll 期间让 Unity 跑」与「Harmony 改代码页必须独占」不可兼得。
+ *
+ * 用户纠正（关键）：R97/R98/R99 从没「进原版主菜单可玩」，也没被成功
+ *   「提前劫持不放行」。真机画面是：原版主菜单【加载界面】出来了，一直
+ *   停在加载中卡死。host 日志里没有 BeginAsync 只是 stdout 抓取在主线程
+ *   被占时积压丢失，不能据此判断 Unity 没走到。
+ *
+ * 真因：Nebula.dll LoadInternal() 里 Harmony.PatchAll() 在 IL_0068，
+ *   SceneManager.sceneLoaded += 回调 在 IL_0099（PatchAll 之后）。
+ *   MainMenu 场景启动 ~2s 就开始异步加载，PatchAll 要占 40s，回调注册时
+ *   sceneLoaded 早已触发 -> NebulaManager 永不创建 -> 加载协程饿死。
+ *
+ * 修法（R99b，见 nebula_mono_host.c）：不再猜毫秒数、不再让出。
+ *   信号驱动把 PatchAll 冻结点锚在 Unity 打出 "Begin async loading MainMenu"
+ *   那一刻：类型已注册(#162 不崩)、sceneLoaded 尚未触发；冻结期间不并发；
+ *   PatchAll 里注册好回调，主线程交还后 Unity 完成场景加载 ->
+ *   sceneLoaded 触发 -> NOS 加载链自然接上。
  * ========================================================================== */
 /* Linux 本地语法检查需要 _GNU_SOURCE 才暴露 Dl_info/dladdr；Darwin 无条件提供。 */
 #ifndef _GNU_SOURCE
@@ -179,9 +208,15 @@ static unsigned r99_late_ms     = 20;
 
 static void r99_cfg_init(void) {
     if (r99_cfg_enabled >= 0) return;
-    r99_cfg_enabled = 1;
-    const char *off = getenv("NEBULA_R99_YIELD");
-    if (off && !strcmp(off, "0")) r99_cfg_enabled = 0;
+    /* [R99b] 默认关闭。R99 真机（BUILD=d203bd88465e）崩在 seq=10：
+       嵌套 CFRunLoopRunInMode 把主线程还给 Unity 后，Unity 的 QuartzCore 渲染回调 /
+       UnitySendMessage / il2cpp worker 线程在 Harmony 正改代码页时并发执行 ->
+       SIGBUS + SIGSEGV + double fault（比 R98b 的 seq=162 更早）。
+       结论：PatchAll 期间绝不能让 Unity 跑起来。保留代码仅作 A/B 对照，
+       NEBULA_R99_YIELD=1 才开启。 */
+    r99_cfg_enabled = 0;
+    const char *on = getenv("NEBULA_R99_YIELD");
+    if (on && !strcmp(on, "1")) r99_cfg_enabled = 1;
     const char *e;
     e = getenv("NEBULA_R99_YIELD_EVERY");
     if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 64)   r99_every = (unsigned)v; }
@@ -191,8 +226,9 @@ static void r99_cfg_init(void) {
     if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 1000) r99_early_ms = (unsigned)v; }
     e = getenv("NEBULA_R99_YIELD_LATE_MS");
     if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 1000) r99_late_ms = (unsigned)v; }
-    printf("[r99][cfg] 分时主线程 enabled=%d every=%u early_seq=%u early_ms=%u late_ms=%u "
-           "（NEBULA_R99_YIELD=0 可回退 R98b）\n",
+    printf("[r99b][cfg] 分时让出(R99) %s enabled=%d every=%u early_seq=%u early_ms=%u late_ms=%u "
+           "（R99b 默认禁用；NEBULA_R99_YIELD=1 才开回 R99 做 A/B）\n",
+           r99_cfg_enabled ? "已开启[A/B]" : "已禁用[真机证伪]",
            r99_cfg_enabled, r99_every, r99_early_seq, r99_early_ms, r99_late_ms);
 }
 
@@ -295,7 +331,8 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
 
     if (seq == 1) {
         gettimeofday(&r98_t0, NULL);
-        printf("[r99][boot] ===== R99：分时主线程（PatchAll 期间让出主循环），破同步冻结死锁 =====\n");
+        printf("[r99b][boot] ===== R99b：删分时让出(证伪) + 信号驱动闸门(等 BeginAsync 再冻结) =====\n");
+        printf("[r99][boot] (R99 分时主线程已默认禁用，真机 seq=10 SIGBUS+double fault 证伪)\n");
         printf("[host][r98] ===== R98：判定沿用 R97（vm_read 硬门槛），砍逐 patch dladdr/取证 IO，主线程 QoS 抬档 =====\n");
         printf("[host][r97b] ===== R97b：vm_read 硬门槛（R97 判定不变）/ 共享进度计数 / 日志节流去 fflush =====\n");
     }
