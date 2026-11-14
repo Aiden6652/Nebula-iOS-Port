@@ -67,6 +67,11 @@
  * 本版绝不碰。只做加速：R97b 每个 patch 无条件调 2 次 dladdr（带 dyld 锁），
  * 202 个 patch 累计 400+ 次；成功路径根本用不到 image 名。改为仅在「降级」
  * 与「每 32 个汇总」时才取证，并给汇总加累计耗时，真机可直接对比 patch 速度。
+ *
+ * [R98b] 只加诊断（判定仍一行不动）：R98 真机崩在 seq=162 之后，日志停在
+ *   #160 降级行，无法确定是 #161/#162/#163 之后崩。把汇总间隔 32->16，
+ *   并给 seq>=150 加每 8 个 patch 一条极简编号日志（不打 image / 不 fflush），
+ *   若再崩可精确锁定停在哪一号之后，供 R99 精准处理。
  */
 /* Linux 本地语法检查需要 _GNU_SOURCE 才暴露 Dl_info/dladdr；Darwin 无条件提供。 */
 #ifndef _GNU_SOURCE
@@ -244,7 +249,7 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
 
     /* [R97b] 每 32 个 patch 一条汇总（替代 R97 每个 patch 2~3 次同步 fflush）。
        心跳线程另有独立的 1s stdout 刷新，日志不会因节流而看不到进展。 */
-    if ((seq % 32u) == 0u) {
+    if ((seq % 16u) == 0u) {   /* [R98b] 32->16：崩点附近更细的进度 */
         struct timeval now; gettimeofday(&now, NULL);
         double ms = (double)(now.tv_sec - r98_t0.tv_sec) * 1000.0
                   + (double)(now.tv_usec - r98_t0.tv_usec) / 1000.0;
@@ -253,6 +258,11 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
                seq, g_r97b_patch_ok, g_r97b_patch_down, g_r97_hook_n, ms,
                t, r97_image_of(target), r, r97_image_of(replace), got_replace);
     }
+    /* [R98b] 崩点高发区（R98 停在 #162）：每 8 个 patch 一条极简编号，
+       不打 image、不 fflush，几乎零开销。再崩即可锁定停在哪一号之后。 */
+    if (seq >= 150u && (seq % 8u) == 0u)
+        printf("[r98b][dob] seq=%u 仍在推进\n", seq);
+
     return rc;
 }
 

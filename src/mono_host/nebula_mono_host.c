@@ -137,6 +137,30 @@ typedef void *os_log_t;
  * 全部带一键回退：NEBULA_R98_PARALLEL=0 / NEBULA_R98_QOS=0 /
  *   NEBULA_EXEC_DELAY_MS=4000 / NEBULA_R98_PHASE_B_DELAY_MS=1500 可退回 R97b 时序。
  * Apple QoS API 一律 dlsym 取，不依赖特定 SDK 头/链接符号，避免交叉编译挂掉。
+ *
+ * ---------------------------------------------------------------------------
+ * [R98b] R98 真机（BUILD=ad0443cec1be-20261114）复盘 —— 抢跑成功但崩在 #162
+ *   ✅ 抢跑生效：Unity 日志停在 16:33:16.791（DiscordManager / addressables），
+ *      全文 0 条 "Begin async loading MainMenu" / "RunStartUp"（R97b 有 4 条），
+ *      => PatchAll 占住主线程，Unity 没放行到原版主菜单（用户要的「不放行」达成）。
+ *   ✅ 加速生效：在线核数(运行时)=9、4 路并行释放、主线程 QoS rc=0、
+ *      阶段B 0ms、首个 patch t≈12s、seq=162 用 t≈39s（~9 patch/s）。
+ *   ❌ 崩点：t≈39s seq=162，Native Crash Reporting：
+ *      libsystem_platform <- UnityFramework(DllCanUnloadNow) <- mono_jit_runtime_invoke
+ *      <- mono_runtime_class_init_full <- RuntimeHelpers.RunClassConstructor
+ *      <- RuntimeFieldInfo.GetValueInternal <- InternalInvoke
+ *      <- nebula_r56_invoke_manual_execute。
+ *      => Harmony 反射读静态字段触发某个 il2cpp 类型的 .cctor，UnityFramework 内
+ *      SIGSEGV；主线程死，裸 pthread 心跳继续跳 43s（不是卡死）。
+ *   R97（延迟 4000+1500）跑完 #202 不崩，R98（0+0）崩 —— 唯一实质差异是
+ *   Unity 有没有时间完成 il2cpp 类型注册 / 启动初始化。R98 把 Unity 掐死在
+ *   「Begin async loading MainMenu」之前，[#162] 反射要的类还没注册。
+ *
+ * 修法：阶段A 给 Unity 2000ms 主线程窗口完成到「Begin async loading MainMenu」
+ *   （il2cpp 类型全注册），但 R97b 实测该步(t≈3.9s)到 RunStartUp(t≈10.9s)
+ *   还有 ~7s 异步加载窗口 —— 2s 远不够放行，PatchAll 仍会抢在放行前占住主线程。
+ *   其余 R98 机制（阶段B 0ms / 主线程 QoS / 并行准备 / 品牌页双闸门）全保留。
+ *   回退：NEBULA_EXEC_DELAY_MS=0 回 R98，=4000 回 R97b。
  * ========================================================================== */
 /* Darwin <sys/qos.h> 的稳定枚举值（ABI 固定，不用 include 具体 SDK 头） */
 #define R98_QOS_USER_INTERACTIVE 0x21
@@ -1150,7 +1174,9 @@ static void nebula_r60_extract_bundle(const char *root) {
         printf("[r98][par] 在线核数(运行时)=%d；4 个释放任务并行(dispatch_apply/AUTO) + QoS 抬档\n", ncpu);
         (void)ncpu;
         dispatch_apply(4, DISPATCH_APPLY_AUTO, ^(size_t idx) {
-            nebula_r98_set_thread_qos(R98_QOS_USER_INITIATED, "extract");
+            /* [R98b] 不再给 dispatch worker 逐任务抬 QoS：R98 真机 4 次
+               rc=22(EINVAL) 全失败（worker 线程不允许 self 提升），纯无效调用；
+               准备阶段 QoS 已由 boot_thread 的 pthread attr 抬档覆盖。 */
             switch (idx) {
                 case 0: {
                     int n = nebula_blob_extract_dir_checked("interop/", d_interop);
@@ -3530,6 +3556,7 @@ static void *boot_thread_impl(void *arg) {
        必须在 capture 之后：心跳用 printf，早于此写不进 nebula_host.txt。 */
     g_r97b_stage = R97B_ST_BOOT;
     nebula_r97b_heartbeat_start();
+    printf("[r98b][boot] ===== R98b：R98 抢跑已证「Unity 不放行」，改 2000ms 窗口修 #162 il2cpp cctor 崩 =====\n");
     printf("[r98][boot] ===== R98：抢主队列 + QoS 抬档 + 多核准备 + 品牌页双闸门 =====\n");
     printf("[r98][boot] 在线核数=%d（运行时探测，不写死 8 核）；阶段A 4000->0ms，阶段B 1500->0ms\n",
            nebula_r98_cpu_count());
@@ -3804,9 +3831,12 @@ static void *boot_thread(void *arg) {
  * ==========================================================================*/
 static int64_t nebula_r56_delay_ms(void) {
     const char *e = getenv("NEBULA_EXEC_DELAY_MS");
-    /* [R98] 默认 0：R97b 的 4000ms 是 Unity 放行后才慢慢派发 Start/Execute 的元凶。
-       设 NEBULA_EXEC_DELAY_MS=4000 可完整回退 R97b 时序做对照。 */
-    if (!e || !*e) return 0;
+    /* [R98b] 默认 2000ms：R98 的 0ms 抢跑成功阻止了 Unity 放行，但把 Unity
+       掐死在启动早期，#162 反射触发的 il2cpp .cctor 崩在 UnityFramework 内。
+       给 Unity 2s 完成到「Begin async loading MainMenu」(il2cpp 类型注册完)，
+       又远小于 R97b 实测的 ~7s 异步加载窗口 -> 仍赶在放行前占住主线程。
+       NEBULA_EXEC_DELAY_MS=0 回退 R98 全抢跑；=4000 回退 R97b。 */
+    if (!e || !*e) return 2000;
     long v = strtol(e, NULL, 10);
     if (v < 0) v = 0;
     if (v > 60000) v = 60000;
@@ -4285,6 +4315,8 @@ static void boot(void) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)nebula_r56_delay_ms() * NSEC_PER_MSEC),
                            dispatch_get_main_queue(), ^{
                 nebula_r98_set_thread_qos(R98_QOS_USER_INTERACTIVE, "phaseA/Start");
+                printf("[r98b][window] 阶段A 延迟=%lldms：Unity 初始化窗口已给（il2cpp 类型注册），随后立刻占住主线程不放行\n",
+                       (long long)nebula_r56_delay_ms());
                 mono_thread_attach(g_boot_domain);
                 /* [R72] 阶段A：跑 Start()（Doorstop→Preloader→IL2CPPChainloader.Initialize）。
                    此刻 dobby 的 dllmap 故意【没挂】→ DobbyDetour.PrepareImpl 抛
