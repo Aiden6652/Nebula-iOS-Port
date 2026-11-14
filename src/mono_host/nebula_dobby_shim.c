@@ -2,64 +2,52 @@
  * [R61] BepInEx6 IL2CPP 原生 detour 桥接 shim
  * --------------------------------------------------
  * BepInEx6 的 BepInEx.Unity.IL2CPP.Hook.Dobby.DobbyDetour 走「两段式」API：
- *     DobbyPrepare(target, replace, &prepared) -> 分配 trampoline（prepared = 原函数指针）
+ *     DobbyPrepare(target, replace, &prepared) -> 分配 trampoline
  *     DobbyCommit(prepared)                    -> 真正把 detour 写入内存
  *     DobbyDestroy(address)                    -> 撤销
- * 但本仓库静态链的是上游 jmpews/dobby，它只有一次性 DobbyHook（prepare+commit 一起完成），
- * 根本没有 DobbyPrepare / DobbyCommit 这两个符号。于是 IL2CPPChainloader.Initialize
- * 在 DobbyDetour.PrepareImpl() 里 P/Invoke "DobbyPrepare" 时抛：
- *     System.EntryPointNotFoundException: DobbyPrepare
- * BepInEx 随即整个退出，游戏直接进原版、NOS 不加载（真机 preloader.log 实锤）。
- *
- * 语义对齐（BepInEx 调用顺序 = Prepare 紧跟 Commit，不会在中间调用 target）：
- *   - DobbyPrepare：直接 DobbyHook，hook 在此时写好；prepared 填 trampoline（调原函数用）。
- *   - DobbyCommit ：hook 已在 Prepare 写完，这里为空操作，返回 0（成功）。
- *   - DobbyDestroy：上游 dobby 已有，不再重复定义。
+ * 但本仓库静态链的是上游 jmpews/dobby，只有一次性 DobbyHook，
+ * 没有 DobbyPrepare / DobbyCommit 这两个符号，故由本 shim 包出。
  *
  * ============================================================================
- * [R95f] 方向纠偏：删掉 R95e 的 arm64e/PAC 整套误判，改成基于反汇编实证的修法
+ * [R96] 修掉 R95f 真机暴露的两个根因，目标：NOS 完成 PatchAll 并加载
  * ----------------------------------------------------------------------------
- * 用户实锤：AU = Among Us，是 arm64 上架包（Apple 不向第三方开放 arm64e ABI），
- *           NOS = Nebula on the Ship（模组）。设备上不存在 PAC 签名指针，
- *           也不存在 PACIASP / BTI / RETAA 指令。R95e 的 strip_pac() 与
- *           arm64e 序言白名单纯属无的放矢（永不命中），本版全部删除。
+ * R95f 真机日志（BUILD=f2122022399c）native stack：
+ *     libsystem_platform(memcpy) <- DobbyCodePatch <- DobbyDestroy
+ * managed: DobbyDetour.UndoImpl -> DobbyLib.Destroy(OriginalMethodPtr)
+ *          <- Undo <- Dispose <- Il2CppDetourMethodPatcher.DetourTo <- PatchAll
  *
- * 真机（R95d, BUILD=1e3e96df3587）崩溃的反汇编实证：
- *   日志 "Memory around native instruction pointer (0x107300cf8)" 首 4 字节
- *     17 01 40 b9  ->  0xB9400117  =  ldr w23, [x8]
- *   与 libdobby.a 内 InstructionRelocationARM64.cc.o 的
- *     relo_relocate +0x19c (0x1f4): b9400117  ldr w23, [x8]
- *   完全一致；紧邻的 0x1f0 为 f9400a68  ldr x8, [x19, #0x10]，
- *   即 x8 = ctx->buffer_cursor —— dobby 正在【读取被 hook 函数开头的 ARM64 指令】
- *   （GenRelocateCode 里 ctx.buffer = ctx.buffer_cursor = 目标函数地址）。
- *   调用链：DobbyPrepare -> DobbyHook -> InterceptRouting::GenerateRelocatedCode
- *           -> GenRelocateCodeAndBranch -> GenRelocateCode -> relo_relocate。
- *   由于 0x144 处的 GenRelocateCodeAndBranch 早于 0x348 处的 DobbyCodePatch，
- *   崩点在【写内存之前】，target 尚未被改坏，降级是安全的。
+ * 根因 1（致命）：本 shim 只接管 DobbyPrepare / DobbyCommit，没接管
+ *   DobbyDestroy。ikdasm 反编译 BepInEx.Unity.IL2CPP.dll 实锤：
+ *     .method UndoImpl(): ldarg.0; call get_OriginalMethodPtr();
+ *       call int32 DobbyLib::Destroy(native int)   // [DllImport("dobby")] "DobbyDestroy"
+ *   即 Destroy 的参数就是 target 地址，不是 handle。它命中 -force_load
+ *   全量链进来的上游 dobby.cpp.o::_DobbyDestroy，对「从未真正 hook 过」
+ *   的地址（R95f 降级产生的假 handle）或「已 hook 但 iOS 代码页不可写回」
+ *   的地址做 DobbyCodePatch(memcpy) -> SIGSEGV。
+ *   本版：接管 DobbyDestroy 为 no-op（游戏生命周期内 Harmony 不真撤销
+ *   detour），并让 build_ios.sh 把 dobby 归档展开成裸 .o 列表、排除
+ *   dobby.cpp.o，避免与上游强符号重复定义。llvm-nm 全量核验过归档内
+ *   没有任何其它 .o 引用 _DobbyDestroy / _DobbyGetVersion，排除安全。
  *
- *   结论：SIGSEGV 说明 target 指向的内存不可读（NULL / 低 4GB 野值 / 未映射页 /
- *   Il2CppInterop 没拿到 MethodPointer 的 stub），或 dobby 内部重定位状态异常。
- *   R95e 用 vm_read 读到了这个事实却只做 hexdump 打印、不参与判定，仍旧放行
- *   DobbyHook，所以必崩 —— 这是 R95e 的致命缺陷。
+ * 根因 2：R95f 的 vm_read 按 16KB 页首对齐、从 page 起始读 (off+want)，
+ *   跨到相邻 region 时把合法地址误判为不可读。真机 #35 0x1159540f0
+ *   (readT=1) 与 #36 0x115955d60 (readT=0) 相差仅 7KB，都在
+ *   UnityFramework __TEXT、dladdr 都能解析 —— 34/55 个合法 patch 被错杀。
+ *   本版直接从 addr 读 n 字节（Mach vm_read 的 address 参数无需页对齐，
+ *   内核自行处理跨页），消除假阴性。
  *
- * 本版做法（只改这一个 C 文件，保持单 dylib）：
- *   1) vm_read 从「纯诊断」提升为【硬判定】：读不到 target 前 32 字节（覆盖
- *      dobby origin->size 可能值）或 replace 前 8 字节，就直接降级；
- *      跨页时按页分段读，避免 "靠近页末 -> 误判不可读"。
- *   2) dladdr 降级为纯信息打印，不再当拒绝条件 —— JIT 生成的合法代码本就不在
- *      任何 Mach-O image 内，R95e 的 in_image 硬拒绝会误伤合法 patch。
- *   3) 低 4GB / 4 字节未对齐仍拦；**删除全部 PAC 清高位、arm64e 白名单**。
- *   4) 最后一道保险：用 sigsetjmp/siglongjmp + 临时 SIGSEGV/SIGBUS handler
- *      包住 DobbyHook。即便判断漏了、dobby 内部仍崩，也当场捕获并降级该
- *      patch，进程绝不崩；崩一次后熔断（dobby 可能留下半初始化状态），
- *      后续 patch 全降级。handler 退出窗口时转发给 mono 原有 handler，
- *      不破坏托管 NullReferenceException 转换。
- *   5) 降级一律 *prepared = target（trampoline = 原函数）。DetourTo 会把
- *      *prepared 写进 modifiedNativeMethodInfo.MethodPointer，留 0 会跳 NULL 崩。
- *   6) 逐 patch 打印序号 / target / replace / dladdr 归属 / 前 32 字节 hexdump /
- *      判定结果，每行 fflush。一次真机即可定位确切坏地址，下一版精准修。
+ * 附带：DobbyDestroy 变 no-op 后，Harmony 重打同方法时不会真撤销，
+ *   Prepare 可能对同一 target 二次 DobbyHook。加「已 hook 地址表」，
+ *   重复 target 直接复用首次生成的 trampoline，不二次 hook。
+ *   保留 R95f 的 SIGSEGV/SIGBUS 保护窗口 + 熔断，防止 dobby 内部
+ *   relo_relocate 之类崩溃拖垮进程。
  *
- * 结果：崩不了；能装的 patch 照常生效；日志给出所有判定依据。
+ * 架构前提（用户实锤，R95e 的 PAC 误判已彻底删除）：
+ *   AU = Among Us 是 arm64 上架包，进程内不存在 PAC / PACIASP / BTI / RETAA。
+ *   iPad M4 芯片兼容 arm64e 不代表本进程有 PAC 签名指针。
+ *   NOS = Nebula on the Ship。
+ *
+ * 保持单 dylib：只改这个 C 文件 + build_ios.sh 的 dobby 链接方式。
  */
 /* Linux 本地语法检查需要 _GNU_SOURCE 才暴露 Dl_info/dladdr；Darwin 无条件提供。 */
 #ifndef _GNU_SOURCE
@@ -90,35 +78,26 @@ int DobbyHook(void *address, void *replace_func, void **origin_func);
 #endif
 
 /* ---------------------------------------------------------------------------
- * 安全读：跨页按页分段 vm_read，绝不直接 deref。读满 n 字节才返回 1。
+ * 安全读：直接从 addr 读 n 字节，绝不直接 deref。
+ * [R96] 不再按 16KB 页首对齐、不再从 page 起始读 (off+want)——
+ *        Mach vm_read 的 address 参数无需页对齐，内核会处理跨页；
+ *        从页首读一大块反而会跨到相邻不可读 region，造成假阴性。
  * 非 __APPLE__ 分支仅用于本地 gcc 语法检查，不参与 iOS 构建。
  * ------------------------------------------------------------------------- */
-static int r95f_safe_read(void *addr, unsigned char *out, size_t n) {
+static int r96_safe_read(void *addr, unsigned char *out, size_t n) {
     if (!addr || !n) return 0;
 #ifdef __APPLE__
-    long ps = getpagesize();
-    if (ps <= 0) return 0;
-    size_t done = 0;
-    while (done < n) {
-        uintptr_t cur = (uintptr_t)addr + done;
-        uintptr_t page = cur & ~(uintptr_t)(ps - 1);
-        size_t off = (size_t)(cur - page);
-        size_t want = n - done;
-        size_t room = (size_t)ps - off;
-        if (want > room) want = room;
-
-        vm_offset_t data = 0;
-        mach_msg_type_number_t cnt = 0;
-        kern_return_t kr = vm_read(mach_task_self(), (vm_address_t)page,
-                                   (vm_size_t)(off + want), &data, &cnt);
-        if (kr != KERN_SUCCESS || cnt < (mach_msg_type_number_t)(off + want)) {
-            if (data) vm_deallocate(mach_task_self(), (vm_address_t)data, (vm_size_t)cnt);
-            return 0;
-        }
-        memcpy(out + done, (const void *)(uintptr_t)(data + off), want);
-        vm_deallocate(mach_task_self(), (vm_address_t)data, (vm_size_t)cnt);
-        done += want;
+    vm_offset_t data = 0;
+    mach_msg_type_number_t cnt = 0;
+    kern_return_t kr = vm_read(mach_task_self(),
+                               (vm_address_t)(uintptr_t)addr,
+                               (vm_size_t)n, &data, &cnt);
+    if (kr != KERN_SUCCESS || !data || cnt < (mach_msg_type_number_t)n) {
+        if (data) vm_deallocate(mach_task_self(), (vm_address_t)data, (vm_size_t)cnt);
+        return 0;
     }
+    memcpy(out, (const void *)(uintptr_t)data, n);
+    vm_deallocate(mach_task_self(), (vm_address_t)data, (vm_size_t)cnt);
     return 1;
 #else
     memcpy(out, addr, n);
@@ -127,7 +106,7 @@ static int r95f_safe_read(void *addr, unsigned char *out, size_t n) {
 }
 
 /* dladdr 只作取证打印。返回 image 名；不在任何 image 内返回 "(jit/none)"。 */
-static const char *r95f_image_of(void *p) {
+static const char *r96_image_of(void *p) {
     Dl_info info;
     memset(&info, 0, sizeof(info));
     if (p && dladdr(p, &info) != 0 && info.dli_fname) return info.dli_fname;
@@ -137,17 +116,17 @@ static const char *r95f_image_of(void *p) {
 /* ---------------------------------------------------------------------------
  * SIGSEGV / SIGBUS 保护窗口
  * ------------------------------------------------------------------------- */
-static sigjmp_buf   g_r95f_jmp;
-static volatile sig_atomic_t g_r95f_armed = 0;
-static struct sigaction g_r95f_old_segv, g_r95f_old_bus;
+static sigjmp_buf              g_r96_jmp;
+static volatile sig_atomic_t  g_r96_armed = 0;
+static struct sigaction       g_r96_old_segv, g_r96_old_bus;
 
-static void r95f_crash_handler(int sig, siginfo_t *si, void *uc) {
-    if (g_r95f_armed) {
-        g_r95f_armed = 0;
-        siglongjmp(g_r95f_jmp, 1);
+static void r96_crash_handler(int sig, siginfo_t *si, void *uc) {
+    if (g_r96_armed) {
+        g_r96_armed = 0;
+        siglongjmp(g_r96_jmp, 1);
     }
     /* 不在保护窗口内：原样转发给 mono 自己装的 handler，不吞异常 */
-    const struct sigaction *old = (sig == SIGBUS) ? &g_r95f_old_bus : &g_r95f_old_segv;
+    const struct sigaction *old = (sig == SIGBUS) ? &g_r96_old_bus : &g_r96_old_segv;
     if (old->sa_flags & SA_SIGINFO) {
         if (old->sa_sigaction) old->sa_sigaction(sig, si, uc);
     } else if (old->sa_handler == SIG_DFL) {
@@ -162,22 +141,53 @@ static void r95f_crash_handler(int sig, siginfo_t *si, void *uc) {
     }
 }
 
-static void r95f_guard_install(void) {
+static void r96_guard_install(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = r95f_crash_handler;
+    sa.sa_sigaction = r96_crash_handler;
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, &g_r95f_old_segv);
-    sigaction(SIGBUS,  &sa, &g_r95f_old_bus);
+    sigaction(SIGSEGV, &sa, &g_r96_old_segv);
+    sigaction(SIGBUS,  &sa, &g_r96_old_bus);
 }
 
-static void r95f_guard_restore(void) {
-    g_r95f_armed = 0;
-    sigaction(SIGSEGV, &g_r95f_old_segv, NULL);
-    sigaction(SIGBUS,  &g_r95f_old_bus,  NULL);
+static void r96_guard_restore(void) {
+    g_r96_armed = 0;
+    sigaction(SIGSEGV, &g_r96_old_segv, NULL);
+    sigaction(SIGBUS,  &g_r96_old_bus,  NULL);
 }
 
+/* ---------------------------------------------------------------------------
+ * [R96] 已 hook 地址表：DobbyDestroy 变 no-op 后，Harmony 重打同一方法
+ *   时不会真撤销，Prepare 可能收到重复 target。复用首次 trampoline，
+ *   避免对同一地址二次 DobbyHook（上游行为不确定，且 iOS 代码页反复写危险）。
+ * ------------------------------------------------------------------------- */
+#define R96_MAX_HOOKS 1024
+typedef struct { void *target; void *trampoline; } r96_hook_t;
+static r96_hook_t g_r96_hooks[R96_MAX_HOOKS];
+static unsigned   g_r96_hook_n = 0;
+
+static int r96_lookup(void *target, void **trampoline) {
+    for (unsigned i = 0; i < g_r96_hook_n; i++) {
+        if (g_r96_hooks[i].target == target) {
+            *trampoline = g_r96_hooks[i].trampoline;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void r96_remember(void *target, void *trampoline) {
+    if (g_r96_hook_n < R96_MAX_HOOKS) {
+        g_r96_hooks[g_r96_hook_n].target     = target;
+        g_r96_hooks[g_r96_hook_n].trampoline = trampoline;
+        g_r96_hook_n++;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * DobbyPrepare：核心判定 + 真 hook（带信号兜底）
+ * ------------------------------------------------------------------------- */
 __attribute__((visibility("default")))
 int DobbyPrepare(void *target, void *replace, void **prepared) {
     static unsigned seq = 0;
@@ -185,7 +195,7 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     seq++;
 
     if (seq == 1)
-        printf("[host][r95f] ===== R95f：arm64 实证版（删 PAC 误判 / vm_read 硬判定 / SIGSEGV 兜底）=====\n");
+        printf("[host][r96] ===== R96：接管 DobbyDestroy(no-op) / 修 vm_read 页对齐误判 / 复用 trampoline =====\n");
 
     unsigned long long t = (unsigned long long)(uintptr_t)target;
     unsigned long long r = (unsigned long long)(uintptr_t)replace;
@@ -193,23 +203,33 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     /* 绝对兜底：trampoline = 原函数（不 patch 也不崩）。 */
     if (prepared) *prepared = target;
 
+    /* —— 重复 target：复用首次 trampoline，不二次 hook —— */
+    void *saved_tramp = NULL;
+    if (r96_lookup(target, &saved_tramp)) {
+        if (prepared) *prepared = saved_tramp;
+        printf("[r96][dob] #%u target=0x%llx 复用 trampoline=0x%llx（Destroy 已 no-op，不二次 hook）\n",
+               seq, t, (unsigned long long)(uintptr_t)saved_tramp);
+        fflush(stdout);
+        return 0;
+    }
+
     /* —— 取证：安全读 target 32B / replace 8B —— */
     unsigned char head[32], rhead[8];
     memset(head, 0, sizeof(head));
     memset(rhead, 0, sizeof(rhead));
-    int got_target  = r95f_safe_read(target,  head,  sizeof(head));
-    int got_replace = r95f_safe_read(replace, rhead, sizeof(rhead));
+    int got_target  = r96_safe_read(target,  head,  sizeof(head));
+    int got_replace = r96_safe_read(replace, rhead, sizeof(rhead));
 
-    const char *tn = r95f_image_of(target);
-    const char *rn = r95f_image_of(replace);
+    const char *tn = r96_image_of(target);
+    const char *rn = r96_image_of(replace);
 
-    printf("[r95f][dob] #%u target=0x%llx [%s] replace=0x%llx [%s] "
+    printf("[r96][dob] #%u target=0x%llx [%s] replace=0x%llx [%s] "
            "readT=%d readR=%d\n",
            seq, t, tn, r, rn, got_target, got_replace);
     fflush(stdout);
 
     if (got_target) {
-        printf("[r95f][dob] #%u head=%02x%02x%02x%02x %02x%02x%02x%02x "
+        printf("[r96][dob] #%u head=%02x%02x%02x%02x %02x%02x%02x%02x "
                "%02x%02x%02x%02x %02x%02x%02x%02x "
                "%02x%02x%02x%02x %02x%02x%02x%02x "
                "%02x%02x%02x%02x %02x%02x%02x%02x\n",
@@ -219,52 +239,71 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
                head[16], head[17], head[18], head[19], head[20], head[21], head[22], head[23],
                head[24], head[25], head[26], head[27], head[28], head[29], head[30], head[31]);
     } else {
-        printf("[r95f][dob] #%u head=<vm_read 失败：目标地址不可读>\n", seq);
+        printf("[r96][dob] #%u head=<vm_read 失败：目标地址不可读>\n", seq);
     }
     fflush(stdout);
 
-    /* —— 硬判定（不再有 PAC 清高位、不再有 arm64e 白名单）—— */
-    int nullish  = (t < 0x100000000ull);            /* NULL / 低 4GB 非法区 */
-    int misalign = ((t & 3ull) != 0);               /* ARM64 指令须 4 字节对齐 */
-    int bad = (!got_target || !got_replace || nullish || misalign);
+    /* —— 判定（无 PAC 清高位、无 arm64e 白名单）——
+     * [R96] R95f 教训：vm_read 硬拒绝错杀了 34/55 个合法 patch，它们的 target
+     *   全部 dladdr 命中 UnityFramework __TEXT。iOS 上 __TEXT 代码页的
+     *   vm_read 存在保护/对齐层面的假阴性，不能作为唯一判据。
+     *   合法 = 不 nullish、不 misalign，且【可读 或 命中已知 Mach-O image】。
+     *   replace 是 Harmony/JIT 生成的委托指针，不 deref，仅打印不做拒绝条件。
+     *   万一放行到坏地址，下面还有 SIGSEGV 兜底 + 熔断保底，进程绝不崩。
+     */
+    int nullish   = (t < 0x100000000ull);           /* NULL / 低 4GB 非法区 */
+    int misalign  = ((t & 3ull) != 0);              /* ARM64 指令须 4 字节对齐 */
+    int in_image  = (strcmp(tn, "(jit/none)") != 0);/* target 命中已知 Mach-O image */
+    int addr_ok   = (got_target || in_image);
+    int bad       = (nullish || misalign || !addr_ok);
 
     if (tripped) {
-        printf("[r95f][dob] #%u 熔断降级：dobby 已崩过一次，后续 patch 全部静默失效（进程不崩）\n", seq);
+        printf("[r96][dob] #%u 熔断降级：dobby 已崩过一次，后续 patch 全部静默失效（进程不崩）\n", seq);
         fflush(stdout);
         return 0;
     }
     if (bad) {
-        printf("[r95f][dob] #%u 降级：readT=%d readR=%d nullish=%d misalign=%d "
+        printf("[r96][dob] #%u 降级：readT=%d readR=%d in_image=%d nullish=%d misalign=%d "
                "-> 不调 DobbyHook，*prepared=原函数\n",
-               seq, got_target, got_replace, nullish, misalign);
+               seq, got_target, got_replace, in_image, nullish, misalign);
         fflush(stdout);
-        return 0;   /* 返回码被 IL pop 丢弃；*prepared 已填好 */
+        return 0;
+    }
+    if (!got_target) {
+        printf("[r96][dob] #%u 放行：vm_read 假阴性但 dladdr 命中 [%s]，仍尝试 hook（信号兜底）\n",
+               seq, tn);
+        fflush(stdout);
     }
 
     /* —— 最后一道保险：把 DobbyHook 包在信号保护窗口里 —— */
-    r95f_guard_install();
+    r96_guard_install();
     int rc;
-    if (sigsetjmp(g_r95f_jmp, 1) == 0) {
-        g_r95f_armed = 1;
+    if (sigsetjmp(g_r96_jmp, 1) == 0) {
+        g_r96_armed = 1;
         rc = DobbyHook(target, replace, prepared);
-        r95f_guard_restore();
+        r96_guard_restore();
         if (rc != 0) {
-            printf("[r95f][dob] #%u DobbyHook rc=%d（失败）-> 兜底 *prepared=原函数\n", seq, rc);
+            printf("[r96][dob] #%u DobbyHook rc=%d（失败）-> 兜底 *prepared=原函数\n", seq, rc);
             fflush(stdout);
             if (prepared) *prepared = target;
         } else if (prepared && *prepared == NULL) {
-            printf("[r95f][dob] #%u DobbyHook 成功但 trampoline=NULL -> 兜底 *prepared=原函数\n", seq);
+            printf("[r96][dob] #%u DobbyHook 成功但 trampoline=NULL -> 兜底 *prepared=原函数\n", seq);
             fflush(stdout);
             *prepared = target;
+        } else {
+            r96_remember(target, prepared ? *prepared : NULL);
+            printf("[r96][dob] #%u DobbyHook 成功 trampoline=0x%llx（已登记，共 %u 个）\n",
+                   seq, (unsigned long long)(uintptr_t)(prepared ? *prepared : NULL), g_r96_hook_n);
+            fflush(stdout);
         }
         return rc;
     }
 
     /* siglongjmp 回来：dobby 内部崩了 */
-    r95f_guard_restore();
+    r96_guard_restore();
     tripped = 1;
     if (prepared) *prepared = target;
-    printf("[r95f][dob] #%u !! DobbyHook 内部 SIGSEGV/SIGBUS（target=0x%llx [%s] "
+    printf("[r96][dob] #%u !! DobbyHook 内部 SIGSEGV/SIGBUS（target=0x%llx [%s] "
            "head=%02x%02x%02x%02x）-> 该 patch 降级并熔断，进程不崩\n",
            seq, t, tn, head[0], head[1], head[2], head[3]);
     fflush(stdout);
@@ -275,4 +314,21 @@ __attribute__((visibility("default")))
 int DobbyCommit(void *prepared) {
     (void)prepared;
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * [R96] 接管 DobbyDestroy —— 这是 R95f 崩溃的直接修法。
+ * BepInEx DobbyDetour.UndoImpl 会 P/Invoke Destroy(OriginalMethodPtr)，
+ * 上游实现会 DobbyCodePatch(memcpy) 写回代码页，在 iOS 上必崩
+ * （假 handle 找不到 entry / 代码签名页不可写）。游戏进程生命周期内
+ * Harmony 不需要真撤销 detour，no-op 是正确且唯一的稳妥语义。
+ * ------------------------------------------------------------------------- */
+__attribute__((visibility("default")))
+int DobbyDestroy(void *address) {
+    static unsigned dseq = 0;
+    dseq++;
+    printf("[r96][destroy] #%u address=0x%llx -> no-op（不写回代码页，进程内不撤销 detour）\n",
+           dseq, (unsigned long long)(uintptr_t)address);
+    fflush(stdout);
+    return 0;   /* 0 = 成功，BepInEx UndoImpl 直接 pop 丢弃 */
 }

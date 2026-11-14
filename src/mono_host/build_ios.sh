@@ -516,8 +516,37 @@ if [ ! -f "$DOBBY_A" ]; then
   echo "!! 缺 dobby/libdobby.a —— R60 无法修 DllNotFoundException: dobby" >&2
   exit 1
 fi
-# FORCE_DOBBY 恒有 1 个元素，永不为空 —— 避免在 bash 3.2 + set -u 下展开空数组。
-FORCE_DOBBY=("-Wl,-force_load,$DOBBY_A")
+
+# [R96] 关键修复：把 dobby 归档【展开成裸 .o 列表】再链入，而不是 -force_load 整包。
+#   原因：归档里 dobby.cpp.o 定义了上游 _DobbyDestroy / _DobbyGetVersion。
+#   BepInEx 的 DobbyDetour.UndoImpl -> DobbyLib.Destroy(OriginalMethodPtr) 会
+#   P/Invoke DobbyDestroy，命中这个上游实现后做 DobbyCodePatch(memcpy) 写回
+#   代码页，在 iOS 上 SIGSEGV（R95f 真机 native stack 实锤：memcpy <- DobbyCodePatch
+#   <- DobbyDestroy）。本版 shim 提供 no-op 的 DobbyDestroy，必须排除同名上游符号。
+#   llvm-nm 全量核验：归档内没有任何其它 .o 引用 _DobbyDestroy/_DobbyGetVersion，
+#   排除 dobby.cpp.o 安全、不会产生未定义符号。
+#   裸 .o 直接作为输入文件传给 clang = 无条件全量链入，与 -force_load 等价，
+#   且不依赖 ar 符号表重建（GNU ar 对 Mach-O 归档 ar d 会 malformed，展开法跨平台稳）。
+DOBBY_OBJ_DIR="$OUT/dobby_objs_r96"
+rm -rf "$DOBBY_OBJ_DIR"; mkdir -p "$DOBBY_OBJ_DIR"
+( cd "$DOBBY_OBJ_DIR" && ar x "$DOBBY_A" )
+if [ -f "$DOBBY_OBJ_DIR/dobby.cpp.o" ]; then
+  rm -f "$DOBBY_OBJ_DIR/dobby.cpp.o"
+  echo "    [R96] 已排除 dobby.cpp.o::_DobbyDestroy/_DobbyGetVersion（shim no-op 版接管）"
+else
+  echo "    [R96] ⚠ 归档内未找到 dobby.cpp.o，检查上游 DobbyDestroy 是否仍会冲突" >&2
+fi
+FORCE_DOBBY=()
+for o in "$DOBBY_OBJ_DIR"/*.o; do
+  [ -e "$o" ] || continue
+  FORCE_DOBBY+=("$o")
+done
+# FORCE_DOBBY 至少有 30+ 个 .o，永不为空 —— 避免 bash 3.2 + set -u 下展开空数组。
+if [ ${#FORCE_DOBBY[@]} -eq 0 ]; then
+  echo "!! [R96] dobby 归档展开后没有任何 .o，无法链接" >&2
+  exit 1
+fi
+echo "    [R96] dobby 裸 .o 链入: ${#FORCE_DOBBY[@]} 个目标文件"
 FORCE_NATIVE=()
 if [ ${#NATIVE_A[@]} -gt 0 ]; then
   for a in "${NATIVE_A[@]}"; do FORCE_NATIVE+=("-Wl,-force_load,$a"); done
@@ -633,6 +662,17 @@ esac
 case "$SYMS" in
   *DobbyPrepare*) echo "    ✓ DobbyPrepare/DobbyCommit（shim 已并入，BepInEx6 IL2CPP detour 可用）" ;;
   *) echo "    ✗ DobbyPrepare 缺失！nebula_dobby_shim.c 未链入主 dylib" >&2; exit 1 ;;
+esac
+# [R96] UndoImpl 会 P/Invoke DobbyDestroy；必须是 shim 的 no-op 版（导出表命中），
+# 且上游 dobby.cpp.o::_DobbyGetVersion 必须已排除，否则会 duplicate symbol 或
+# 命中上游 DobbyDestroy -> DobbyCodePatch(memcpy) 写回代码页 SIGSEGV。
+case "$SYMS" in
+  *DobbyDestroy*) echo "    ✓ DobbyDestroy（R96 shim no-op 版已接管，UndoImpl 不再写回代码页）" ;;
+  *) echo "    ✗ DobbyDestroy 缺失！UndoImpl 会 P/Invoke 落空或命中上游崩" >&2; exit 1 ;;
+esac
+case "$SYMS" in
+  *DobbyGetVersion*) echo "    ⚠ 上游 dobby.cpp.o 可能仍被链入（DobbyGetVersion 在导出表），检查 DobbyDestroy 是否被覆盖" >&2 ;;
+  *) echo "    ✓ 上游 dobby.cpp.o 已排除（无 DobbyGetVersion）" ;;
 esac
 # [R60] 静态链 CoreLib shim 的证明（blob-fallback 模式不要求主 dylib 含 SystemNative_*）
 if [ "$R60_SHIM_MODE" = "static" ]; then
