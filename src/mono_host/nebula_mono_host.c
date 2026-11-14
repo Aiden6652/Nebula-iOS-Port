@@ -113,6 +113,85 @@ typedef void *os_log_t;
 #define os_log_create(...) NULL
 #endif
 
+/* ==========================================================================
+ * [R98] 时序抢跑 / QoS 抬档 / 多核准备
+ * --------------------------------------------------------------------------
+ * R97b 真机（BUILD=bd8ec3abe30f-20261114）心跳 + Unity 绝对时间戳对齐结论：
+ *   Unity  14:47:28.922 "Begin async loading MainMenu"（心跳 t≈3.9s）
+ *   Unity  14:47:35.892 MainMenuManager.RunStartUp（心跳 t≈10.9s）
+ *   宿主   阶段A Start 在 t≈6~9s、阶段B Execute 在 t≈11s、首个 patch t≈16s、
+ *          t≈26s 才到 #79 —— NOS 自带的 Nebula.Patches.LoadPatch（patch
+ *          SplashManager.Update，动画后 CoLoadNebula -> AllowFinishLoadingScene）
+ *          根本没机会装上，Unity 已在动画期间自行放行到原版主菜单。
+ *
+ * R98 做三件事（不改任何崩溃判定、不动托管 DLL、仍是单 dylib）：
+ *   ① 阶段A 死等 4000ms -> 0、阶段B 死等 1500ms -> 0，抢主队列让
+ *      LoadPatch 尽量赶在 SplashManager.Update 之前装好；放行交给 NOS 原生闸门。
+ *   ② QoS：把 boot 准备线程抬到 USER_INITIATED，把跑 Start/PatchAll 的主线程
+ *      抬到 USER_INTERACTIVE —— 用户点名的「iOS 把普通 App 任务扔小核」问题。
+ *      Harmony patch 仍严格主队列单线程（顺序依赖 + 共享 detour 表 + 改同一代码页，
+ *      绝不能并行），只抬 QoS 不并行。
+ *   ③ 准备阶段（4 个互不重叠目录的 blob 释放）并行 + 运行时探测核数，
+ *      绝不写死 8 核（M4 是 8 核，别的设备不是）。
+ *
+ * 全部带一键回退：NEBULA_R98_PARALLEL=0 / NEBULA_R98_QOS=0 /
+ *   NEBULA_EXEC_DELAY_MS=4000 / NEBULA_R98_PHASE_B_DELAY_MS=1500 可退回 R97b 时序。
+ * Apple QoS API 一律 dlsym 取，不依赖特定 SDK 头/链接符号，避免交叉编译挂掉。
+ * ========================================================================== */
+/* Darwin <sys/qos.h> 的稳定枚举值（ABI 固定，不用 include 具体 SDK 头） */
+#define R98_QOS_USER_INTERACTIVE 0x21
+#define R98_QOS_USER_INITIATED   0x1F
+
+static int nebula_r98_env_on(const char *name) {
+    const char *e = getenv(name);
+    return (!e || !*e) ? 1 : (strcmp(e, "0") != 0);
+}
+
+/* 运行时在线核数，运行时探测；失败回退 1，上限 16（只用于并发度参考）。 */
+static int nebula_r98_cpu_count(void) {
+    long v = sysconf(_SC_NPROCESSORS_ONLN);
+    int n = (v > 0) ? (int)v : 1;
+    if (n < 1) n = 1;
+    if (n > 16) n = 16;
+    return n;
+}
+
+/* 把当前线程抬到指定 QoS。dlsym 找不到就静默跳过，绝不影响运行。 */
+static void nebula_r98_set_thread_qos(unsigned int qos, const char *tag) {
+#if defined(__APPLE__)
+    if (!nebula_r98_env_on("NEBULA_R98_QOS")) return;
+    typedef int (*fn_t)(unsigned int, int);
+    static fn_t f = NULL;
+    static int probed = 0;
+    if (!probed) {
+        f = (fn_t)(void *)dlsym(RTLD_DEFAULT, "pthread_set_qos_class_self_np");
+        probed = 1;
+    }
+    if (!f) return;
+    int rc = f(qos, 0);
+    printf("[r98][qos] %s -> %s rc=%d\n", tag,
+           qos == R98_QOS_USER_INTERACTIVE ? "USER_INTERACTIVE(大核)" : "USER_INITIATED(准备)", rc);
+#else
+    (void)qos; (void)tag;
+#endif
+}
+
+static void nebula_r98_boost_attr_qos(pthread_attr_t *attr) {
+#if defined(__APPLE__)
+    if (!nebula_r98_env_on("NEBULA_R98_QOS")) return;
+    typedef int (*fn_t)(pthread_attr_t *, unsigned int, int);
+    static fn_t f = NULL;
+    static int probed = 0;
+    if (!probed) {
+        f = (fn_t)(void *)dlsym(RTLD_DEFAULT, "pthread_attr_set_qos_class_np");
+        probed = 1;
+    }
+    if (f) (void)f(attr, R98_QOS_USER_INITIATED, 0);
+#else
+    (void)attr;
+#endif
+}
+
 // ---------------------------------------------------------------- 嵌入式 BCL/BepInEx blob
 //
 // 构建期把 BCL(.NET 8 基础类库, 171 个程序集) + BepInEx/core 托管 dll 打成一个 NBL1 blob，
@@ -1052,16 +1131,50 @@ static const char *nebula_r60_self_path(void) {
     「表面上一个 dylib，启动自动在内存里分裂回来」。 */
 static void nebula_r60_extract_bundle(const char *root) {
     if (!g_n) return;
-    char dest[PATH_MAX];
     /* [R86] 释放目标一律是可写 Documents。以前还额外投了一份到只读 root(.app)，
        R85 日志第 30 行 "预生成 interop -> .../AmongUs.app/BepInEx/interop 本次新写 0"
        实锤那是纯无效功（bundle 只读，写不进），且正是用户反感的「在 .app 里创建」。
        游戏本体数据仍从 .app 只读探测（nebula_fix_il2cpp_paths），两者不冲突。 */
     const char *doc = nebula_doc_root(root);
+    /* [R98] 4 个目标目录互不重叠、g_entries 只读、neb_mkdir_p 对 EEXIST 容错 =>
+       这 4 个释放任务可安全并行。路径用静态数组，block 直接引用（不捕获局部数组）。 */
+    static char d_interop[PATH_MAX], d_native[PATH_MAX], d_core[PATH_MAX], d_plugins[PATH_MAX];
+    snprintf(d_interop, sizeof(d_interop), "%s/BepInEx/interop", doc);
+    snprintf(d_native,  sizeof(d_native),  "%s/nebula_native", doc);
+    snprintf(d_core,    sizeof(d_core),    "%s/BepInEx/core", doc);
+    snprintf(d_plugins, sizeof(d_plugins), "%s/BepInEx/plugins", doc);
 
+#if defined(__APPLE__)
+    if (nebula_r98_env_on("NEBULA_R98_PARALLEL")) {
+        int ncpu = nebula_r98_cpu_count();   /* 运行时探测，绝不写死 8 核 */
+        printf("[r98][par] 在线核数(运行时)=%d；4 个释放任务并行(dispatch_apply/AUTO) + QoS 抬档\n", ncpu);
+        (void)ncpu;
+        dispatch_apply(4, DISPATCH_APPLY_AUTO, ^(size_t idx) {
+            nebula_r98_set_thread_qos(R98_QOS_USER_INITIATED, "extract");
+            switch (idx) {
+                case 0: {
+                    int n = nebula_blob_extract_dir_checked("interop/", d_interop);
+                    printf("[host][r91] 预生成 interop -> %s（本次新写 %d，指纹一致则跳过）\n", d_interop, n);
+                    break;
+                }
+                case 1: {
+                    int n = nebula_blob_extract_dir("native/", d_native);
+                    printf("[host][r60] native shim fallback -> %s（本次新写 %d）\n", d_native, n);
+                    break;
+                }
+                case 2: nebula_blob_extract_cecil_refs(d_core); break;   /* [R80] Cecil 参考程序集 */
+                case 3: nebula_blob_extract_plugins(d_plugins); break;    /* [R82] 滑动插件 */
+            }
+        });
+        return;
+    }
+    printf("[r98][par] NEBULA_R98_PARALLEL=0：回退 R97b 顺序释放\n");
+#endif
+    char dest[PATH_MAX];
+    int n;
     snprintf(dest, sizeof(dest), "%s/BepInEx/interop", doc);
     /* [R91] 改用内容指纹释放：换包后不再因「大小相同」而复用设备端过期 interop dll */
-    int n = nebula_blob_extract_dir_checked("interop/", dest);
+    n = nebula_blob_extract_dir_checked("interop/", dest);
     printf("[host][r91] 预生成 interop -> %s（本次新写 %d，指纹一致则跳过）\n", dest, n);
 
     // native shim 只投可写目录
@@ -3417,6 +3530,9 @@ static void *boot_thread_impl(void *arg) {
        必须在 capture 之后：心跳用 printf，早于此写不进 nebula_host.txt。 */
     g_r97b_stage = R97B_ST_BOOT;
     nebula_r97b_heartbeat_start();
+    printf("[r98][boot] ===== R98：抢主队列 + QoS 抬档 + 多核准备 + 品牌页双闸门 =====\n");
+    printf("[r98][boot] 在线核数=%d（运行时探测，不写死 8 核）；阶段A 4000->0ms，阶段B 1500->0ms\n",
+           nebula_r98_cpu_count());
 
     // [R73] 启动画面：无条件强制播放 "AUI Mod Loader by Aiden" 满 5 秒（原 R60 = 3s）。
     //   ① 不再是「正在生成interop」占位 —— R60 设备端永不生成 interop，那个文案会误导；
@@ -3688,7 +3804,9 @@ static void *boot_thread(void *arg) {
  * ==========================================================================*/
 static int64_t nebula_r56_delay_ms(void) {
     const char *e = getenv("NEBULA_EXEC_DELAY_MS");
-    if (!e || !*e) return 4000;
+    /* [R98] 默认 0：R97b 的 4000ms 是 Unity 放行后才慢慢派发 Start/Execute 的元凶。
+       设 NEBULA_EXEC_DELAY_MS=4000 可完整回退 R97b 时序做对照。 */
+    if (!e || !*e) return 0;
     long v = strtol(e, NULL, 10);
     if (v < 0) v = 0;
     if (v > 60000) v = 60000;
@@ -4079,6 +4197,12 @@ static void nebula_r56_invoke_manual_execute(void) {
     } else {
         printf("[host][r56] mono_runtime_invoke 返回（无托管异常）；插件加载结果看 LogOutput.log 的 [r56] 行\n");
     }
+    /* [R98] NebulaManualExecute 返回 == PatchAll（含 NOS 的 LoadPatch）全部装完。
+       这才是放行信号：品牌页双闸门 = 最短展示时长 + 本信号，二者齐备才淡出，
+       绝不在 patch 途中放行到原版主菜单画面。 */
+    printf("[r98][gate] PatchAll 完成 seq=%u ok=%u down=%u，发出 NOS 就绪信号\n",
+           g_r97b_patch_seq, g_r97b_patch_ok, g_r97b_patch_down);
+    nebula_signal_ready();
     printf("[host][r56] ===== Unity 主线程触发结束 =====\n");
     fflush(NULL);
 }
@@ -4120,6 +4244,7 @@ static void boot(void) {
     {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
+        nebula_r98_boost_attr_qos(&attr);   /* [R98] 准备阶段抬到 USER_INITIATED，别被扔小核 */
         // [R66] 裸 pthread 默认栈仅 ~512KB，mono JIT 递归编译（mono_method_to_ir 等）
         // 极易栈溢出 / 踩坏 GC 栈扫描边界。放大到 8MB（标准主线程量级）规避。
         if (pthread_attr_setstacksize(&attr, 8 * 1024 * 1024) == 0) {
@@ -4159,6 +4284,7 @@ static void boot(void) {
             extern void mono_thread_attach(MonoDomain *d);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)nebula_r56_delay_ms() * NSEC_PER_MSEC),
                            dispatch_get_main_queue(), ^{
+                nebula_r98_set_thread_qos(R98_QOS_USER_INTERACTIVE, "phaseA/Start");
                 mono_thread_attach(g_boot_domain);
                 /* [R72] 阶段A：跑 Start()（Doorstop→Preloader→IL2CPPChainloader.Initialize）。
                    此刻 dobby 的 dllmap 故意【没挂】→ DobbyDetour.PrepareImpl 抛
@@ -4193,8 +4319,16 @@ static void boot(void) {
                    Il2CppInterop 若需要 detour 能装上。用户方案：dobby 只在装插件阶段可用，
                    从最脆弱的 Initialize 阶段挪开。装插件走 R56 的纯 managed
                    NebulaManualExecute（PreloadInteropAssemblies + Execute 扫 plugins 加载 NOS）。 */
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC),
+                /* [R98] 阶段B 死等 1500ms -> 0，让 NebulaManualExecute（含 NOS 的
+                   LoadPatch）尽可能赶在 SplashManager.Update 放行之前装上。
+                   NEBULA_R98_PHASE_B_DELAY_MS=1500 可回退 R97b 时序。 */
+                int64_t bdelay = 0;
+                const char *be = getenv("NEBULA_R98_PHASE_B_DELAY_MS");
+                if (be && *be) { long bv = strtol(be, NULL, 10); if (bv > 0) bdelay = (int64_t)bv; }
+                printf("[r98][timing] 阶段B 延迟=%lldms（R97b 为 1500ms）；Execute 立即抢主线程\n", (long long)bdelay);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, bdelay * NSEC_PER_MSEC),
                                dispatch_get_main_queue(), ^{
+                    nebula_r98_set_thread_qos(R98_QOS_USER_INTERACTIVE, "phaseB/PatchAll");
                     nebula_enable_dobby_dllmap();           // 手动启动 dobby
                     g_r56_domain = g_boot_domain;           // 手动 Execute 依赖（boot_bepinex 已设 g_r56_il2cpp_img）
                     hlog("[host][r72] 阶段B: dobby 已手动启动 + g_r56_domain 已登记，开始扫 plugins 装 NOS");

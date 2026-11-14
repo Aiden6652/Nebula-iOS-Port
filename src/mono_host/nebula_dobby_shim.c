@@ -59,6 +59,14 @@
  *     + 降级原因/异常仍单条打印（不打 32B hexdump）。判定结果完全不变。
  *
  * 保持单 dylib：只改这个 C 文件；build_ios.sh 沿用 R96b，不动链接方式。
+ *
+ * ============================================================================
+ * [R98] 唯一改动：砍逐 patch 的 dladdr / 取证 IO（判定逻辑一行不动）
+ * ----------------------------------------------------------------------------
+ * R97 判定（vm_read 硬门槛 / DobbyDestroy no-op / hook 表复用）真机已证实「不崩」，
+ * 本版绝不碰。只做加速：R97b 每个 patch 无条件调 2 次 dladdr（带 dyld 锁），
+ * 202 个 patch 累计 400+ 次；成功路径根本用不到 image 名。改为仅在「降级」
+ * 与「每 32 个汇总」时才取证，并给汇总加累计耗时，真机可直接对比 patch 速度。
  */
 /* Linux 本地语法检查需要 _GNU_SOURCE 才暴露 Dl_info/dladdr；Darwin 无条件提供。 */
 #ifndef _GNU_SOURCE
@@ -69,6 +77,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <dlfcn.h>               /* dladdr：仅用于打印归属 image，不参与判定 */
+#include <sys/time.h>            /* [R98] gettimeofday：每 32 个 patch 打印累计耗时 */
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/vm_map.h>
@@ -162,13 +171,17 @@ static void r97_remember(void *target, void *trampoline) {
 __attribute__((visibility("default")))
 int DobbyPrepare(void *target, void *replace, void **prepared) {
     static unsigned seq = 0;
+    static struct timeval r98_t0;
     seq++;
 
     /* [R97b] 每个 patch 都推进心跳看到的序号 —— 这是「是否在加载」的数据源。 */
     g_r97b_patch_seq = seq;
 
-    if (seq == 1)
+    if (seq == 1) {
+        gettimeofday(&r98_t0, NULL);
+        printf("[host][r98] ===== R98：判定沿用 R97（vm_read 硬门槛），砍逐 patch dladdr/取证 IO，主线程 QoS 抬档 =====\n");
         printf("[host][r97b] ===== R97b：vm_read 硬门槛（R97 判定不变）/ 共享进度计数 / 日志节流去 fflush =====\n");
+    }
 
     unsigned long long t = (unsigned long long)(uintptr_t)target;
     unsigned long long r = (unsigned long long)(uintptr_t)replace;
@@ -191,8 +204,7 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     int got_target  = r97_safe_read(target,  head,  sizeof(head));
     int got_replace = r97_safe_read(replace, rhead, sizeof(rhead));
 
-    const char *tn = r97_image_of(target);
-    const char *rn = r97_image_of(replace);
+    /* [R98] 成功路径不再逐 patch 做 2 次 dladdr（带 dyld 锁）；只在降级/汇总时取证。 */
 
     /* —— 硬门槛（R97：不再有 dladdr/in_image 放行、不再有 PAC 相关判定）——
      * R96b 真机实锤：readT=0 的地址（#9）进 DobbyHook 必崩在 relo_relocate。
@@ -211,8 +223,8 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     if (nullish || misalign || !got_target || garbage) {
         g_r97b_patch_down++;
         /* 降级原因保留单条（无 fflush），供真机定位坏地址来源 */
-        printf("[r97b][dob] #%u 降级 target=0x%llx [%s] readT=%d nullish=%d misalign=%d garbage=%d\n",
-               seq, t, tn, got_target, nullish, misalign, garbage);
+        printf("[r98][dob] #%u 降级 target=0x%llx [%s] readT=%d nullish=%d misalign=%d garbage=%d\n",
+               seq, t, r97_image_of(target), got_target, nullish, misalign, garbage);
         return 0;
     }
 
@@ -233,10 +245,13 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     /* [R97b] 每 32 个 patch 一条汇总（替代 R97 每个 patch 2~3 次同步 fflush）。
        心跳线程另有独立的 1s stdout 刷新，日志不会因节流而看不到进展。 */
     if ((seq % 32u) == 0u) {
-        printf("[r97b][dob] --- 进度 seq=%u ok=%u down=%u hooks=%u "
+        struct timeval now; gettimeofday(&now, NULL);
+        double ms = (double)(now.tv_sec - r98_t0.tv_sec) * 1000.0
+                  + (double)(now.tv_usec - r98_t0.tv_usec) / 1000.0;
+        printf("[r98][dob] --- 进度 seq=%u ok=%u down=%u hooks=%u 累计=%.0fms "
                "last_target=0x%llx [%s] replace=0x%llx [%s] readR=%d ---\n",
-               seq, g_r97b_patch_ok, g_r97b_patch_down, g_r97_hook_n,
-               t, tn, r, rn, got_replace);
+               seq, g_r97b_patch_ok, g_r97b_patch_down, g_r97_hook_n, ms,
+               t, r97_image_of(target), r, r97_image_of(replace), got_replace);
     }
     return rc;
 }
