@@ -143,6 +143,30 @@
  *   那一刻：类型已注册(#162 不崩)、sceneLoaded 尚未触发；冻结期间不并发；
  *   PatchAll 里注册好回调，主线程交还后 Unity 完成场景加载 ->
  *   sceneLoaded 触发 -> NOS 加载链自然接上。
+ *
+ * ============================================================================
+ * [R100] 用户放开额度到 R110，但加两条硬红线
+ * ----------------------------------------------------------------------------
+ * R99b 真机（BUILD=e8223bac6c89）：并没有「越过 #162」，日志 1398 行有
+ *   Native Crash Reporting + SIGSEGV，栈是 RunClassConstructor /
+ *   mono_runtime_class_init_full，和 R98/R98b 同一个 il2cpp cctor；
+ *   只是 mono 崩溃处理器没杀掉进程，主线程挂住（心跳 idle 涨到 127518ms），
+ *   看起来像「没崩卡死」。闸门打印「等待 0ms」= Unity 信号在闸门启动前
+ *   就到了（迟到命中），闸门形同虚设。
+ *
+ * 用户定论：降级 = 用原版，且「所有 patch 不能跳过不能降级」。
+ * 逐行统计两版真机：R97b 86 真 hook / 112 降级，R99b 74 / 84，
+ * 降级 100% 是 readT=0（vm_read 读不到 target 32B），地址全合法。
+ * 超过一半 Harmony patch 是原版 —— 这才是 NOS 一直加载不起来的根因，
+ * 之前 R98~R99b 全在调放行时机 / 信号闸门 / 分时让出，方向偏了。
+ *
+ * 用户给的钥匙：进程有调试 JIT 权限，探测/写入阶段可临时改页保护，
+ *   「执行的时候翻转回来就行」。
+ * 用户追加纠正（本轮）：「不能在 RWX 页上 X 会被 TMX 整爆炸」——
+ *   TXM/SPTM 的 W^X 是硬件强制，W+X 同时置位的映射上一执行就违规。
+ *   => 绝不出现 RWX 第三态：写态 READ|WRITE（无 X，COW 私有副本）只包住
+ *      一次 memcpy 读指令，随即 READ|EXECUTE（无 W）+ 刷 icache，然后才轮到
+ *      DobbyHook —— 即「执行的时候翻转回来」在 Dobby 之前就完成。详见 r100_make_rw。
  * ========================================================================== */
 /* Linux 本地语法检查需要 _GNU_SOURCE 才暴露 Dl_info/dladdr；Darwin 无条件提供。 */
 #ifndef _GNU_SOURCE
@@ -158,6 +182,10 @@
 #include <CoreFoundation/CoreFoundation.h>  /* [R99] CFRunLoopRunInMode：分时让出主线程 */
 #include <mach/mach.h>
 #include <mach/vm_map.h>
+#include <mach/mach_vm.h>           /* [R100] mach_vm_region / mach_vm_protect */
+#include <mach/vm_region.h>         /* [R100] VM_REGION_BASIC_INFO_64 */
+#include <libkern/OSCacheControl.h> /* [R100] sys_icache_invalidate */
+#include <unistd.h>                /* [R100] getpagesize() */
 #endif
 
 #ifdef __cplusplus
@@ -258,6 +286,111 @@ static int r97_safe_read(void *addr, unsigned char *out, size_t n) {
 #endif
 }
 
+/* ===========================================================================
+ * [R100] 零降级核心：给代码页「补 READ」，全程无 W（用户两条硬红线）
+ * ---------------------------------------------------------------------------
+ * 红线① 所有 patch 必须真 hook，不跳过、不降级（不接受 *prepared=target 用原版顶替）。
+ * 红线② 绝不能让页出现 W+X 同时置位。Apple Silicon / iOS 的 TXM(Trusted
+ *   Execution Monitor) / SPTM 硬件强制 W^X：一个映射只要同时可写可执行，
+ *   在上面执行代码就被判违规炸掉。用户原话「不能在 RWX 页上 X 会被 TMX 整爆炸」。
+ *   => 上一版 r100_make_rwx 用了 READ|WRITE|EXECUTE|COPY，正好踩雷，已删除。
+ *
+ * 根因重新钉死（R96b #9 崩栈 + R99b 84 个 readT=0 统计）：
+ *   这些 target 全在 UnityFramework 的 __TEXT 代码页，4 对齐、地址合法，
+ *   vm_read 读不到 32B 指令；R96b 硬送 DobbyHook 崩在 relo_relocate 的
+ *   ldr —— 也就是 Dobby 内部【同样读不到原指令】。所以缺的是 READ 权限
+ *   （iOS 上签名代码页常是 --x / 无 R 的 COW 映射），不是 WRITE。
+ *   R97b 86 个真 hook 成功，证明「页可读时 Dobby 自己能改权限写 detour」。
+ *   => 正解：把该页补成 READ|EXECUTE（+ VM_PROT_COPY 走 COW 私有副本），
+ *      补完 vm_read / Dobby relo_relocate 都能读，Dobby 按已验证路径真 hook。
+ *      这一步从头到尾【没有 W】，TXM 完全没有触发条件。
+ *
+ * 三档（按安全性排序，前两档是纯 RX、永不产生 W+X）：
+ *   A 主路径  READ|EXECUTE|COPY  —— COW 私有副本 + 补 R，不碰签名共享页
+ *   B 退化    READ|EXECUTE       —— 内核不接受 COPY 时直接补 R
+ *   C 兜底    READ|WRITE（无 X，COPY 优先） —— 仅当 A/B 后 vm_read 仍读不到，
+ *             用一次 memcpy 读 32B，【立刻】r100_restore_rx 翻回严格 RX，
+ *             然后才调 DobbyHook。写态窗口 = 一次 memcpy，且无 X。
+ *
+ * 安全：
+ *   - 任何时刻都不存在 W+X 同时态：A/B 无 W；C 无 X；翻回后无 W。
+ *   - 只对 [target, target+32) 覆盖到的页改属性，不整段 region。
+ *   - 页大小运行时 getpagesize()，不写死 16384。
+ *   - VM_PROT_COPY 让本进程页表指向私有副本，进程内所有线程（含 Unity
+ *     worker）都看到同一副本，detour 生效；签名共享 __TEXT 不被写坏。
+ *   - 全部失败也不降级/不跳过：仍照常送 DobbyHook，由真机日志说话。
+ * ========================================================================= */
+static int r100_promote_rx(void *addr, size_t len,
+                           uint64_t *base, uint64_t *size_out, int *orig) {
+#ifdef __APPLE__
+    if (!addr || !base || !size_out || !orig) return 0;
+    mach_vm_address_t p = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_address_t q = p;
+    mach_vm_size_t   rsz = 0;
+    vm_region_basic_info_data_64_t info;
+    memset(&info, 0, sizeof(info));
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &q, &rsz,
+                        VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &cnt, &obj);
+    if (kr != KERN_SUCCESS || rsz == 0) return 0;
+    *orig = (int)info.protection;
+
+    long pg = (long)getpagesize();       /* iOS arm64 = 16384，运行时探测不写死 */
+    if (pg <= 0) pg = 16384;
+    mach_vm_address_t mask = (mach_vm_address_t)(pg - 1);
+    mach_vm_address_t start = p & ~mask;
+    mach_vm_address_t end   = (p + (mach_vm_address_t)len + mask) & ~mask;
+    if (end > q + rsz) end = q + rsz;    /* 不越出该 region */
+    if (end <= start) return 0;
+    *base = (uint64_t)start; *size_out = (uint64_t)(end - start);
+
+    /* A：COW 私有副本 + READ|EXECUTE。补 R、绝不加 W。 */
+    kr = mach_vm_protect(mach_task_self(), start, end - start, FALSE,
+             VM_PROT_READ | VM_PROT_EXECUTE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS)
+        /* B：内核不接受 COPY 时，直接把当前映射补 R（仍不加 W） */
+        kr = mach_vm_protect(mach_task_self(), start, end - start, FALSE,
+                 VM_PROT_READ | VM_PROT_EXECUTE);
+    return kr == KERN_SUCCESS;
+#else
+    (void)addr; (void)len; (void)base; (void)size_out; (void)orig;
+    return 0;
+#endif
+}
+
+/* C 档兜底：把页切到「无 X 写态」READ|WRITE，仅供一次 memcpy 读指令。
+   写态没有任何执行权限，因此即便 worker 撞上也不会触发 TXM 的 W+X 违规。 */
+static int r100_make_rw(uint64_t base, uint64_t size) {
+#ifdef __APPLE__
+    if (!base || !size) return 0;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)base,
+             (mach_vm_size_t)size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS)
+        kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)base,
+                 (mach_vm_size_t)size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    return kr == KERN_SUCCESS;
+#else
+    (void)base; (void)size;
+    return 0;
+#endif
+}
+
+/* 执行态：显式清 W、补 R+X，刷干净整段 icache 后再翻回。
+   绝不套用 orig（orig 可能 --x 无 R），而是重建严格 RX，杜绝任何路径留 W+X。 */
+static void r100_restore_rx(uint64_t base, uint64_t size) {
+#ifdef __APPLE__
+    if (!base || !size) return;
+    vm_prot_t rx = VM_PROT_READ | VM_PROT_EXECUTE;   /* 无 W，纯 RX */
+    sys_icache_invalidate((void *)(uintptr_t)base, (size_t)size);
+    mach_vm_protect(mach_task_self(), (mach_vm_address_t)base,
+                    (mach_vm_size_t)size, FALSE, rx);
+#else
+    (void)base; (void)size;
+#endif
+}
+
 /* dladdr 只作取证打印。返回 image 名；不在任何 image 内返回 "(jit/none)"。 */
 static const char *r97_image_of(void *p) {
     Dl_info info;
@@ -299,12 +432,12 @@ static void r97_remember(void *target, void *trampoline) {
  * ------------------------------------------------------------------------- */
 __attribute__((visibility("default")))
 int DobbyPrepare(void *target, void *replace, void **prepared) {
-    /* [R99] 让出期间 Unity 主循环若重入本函数：一律降级，绝不二次 patch、
-       绝不递归让出（Harmony patch 途中被 Unity 回调重入会破坏 detour 表）。 */
-    if (r99_yielding) {
-        if (prepared) *prepared = target;
-        return 0;
-    }
+    /* [R100] 零降级：重入也绝不 *prepared=target / 提前 return。
+       继续走下面的 r97_lookup（重复 target 复用真 trampoline，不会二次
+       DobbyHook）/ 真 hook 流程。R99 分时让出默认禁用，本分支实际不可达，
+       保留判断只为不破坏 A/B 对照开关。 */
+    if (r99_yielding)
+        printf("[r100][warn] DobbyPrepare 重入（让出已默认禁用，理论不可达）-> 仍走真 hook 流程，不降级\n");
     r99_cfg_init();
 
     static unsigned seq = 0;
@@ -331,6 +464,10 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
 
     if (seq == 1) {
         gettimeofday(&r98_t0, NULL);
+        printf("[r100][boot] ===== R100：零降级零跳过（补 READ 为主，全程无 W+X 同时态）=====\n");
+        printf("[r100][boot] 用户硬红线①：所有 patch 真 hook，不降级不跳过（版本额度放宽到 R110）\n");
+        printf("[r100][boot] 用户硬红线②：绝不在可写页上执行（W^X）；主路径把 --x 代码页补成纯 RX，兜底写态无 X 且立刻翻回\n");
+        printf("[r100][boot] 本版只改这一个变量：闸门时序沿用 R99b 不动（RunStartUp 真机计数=0，锚它已证伪），便于崩了干净归因\n");
         printf("[r99b][boot] ===== R99b：删分时让出(证伪) + 信号驱动闸门(等 BeginAsync 再冻结) =====\n");
         printf("[r99][boot] (R99 分时主线程已默认禁用，真机 seq=10 SIGBUS+double fault 证伪)\n");
         printf("[host][r98] ===== R98：判定沿用 R97（vm_read 硬门槛），砍逐 patch dladdr/取证 IO，主线程 QoS 抬档 =====\n");
@@ -340,59 +477,85 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     unsigned long long t = (unsigned long long)(uintptr_t)target;
     unsigned long long r = (unsigned long long)(uintptr_t)replace;
 
-    /* 绝对兜底：trampoline = 原函数（不 patch 也不崩）。 */
-    if (prepared) *prepared = target;
+    /* [R100] 零降级：兜底不再是「原函数」。trampoline 先置 NULL，
+       DobbyHook 成功才填真 trampoline；失败如实返回，绝不用原版顶替。 */
+    if (prepared) *prepared = NULL;
 
-    /* —— 重复 target：复用首次 trampoline，不二次 hook —— */
+    /* —— 重复 target：复用首次 trampoline（真 trampoline，非原版），不二次 hook —— */
     void *saved_tramp = NULL;
     if (r97_lookup(target, &saved_tramp)) {
         if (prepared) *prepared = saved_tramp;
-        /* 复用属正常路径，交给 32 步长汇总，不单独刷盘 */
         return 0;
     }
+
+    /* —— 参数合法性（仅诊断，绝不据此跳过；红线：所有 patch 不跳过）—— */
+    int nullish  = (t < 0x100000000ull);            /* NULL / 低 4GB 非法区 */
+    int misalign = ((t & 3ull) != 0);               /* ARM64 指令须 4 字节对齐 */
 
     /* —— 取证：安全读 target 32B / replace 8B —— */
     unsigned char head[32], rhead[8];
     memset(head, 0, sizeof(head));
     memset(rhead, 0, sizeof(rhead));
-    int got_target  = r97_safe_read(target,  head,  sizeof(head));
     int got_replace = r97_safe_read(replace, rhead, sizeof(rhead));
+    int got_target  = r97_safe_read(target,  head,  sizeof(head));
 
-    /* [R98] 成功路径不再逐 patch 做 2 次 dladdr（带 dyld 锁）；只在降级/汇总时取证。 */
+    /* [R100] 零降级：vm_read 读不到 ≠ 地址坏，是代码页缺 READ（--x）。
+       主路径 r100_promote_rx 把该页补成 READ|EXECUTE（+ COW 私有副本），
+       补完用 vm_read 重读；只有仍读不到才短暂切「无 X 写态」读一次并
+       【立刻】r100_restore_rx 翻回严格 RX。DobbyHook 之前页一定是 RX。 */
+    uint64_t r100_base = 0, r100_size = 0;
+    int      r100_orig = 0, r100_promoted = 0, r100_wstate = 0;
+    if (!got_target && !nullish && !misalign) {
+        r100_promoted = r100_promote_rx(target, sizeof(head),
+                                        &r100_base, &r100_size, &r100_orig);
+        if (r100_promoted)
+            got_target = r97_safe_read(target, head, sizeof(head));  /* 补 R 后重读 */
+        if (!got_target && r100_promoted && r100_make_rw(r100_base, r100_size)) {
+            /* C 档兜底：写态无 X，只做一次 memcpy，随即翻回严格 RX */
+            memcpy(head, target, sizeof(head));
+            r100_restore_rx(r100_base, r100_size);
+            got_target = 1;
+            r100_wstate = 1;
+        }
+        if ((seq % 16u) == 0u || seq < 4u)
+            printf("[r100][wx] #%u target=0x%llx 补RX=%d 无X写态=%d 读到指令=%d "
+                   "（页=0x%llx/%lluB 原prot=0x%x）-> %s\n",
+                   seq, t, r100_promoted, r100_wstate, got_target,
+                   (unsigned long long)r100_base, (unsigned long long)r100_size,
+                   (unsigned)r100_orig,
+                   got_target ? "真 hook" : "仍照常送 DobbyHook（不降级不跳过）");
+    }
 
-    /* —— 硬门槛（R97：不再有 dladdr/in_image 放行、不再有 PAC 相关判定）——
-     * R96b 真机实锤：readT=0 的地址（#9）进 DobbyHook 必崩在 relo_relocate。
-     * vm_read 能读满 32B == dobby 重定位所需指令可读（#1~#8 已真机验证安全）。
-     * 读不到 / NULL 低 4GB / 非 4 字节对齐 / 指令头全 0 或全 f（垃圾页）
-     * 一律降级，绝不调 DobbyHook。PatchAll 会继续走完，NOS 正常加载。
-     */
-    int nullish  = (t < 0x100000000ull);            /* NULL / 低 4GB 非法区 */
-    int misalign = ((t & 3ull) != 0);               /* ARM64 指令须 4 字节对齐 */
     uint32_t insn0 = (uint32_t)head[0]
                    | ((uint32_t)head[1] << 8)
                    | ((uint32_t)head[2] << 16)
                    | ((uint32_t)head[3] << 24);
     int garbage = got_target && (insn0 == 0u || insn0 == 0xffffffffu);
 
-    if (nullish || misalign || !got_target || garbage) {
-        g_r97b_patch_down++;
-        /* 降级原因保留单条（无 fflush），供真机定位坏地址来源 */
-        printf("[r98][dob] #%u 降级 target=0x%llx [%s] readT=%d nullish=%d misalign=%d garbage=%d\n",
-               seq, t, r97_image_of(target), got_target, nullish, misalign, garbage);
-        return 0;
-    }
+    /* 零跳过：物理可疑 / 垃圾页也照常送 DobbyHook，不在 C 层提前 return。
+       真机统计这三类应为 0；真出现时由 Dobby 的 rc 说话，不替它决定走原版。 */
+    if (nullish || misalign)
+        printf("[r100][warn] #%u 物理可疑 target=0x%llx nullish=%d misalign=%d"
+               " -> 仍送 DobbyHook（零跳过）\n", seq, t, nullish, misalign);
+    if (garbage)
+        printf("[r100][warn] #%u 指令头全0/全f target=0x%llx insn0=0x%08x"
+               " -> 仍送 DobbyHook（零跳过）\n", seq, t, insn0);
 
+    /* [R100] 走到这里，做过提权的页【已经是严格 RX】：
+         A/B 档补 READ 后保持 RX 不变；C 档写态已在 memcpy 后立刻翻回 RX。
+       DobbyHook 在 RX 页上写 detour，走的是 R97b 86 个真 hook 已实证的路径；
+       补上的 READ 让 Dobby 的 relo_relocate 能读到原指令（R96b #9 崩点）。
+       全程不存在 W+X 同时态，DobbyHook 之前不残留任何写态 —— 用户红线②。 */
     int rc = DobbyHook(target, replace, prepared);
+
     if (rc != 0) {
-        printf("[r97b][dob] #%u DobbyHook rc=%d（失败）-> 兜底 *prepared=原函数\n", seq, rc);
-        if (prepared) *prepared = target;
+        printf("[r100][dob] #%u DobbyHook rc=%d（真失败，不用原版顶替）\n", seq, rc);
         g_r97b_patch_down++;
-    } else if (prepared && *prepared == NULL) {
-        printf("[r97b][dob] #%u DobbyHook 成功但 trampoline=NULL -> 兜底 *prepared=原函数\n", seq);
-        *prepared = target;
+    } else if (!prepared || *prepared == NULL) {
+        printf("[r100][dob] #%u DobbyHook 返回 0 但 trampoline=NULL（真失败）\n", seq);
         g_r97b_patch_down++;
     } else {
-        r97_remember(target, prepared ? *prepared : NULL);
+        r97_remember(target, *prepared);
         g_r97b_patch_ok++;
     }
 
@@ -402,7 +565,7 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
         struct timeval now; gettimeofday(&now, NULL);
         double ms = (double)(now.tv_sec - r98_t0.tv_sec) * 1000.0
                   + (double)(now.tv_usec - r98_t0.tv_usec) / 1000.0;
-        printf("[r98][dob] --- 进度 seq=%u ok=%u down=%u hooks=%u 累计=%.0fms "
+        printf("[r100][dob] --- 进度 seq=%u ok=%u down=%u hooks=%u 累计=%.0fms "
                "last_target=0x%llx [%s] replace=0x%llx [%s] readR=%d ---\n",
                seq, g_r97b_patch_ok, g_r97b_patch_down, g_r97_hook_n, ms,
                t, r97_image_of(target), r, r97_image_of(replace), got_replace);
