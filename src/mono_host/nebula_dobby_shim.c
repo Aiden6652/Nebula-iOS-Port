@@ -168,7 +168,7 @@
  *      一次 memcpy 读指令，随即 READ|EXECUTE（无 W）+ 刷 icache，然后才轮到
  *      DobbyHook —— 即「执行的时候翻转回来」在 Dobby 之前就完成。
  *
- * [R100c / R101 / R102 真机结论 —— 改页保护这条线已彻底作废]
+ * [R100c / R101 / R102 / R103 真机结论 —— 逐个证伪后的收敛]
  *   R100c（358402cc5aeb）：冒烟 JIT 链路全绿、零降级字面成立（ok=7 down=0），
  *     但第 8 个 patch 崩在 relo_relocate —— Dobby 读不到 target 原指令。
  *   R101（985a734a8647）：改回 vm_protect + VM_PROT_COPY 补 READ，仍是
@@ -179,9 +179,14 @@
  *     崩时 stdio 缓冲把诊断全吞了。崩栈 libsystem_platform(memcpy) 说明
  *     【Dobby 用 CPU 直接 deref target 读指令】，和 vm_read 是两回事：
  *     补 READ 就算成功也管不到 vm_read 本来就能读的那些页。
- *   => R102（本版）：彻底删除所有改页保护逻辑（vm_protect / VM_PROT_COPY /
- *      mprotect 加权限），改从【Mach-O 文件读原始机器码】，用 MAP_FIXED 在
- *      target 原地址重建可读私有映射。详见下方 [R102] 段。
+ *   => R102：删改权限、改从 Mach-O 文件 pread 读原始机器码 + MAP_FIXED 覆盖
+ *      原地址。真机（8e9fd333c3da）：fileoff 换算 + 字节校验成功，但
+ *      mmap(MAP_FIXED|MAP_ANON) 覆盖 code-signed 的 file-backed __TEXT_EXEC
+ *      被内核拒绝 errno=12(ENOMEM)；#9 仍崩在 relo_relocate。
+ *   => R103（本版）：#8/#9 同页 0x1179a0000 却 readT 1->0，说明页是
+ *      execute-only(--x)，机器码本就正确，缺的只是【数据读权限】。删 MAP_FIXED，
+ *      改 vm_protect+VM_PROT_COPY 补 READ（fishhook.c:148 真机范式），三档 +
+ *      全量 kr 诊断；从文件读机器码仅作校验/最坏兜底。详见下方 [R103] 段。
  * ========================================================================== */
 /* Linux 本地语法检查需要 _GNU_SOURCE 才暴露 Dl_info/dladdr；Darwin 无条件提供。 */
 #ifndef _GNU_SOURCE
@@ -193,23 +198,21 @@
 #include <stdlib.h>
 #include <dlfcn.h>               /* dladdr：仅用于打印归属 image，不参与判定 */
 #include <sys/time.h>            /* [R98] gettimeofday：每 32 个 patch 打印累计耗时 */
-#include <sys/mman.h>            /* [R102] mmap(MAP_FIXED) / mprotect / PROT_* */
-#include <unistd.h>              /* [R102] getpagesize() / pread() / close() */
-#include <errno.h>               /* [R102] open/pread/mmap/mprotect 失败原因 */
-#include <fcntl.h>               /* [R102] open(O_RDONLY)：读 Mach-O 原始机器码 */
+#include <unistd.h>              /* [R103] getpagesize() / pread() / close() */
+#include <errno.h>               /* [R103] open/pread 失败原因 */
+#include <fcntl.h>               /* [R103] open(O_RDONLY)：读 Mach-O 原始机器码（校验/兜底） */
 #include <sys/stat.h>            /* [R102] 文件完整性诊断 */
-#ifndef MAP_ANON
-#define MAP_ANON MAP_ANONYMOUS
-#endif
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>  /* [R99] CFRunLoopRunInMode：分时让出主线程 */
 #include <mach/mach.h>
 #include <mach/vm_map.h>            /* r97_safe_read 的 vm_read（R97 起真机验证） */
 #include <libkern/OSCacheControl.h> /* [R102] sys_icache_invalidate：影子页翻 RX 后刷缓存 */
-/* [R102] vm_protect / VM_PROT_COPY / 提权补 READ 全部删除 —— R100/R100c/R101
-   三版真机证伪：code-signed 共享 __TEXT_EXEC 页加保护被内核拒，且 Dobby 是
-   CPU 直接 deref，补 READ 也拦不住。改为「从文件读机器码 + MAP_FIXED 影子页」。
-   mach/vm_map.h 仅保留给 r97_safe_read 的 vm_read（取证/验证，不参与判定）。 */
+/* [R103] 恢复 vm_protect + VM_PROT_COPY（fishhook.c:148 是仓库真机验证范式）：
+   - R100c 用的是不带 COPY 的 POSIX mprotect（对 code-signed 共享页无效）；
+   - R101 用 vm_protect+COPY 但诊断被 stdio 缓冲吞光、kr 从未真机确认；
+   - R102 的 MAP_FIXED 匿名覆盖被内核 ENOMEM 拒绝（真机 errno=12）。
+   => vm_protect+COPY 对 code-signed 页从没被干净验证过，R103 用全量 kr 诊断补齐。
+   mach/vm_map.h 提供 vm_protect / VM_PROT_COPY / vm_read（R97 起真机验证）。 */
 #endif
 
 #ifdef __cplusplus
@@ -311,32 +314,17 @@ static int r97_safe_read(void *addr, unsigned char *out, size_t n) {
 }
 
 /* ===========================================================================
- * [R102] 降维打击：放弃改权限，从 Mach-O 文件读原始机器码铺回 target 原地址
- * ---------------------------------------------------------------------------
- * R101 真机（BUILD=985a734a…，nebula_host.txt 1300~1402）managed 栈钉死崩点：
- *   NebulaPlugin:LoadInternal -> Harmony:PatchAll -> Il2CppInteropDetour:Apply
- *   -> DobbyLib:Prepare -> DobbyHook -> relo_relocate -> libsystem_platform(memcpy)
- *   —— Dobby 用【CPU 直接读 target 原指令】，与 vm_read（Mach 内核读）是两回事。
- *   R101 前 4 个 patch vm_read 成功（got_target=1），提权条件 !got_target 没进，
- *   第 5 个 patch 直接崩；[r101][cow] 0 条还叠加了崩溃时 stdio 缓冲丢失。
- *   => 「临时改页保护补 READ」这条线（R100 / R100c / R101 三版）彻底作废。
- *
- * DeepSeek 方向（用户转述）：放弃强行读内存，改从 Mach-O 文件读原始机器码。
- * 但「把 32B 塞进临时内存喂给 Dobby」不成立：Dobby 从 target 读指令、往
- * target 写跳板、按 target 算跳回地址，三者都是同一个原地址；伪造块地址不同
- * 会让跳回错位。R102 的正确落地是让【target 原地址本身】变成可读私有映射：
- *   dladdr -> image 基址(含 slide) + 文件路径
- *   -> 解析 LC_SEGMENT_64 把 (target - image_base) 换算成文件偏移
- *   -> pread 读整页原始机器码（DeepSeek 第 2 点）
- *   -> mmap(MAP_FIXED) 在该页原地址重建匿名私有 RW 映射（无 X）填入机器码
- *   -> 立刻 mprotect 翻 PROT_READ|PROT_EXEC（无 W）+ 刷 icache
- *   -> 之后 Dobby 从 target 读/写/算跳回全部落在私有副本，不再碰签名共享页
- *
- * 每页只接管一次（首次接管时该页还没有任何 detour），后续同页 patch 累积保留。
- * 严格 W^X：写态 R+W（无 X）、执行态 R+X（无 W），任何时刻无 W+X 同时态。
- * 零降级零跳过保持：接管失败也照常送 DobbyHook，绝不用原版顶替。
- * 失败原因（FairPlay 加密 / open / pread / mmap / mprotect）全量记录并 fflush，
- * 不再让崩溃吞掉诊断（R101 的坑）。
+ * [R102 复盘 / R103 收敛]
+ * R102 用 dladdr -> LC_SEGMENT_64 -> pread 从 Mach-O 文件读整页原始机器码
+ *   （真机验证：fileoff 换算正确、字节校验通过），再用 MAP_FIXED 在原地址
+ *   重建匿名私有 RW 映射填回。真机 errno=12(ENOMEM)：iOS 内核不允许匿名
+ *   映射覆盖 code-signed 的 file-backed __TEXT_EXEC 映射，影子页建不起来，
+ *   Dobby 仍 CPU 直读 target -> relo_relocate SIGSEGV。
+ * 决定性新证据：#8 t=0x1179a1ac8 与 #9 t=0x1179a27c0 同页 0x1179a0000，
+ *   #8 readT=1 成功 hook、#9 readT=0。=> 不是地址坏、不是内容缺，是 Dobby
+ *   写跳板后把该页翻成 execute-only(--x，剥掉 READ)。正解=恢复 READ 权限。
+ * 用户红线保持：零降级零跳过、严格 W^X（写态 rw- 无 X / 执行态 r-x 无 W）、
+ *   单 dylib、品牌页不动。诊断每条 fflush(stdout)（R101 缓冲吞日志的坑）。
  * ========================================================================= */
 
 #define R102_MH_MAGIC_64          0xfeedfacfu
@@ -459,138 +447,147 @@ static int r102_image_fileoff(const char *path, uint64_t rel_off,
 
 /* 让 target 所在页的原地址变成「可读 + 原始机器码」的私有映射。
    返回 tier：1=vm_read 保留现状重建 / 2=文件原始机器码重建 / 0=失败(原因写 reason)。 */
-static int r102_shadow_page(void *target, void *image_base, const char *image_path,
-                            int *errno_out, uint64_t *file_off_out,
-                            unsigned char *insn4_out, char *reason, size_t reasoncap) {
+/* ===========================================================================
+ * [R103] 正解：让 execute-only 的 __TEXT_EXEC 页「恢复可读」，不是搬字节。
+ * ---------------------------------------------------------------------------
+ * R102 真机（BUILD=8e9fd333c3da）钉死：
+ *   #1~#8 readT=1 真 hook 成功；#9 t=0x1179a27c0 与 #8 t=0x1179a1ac8
+ *   【同页 0x1179a0000】却 readT=0。同一 16KB 页不可能天生两种权限 ——
+ *   只能是 Dobby hook #8 写跳板后把该页翻成 execute-only(--x，剥掉 READ)，
+ *   同页第二个 target 的 vm_read / relo_relocate(CPU 读原指令) 必然失败。
+ *   => 页里机器码本来就在、本来正确（CPU 取指能执行），缺的只是【数据读权限】。
+ *      R102 的 fileoff=0x4518000 换算成功 + 字节校验通过，恰恰证明内存/文件
+ *      里都是合法机器码。正解是补 READ，把整页搬掉反而会抹掉已写的 detour。
+ *
+ * 「从 Mach-O 文件 pread 读原始机器码」(DeepSeek 方向 / R102 已验证可用) 在此
+ * 保留为：① 诊断——打印文件里 target 处的真实 4B，与复验字节比对；② 最坏兜底
+ * —— 仅当三档 vm_protect 全失败、页确实不可读时，只铺 [target,target+32)，
+ * 不整页覆盖，绝不抹同页其他 detour。
+ *
+ * 三档（每档后 vm_read 复验，成功即停；kr 全量打印，一次真机定性）：
+ *   Tier A  vm_protect(READ|EXECUTE)              纯补 READ，r-x 无 W，最安全
+ *   Tier B  vm_protect(READ|EXECUTE|COPY)         补 READ + COW 私有副本
+ *           (fishhook.c:148 范式；仍是 r-x 无 W，绝不触发 TXM)
+ *   Tier C  vm_protect(READ|WRITE|COPY)           写态 rw-（无 X，COW 私有副本）
+ *           -> 只铺文件抠出的 target 32B -> 立刻 vm_protect(READ|EXECUTE) 翻回
+ *              r-x（无 W）+ sys_icache_invalidate
+ *   全程严格 W^X：写态 rw- 无 X / 执行态 r-x 无 W，任何时刻无 W+X 同帧。
+ *
+ * 红线：三档全失败也照常送 DobbyHook（零跳过、不降级、不用原版顶替）。
+ * ========================================================================= */
+#define R103_KR_OK 0            /* kern_return_t KERN_SUCCESS = 0，不依赖 SDK 头 */
+
+static int r103_cow_readable(void *target, void *image_base, const char *image_path,
+                             int *errno_out, uint64_t *file_off_out,
+                             unsigned char *insn4_out, char *reason, size_t reasoncap) {
     long pg = (long)getpagesize();
     if (pg <= 0) pg = 16384;
-    uint64_t mask  = (uint64_t)(pg - 1);
-    uint64_t base  = (uint64_t)(uintptr_t)target & ~mask;
+    uint64_t mask = (uint64_t)(pg - 1);
+    uint64_t base = (uint64_t)(uintptr_t)target & ~mask;
+    size_t   ioff = (size_t)((uintptr_t)target - (uintptr_t)base);
     if (errno_out)   *errno_out = 0;
     if (file_off_out)*file_off_out = 0;
+
+    /* 同页只处理一次：补 READ 成功后整页可读，后续 patch 不必再改保护，
+       且绝不覆盖本页已写入的 detour。 */
     if (r102_page_taken(base)) {
-        snprintf(reason, reasoncap, "已接管(跳过重建，detour 累积保留)");
-        return 1;
+        snprintf(reason, reasoncap, "已接管(同页复用，detour 保留)");
+        return 3;
     }
 
+    /* 诊断资产：把 target 所在页换算成 Mach-O 文件偏移，并从文件读 target 处
+       4B 原始机器码。R102 真机已证 LC_SEGMENT_64 换算 + 字节校验可用。 */
     uint64_t rel_page = base - (uint64_t)(uintptr_t)image_base;
-    uint64_t foff = 0;
-    int enc = 0;
-    char seg[24] = "?";
-    int fr = r102_image_fileoff(image_path, rel_page, &foff, &enc,
-                                seg, sizeof(seg));
+    uint64_t foff = 0; int enc = 0; char seg[24] = "?";
+    int fr = r102_image_fileoff(image_path, rel_page, &foff, &enc, seg, sizeof(seg));
     if (file_off_out) *file_off_out = foff;
-    if (fr != 0) {
-        snprintf(reason, reasoncap,
-                 "fileoff失败 rc=%d enc=%d cputype需arm64 path=%s", fr, enc, image_path);
-        return 0;
-    }
-
-    unsigned char *pagebuf = (unsigned char *)malloc((size_t)pg);
-    if (!pagebuf) { snprintf(reason, reasoncap, "malloc(%ld)失败", pg); return 0; }
-    int got_mem = 0;
-#ifdef __APPLE__
-    /* 优先读当前内存整页：若该页恰好可读，能保留 dyld fixup / 已写 detour。 */
-    vm_offset_t data = 0;
-    mach_msg_type_number_t cnt = 0;
-    kern_return_t kr = vm_read(mach_task_self(), (vm_address_t)base,
-                               (vm_size_t)pg, &data, &cnt);
-    if (kr == KERN_SUCCESS && data && cnt >= (mach_msg_type_number_t)pg) {
-        memcpy(pagebuf, (const void *)(uintptr_t)data, (size_t)pg);
-        vm_deallocate(mach_task_self(), (vm_address_t)data, (vm_size_t)cnt);
-        got_mem = 1;
-    } else if (data) {
-        vm_deallocate(mach_task_self(), (vm_address_t)data, (vm_size_t)cnt);
-    }
-#else
-    memcpy(pagebuf, (const void *)(uintptr_t)base, (size_t)pg);
-    got_mem = 1;
-#endif
-    /* 读不到 -> 从 Mach-O 文件读整页原始机器码（DeepSeek 核心）。 */
-    if (!got_mem) {
+    unsigned char file4[4] = {0, 0, 0, 0};
+    if (fr == 0) {
         int fd = open(image_path, O_RDONLY);
-        if (fd < 0) {
-            if (errno_out) *errno_out = errno;
-            snprintf(reason, reasoncap, "open失败 errno=%d", errno);
-            free(pagebuf); return 0;
-        }
-        errno = 0;
-        ssize_t n = pread(fd, pagebuf, (size_t)pg, (off_t)foff);
-        int perr = errno;
-        close(fd);
-        if (n <= 0) {
-            if (errno_out) *errno_out = perr;
-            snprintf(reason, reasoncap, "pread失败 n=%zd errno=%d off=0x%llx",
-                     n, perr, (unsigned long long)foff);
-            free(pagebuf); return 0;
-        }
-        if (n < pg) memset(pagebuf + n, 0, (size_t)pg - (size_t)n);
-    }
-
-    /* [R102] 覆盖前字节校验（保险）：target 在页内的偏移处 4 字节必须像合法
-       arm64 指令。若文件被 FairPlay 加密 / 段换算错 / 预读失败，宁可如实报错
-       并仍送 DobbyHook（零跳过），也绝不把错误字节铺进正在执行的 __TEXT_EXEC 页。 */
-    size_t insn_off = (size_t)((uintptr_t)target - (uintptr_t)base);
-    if (insn_off + 4 <= (size_t)pg) {
-        uint32_t probe = (uint32_t)pagebuf[insn_off]
-                       | ((uint32_t)pagebuf[insn_off + 1] << 8)
-                       | ((uint32_t)pagebuf[insn_off + 2] << 16)
-                       | ((uint32_t)pagebuf[insn_off + 3] << 24);
-        if (probe == 0u || probe == 0xffffffffu) {
-            snprintf(reason, reasoncap,
-                     "原始码 insn0=0x%08x 疑似加密/换算错，拒绝覆盖真代码页",
-                     probe);
-            free(pagebuf); return 0;
+        if (fd >= 0) {
+            unsigned char tmp[8];
+            ssize_t n = pread(fd, tmp, sizeof(tmp), (off_t)(foff + ioff));
+            if (n >= 4) memcpy(file4, tmp, 4);
+            close(fd);
         }
     }
 
-    /* MAP_FIXED 在【原地址】重建匿名私有映射：RW 态（无 X）填充原始机器码。
-       覆盖的是 code-signed 共享映射，新页是本进程私有副本，不写回文件、
-       不影响其他映射者，也不再受签名页「改保护被内核拒绝」的限制。 */
-    errno = 0;
-    void *m = mmap((void *)(uintptr_t)base, (size_t)pg,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-    if (m == MAP_FAILED || m != (void *)(uintptr_t)base) {
-        if (errno_out) *errno_out = errno;
-        snprintf(reason, reasoncap, "mmap(MAP_FIXED)失败 errno=%d got=%p", errno, m);
-        free(pagebuf); return 0;
-    }
-    memcpy((void *)(uintptr_t)base, pagebuf, (size_t)pg);
-    free(pagebuf);
-
-    /* 立刻翻回严格 RX（无 W）+ 刷 icache：执行态绝不带 W。 */
-    errno = 0;
-    if (mprotect((void *)(uintptr_t)base, (size_t)pg,
-                 PROT_READ | PROT_EXEC) != 0) {
-        if (errno_out) *errno_out = errno;
-        snprintf(reason, reasoncap, "mprotect(RX)失败 errno=%d", errno);
-        return 0;
-    }
+    unsigned char rb[32]; memset(rb, 0, sizeof(rb));
+    int reread = 0, krA = -1, krB = -1, krC = -1;
 #ifdef __APPLE__
-    sys_icache_invalidate((void *)(uintptr_t)base, (size_t)pg);
+    /* Tier A：纯补 READ（r-x，无 W）。页若是 --x，补上 R 后 CPU/vm_read 都能读。 */
+    krA = (int)vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)base,
+                          (vm_size_t)pg, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    reread = r97_safe_read(target, rb, sizeof(rb));
+    if (!reread) {
+        /* Tier B：补 READ + VM_PROT_COPY 强制 COW 私有副本（fishhook 真机范式）。 */
+        krB = (int)vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)base,
+                              (vm_size_t)pg, FALSE,
+                              VM_PROT_READ | VM_PROT_EXECUTE | VM_PROT_COPY);
+        reread = r97_safe_read(target, rb, sizeof(rb));
+    }
+    if (!reread) {
+        /* Tier C：写态 rw-(无 X) COW 私有副本，只铺文件抠出的 target 32B，
+           立刻翻回 r-x(无 W) + 刷 icache。写态/执行态严格 W^X。 */
+        krC = (int)vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)base,
+                              (vm_size_t)pg, FALSE,
+                              VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (krC == R103_KR_OK) {
+            if (fr == 0) {
+                int fd = open(image_path, O_RDONLY);
+                if (fd >= 0) {
+                    unsigned char tmp[32];
+                    ssize_t n = pread(fd, tmp, sizeof(tmp), (off_t)(foff + ioff));
+                    if (n > 0) {
+                        if (n < 32) memset(tmp + n, 0, sizeof(tmp) - (size_t)n);
+                        memcpy((void *)(uintptr_t)target, tmp, sizeof(tmp));
+                    }
+                    close(fd);
+                }
+            }
+            vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)base,
+                       (vm_size_t)pg, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+            sys_icache_invalidate((void *)(uintptr_t)base, (size_t)pg);
+            reread = r97_safe_read(target, rb, sizeof(rb));
+        }
+    }
 #else
-    __builtin___clear_cache((char *)(uintptr_t)base,
-                            (char *)(uintptr_t)(base + (uint64_t)pg));
+    (void)image_base; (void)image_path;
+    reread = r97_safe_read(target, rb, sizeof(rb));
 #endif
-    r102_page_remember(base);
-    if (insn4_out) memcpy(insn4_out, (void *)(uintptr_t)target, 4);
-    snprintf(reason, reasoncap, "%s seg=%s fileoff=0x%llx -> 严格RX",
-             got_mem ? "vm_read保留现状" : "文件原始机器码重建",
-             seg, (unsigned long long)foff);
-    return got_mem ? 1 : 2;
+
+    if (insn4_out) {
+        if (reread) memcpy(insn4_out, rb, 4);
+        else        memcpy(insn4_out, file4, 4);   /* 失败时展示文件里真实字节 */
+    }
+    if (reread) {
+        r102_page_remember(base);
+        snprintf(reason, reasoncap,
+                 "成功 tier=%s krA=%d krB=%d krC=%d seg=%s fileoff=0x%llx file4=%02x%02x%02x%02x",
+                 krA == R103_KR_OK ? "A" : (krB == R103_KR_OK ? "B" : "C"),
+                 krA, krB, krC, seg, (unsigned long long)foff,
+                 file4[0], file4[1], file4[2], file4[3]);
+        return krA == R103_KR_OK ? 3 : (krB == R103_KR_OK ? 2 : 1);
+    }
+    if (errno_out) *errno_out = krC >= 0 ? krC : (krB >= 0 ? krB : krA);
+    snprintf(reason, reasoncap,
+             "全档失败 krA=%d krB=%d krC=%d fr=%d seg=%s fileoff=0x%llx "
+             "file4=%02x%02x%02x%02x（仍送 DobbyHook，零跳过不降级）",
+             krA, krB, krC, fr, seg, (unsigned long long)foff,
+             file4[0], file4[1], file4[2], file4[3]);
+    return 0;
 }
 
-/* 开关：默认开；NEBULA_R102_SHADOW=0 关闭做 A/B（崩了能干净归因）。 */
-static int r102_cfg_shadow = -1;
-static void r102_cfg_init(void) {
-    if (r102_cfg_shadow >= 0) return;
-    r102_cfg_shadow = 1;
-    const char *v = getenv("NEBULA_R102_SHADOW");
-    if (v && (!strcmp(v, "0"))) r102_cfg_shadow = 0;
-    printf("[r102][cfg] 影子页接管 enabled=%d 页大小=%ld "
-           "（NEBULA_R102_SHADOW=0 关闭做 A/B）\n",
-           r102_cfg_shadow, (long)getpagesize());
+/* 开关：默认开；NEBULA_R103_COW=0 关闭做 A/B（崩了能干净归因）。 */
+static int r103_cfg_cow = -1;
+static void r103_cfg_init(void) {
+    if (r103_cfg_cow >= 0) return;
+    r103_cfg_cow = 1;
+    const char *v = getenv("NEBULA_R103_COW");
+    if (v && (!strcmp(v, "0"))) r103_cfg_cow = 0;
+    printf("[r103][cfg] COW 补 READ 接管 enabled=%d 页大小=%ld "
+           "（NEBULA_R103_COW=0 关闭做 A/B）\n",
+           r103_cfg_cow, (long)getpagesize());
     fflush(stdout);
 }
 
@@ -667,12 +664,13 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
 
     if (seq == 1) {
         gettimeofday(&r98_t0, NULL);
-        r102_cfg_init();
-        printf("[r102][boot] ===== R102：放弃改权限 / 从 Mach-O 文件读原始机器码 / MAP_FIXED 影子页 =====\n");
-        printf("[r102][boot] R101 真机证伪：Dobby 用 CPU 直接读 target（relo_relocate 崩），vm_read 能读也拦不住；补 READ 三版全作废\n");
-        printf("[r102][boot] 降维打击：dladdr->LC_SEGMENT_64->pread 整页机器码->MAP_FIXED 原地址重建私有映射->翻严格RX\n");
-        printf("[r102][boot] 红线保持：零降级零跳过；写态 R+W 无 X、执行态 R+X 无 W，任何时刻无 W+X 同帧\n");
-        printf("[r102][boot] 诊断每条 fflush(stdout)：R101 崩前日志被 stdio 缓冲吞掉的坑不再犯\n");
+        r103_cfg_init();
+        printf("[r103][boot] ===== R103：删 MAP_FIXED(证伪 ENOMEM) / vm_protect+VM_PROT_COPY 补 READ =====\n");
+        printf("[r103][boot] R102 真机：#8/#9 同页 readT 1->0 = Dobby 写跳板后把页翻成 execute-only(--x)\n");
+        printf("[r103][boot] 正解=补 READ 不是搬字节；从文件 pread 读机器码(R102 已验证)仅作校验/最坏兜底\n");
+        printf("[r103][boot] 三档 vm_protect：A 纯补R / B +COW(fishhook范式) / C 写态铺文件32B翻回RX；全量打印 kr\n");
+        printf("[r103][boot] 红线保持：零降级零跳过；写态 rw- 无 X、执行态 r-x 无 W，任何时刻无 W+X 同帧\n");
+        printf("[r103][boot] 诊断每条 fflush(stdout)；NEBULA_R103_COW=0 关闭做 A/B\n");
         printf("[r99b][boot] ===== R99b：删分时让出(证伪) + 信号驱动闸门(等 BeginAsync 再冻结) =====\n");
         printf("[r99][boot] (R99 分时主线程已默认禁用，真机 seq=10 SIGBUS+double fault 证伪)\n");
         printf("[host][r98] ===== R98：判定沿用 R97（vm_read 硬门槛），砍逐 patch dladdr/取证 IO，主线程 QoS 抬档 =====\n");
@@ -704,10 +702,10 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     int got_replace = r97_safe_read(replace, rhead, sizeof(rhead));
     int got_target  = r97_safe_read(target,  head,  sizeof(head));
 
-    /* [R102] 只在 vm_read 读不到时接管该页；可读页交给 Dobby 原路径
-       （R97b 86 个真 hook / R101 前 4 个 ok 已证 Dobby 能处理可读页）。
-       诊断每条都 fflush(stdout)：R101 崩前 [cow] 全被 stdio 缓冲吞掉的坑。 */
-    if (r102_cfg_shadow && !nullish && !misalign) {
+    /* [R103] 只在 vm_read 读不到时接管该页；可读页交给 Dobby 原路径
+       （R97b 86 个真 hook / R102 前 8 个 ok 已证 Dobby 能处理可读页）。
+       诊断每条都 fflush(stdout)：R101 崩前诊断被 stdio 缓冲吞掉的坑。 */
+    if (r103_cfg_cow && !nullish && !misalign) {
         long pg = (long)getpagesize();
         if (pg <= 0) pg = 16384;
         uint64_t page_base = t & ~((uint64_t)(pg - 1));
@@ -721,9 +719,9 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
                 int ern = 0;
                 unsigned char i4[4] = {0, 0, 0, 0};
                 char why[320] = "";
-                int tier = r102_shadow_page(target, di.dli_fbase, di.dli_fname,
-                                            &ern, &foff, i4, why, sizeof(why));
-                printf("[r102][shadow] #%u t=0x%llx page=0x%llx tier=%d errno=%d "
+                int tier = r103_cow_readable(target, di.dli_fbase, di.dli_fname,
+                                             &ern, &foff, i4, why, sizeof(why));
+                printf("[r103][cow] #%u t=0x%llx page=0x%llx tier=%d errno=%d "
                        "fileoff=0x%llx insn4=%02x%02x%02x%02x [%s] %s\n",
                        seq, t, (unsigned long long)page_base, tier, ern,
                        (unsigned long long)foff, i4[0], i4[1], i4[2], i4[3],
@@ -731,12 +729,12 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
                 fflush(stdout);
                 if (tier > 0) got_target = r97_safe_read(target, head, sizeof(head));
             } else {
-                printf("[r102][shadow] #%u t=0x%llx 无 image 归属(dladdr失败)，"
+                printf("[r103][cow] #%u t=0x%llx 无 image 归属(dladdr失败)，"
                        "仍送 DobbyHook（零跳过）\n", seq, t);
                 fflush(stdout);
             }
         } else {
-            printf("[r102][ok] #%u t=0x%llx readT=%d taken=%d [%s]\n",
+            printf("[r103][ok] #%u t=0x%llx readT=%d taken=%d [%s]\n",
                    seq, t, got_target, taken, r97_image_of(target));
             fflush(stdout);
         }
@@ -757,13 +755,12 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
         printf("[r100][warn] #%u 指令头全0/全f target=0x%llx insn0=0x%08x"
                " -> 仍送 DobbyHook（零跳过）\n", seq, t, insn0);
 
-    /* [R102] 走到这里，若该页被接管过，target 原地址已经是【私有 RX 映射】，
-       内容是 Mach-O 文件里的原始机器码：Dobby 的 CPU 读指令、写跳板、算跳回
-       三处全部落在这个私有副本上，不再碰 code-signed 共享页（R96b #9 /
-       R100c #8 / R101 #5 的 relo_relocate 崩点被根治）。
-       未被接管的页是 vm_read 可读页，走 R97b 86 个真 hook 已实证的原路径。
-       全程无 W+X 同时态：填充用 R+W（无 X），执行前已翻 R+X（无 W）。
-       接管失败也照常送 DobbyHook —— 零跳过，不降级，不用原版顶替。 */
+    /* [R103] 走到这里，若该页被接管过，target 原地址已恢复【可读 r-x】
+       （必要时是 COW 私有副本）：Dobby 的 relo_relocate(CPU 读原指令) 不再
+       SIGSEGV，写跳板 / 算跳回仍落在同一原地址（内容不被整页覆盖，同页
+       已写 detour 完整保留）。未被接管的页是 vm_read 可读页，走 R97b 86 个
+       真 hook 已实证的原路径。全程无 W+X 同时态：写态 rw- 无 X，执行态
+       r-x 无 W。接管失败也照常送 DobbyHook —— 零跳过，不降级，不用原版顶替。 */
     int rc = DobbyHook(target, replace, prepared);
 
     if (rc != 0) {
@@ -788,7 +785,7 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
         unsigned char post[16]; memset(post, 0, sizeof(post));
         int got_post = r97_safe_read(target, post, sizeof(post));
         int really = got_post && memcmp(post, head, 16) != 0;
-        printf("[r102][dob] --- 进度 seq=%u ok=%u down=%u hooks=%u 累计=%.0fms "
+        printf("[r103][dob] --- 进度 seq=%u ok=%u down=%u hooks=%u 累计=%.0fms "
                "last_target=0x%llx [%s] replace=0x%llx [%s] readR=%d "
                "post=%d 跳板已写入=%d ---\n",
                seq, g_r97b_patch_ok, g_r97b_patch_down, g_r97_hook_n, ms,
