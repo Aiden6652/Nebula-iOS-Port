@@ -48,6 +48,11 @@ extern volatile unsigned g_r97b_patch_seq;
 extern volatile unsigned g_r97b_patch_ok;
 extern volatile unsigned g_r97b_patch_down;
 
+/* R99 分时让出统计：R99b 起分时已禁用，这两个恒 0；host.c 诊断打印仍引用，
+   故在此保留定义（原来定义在 R99 权限补丁段，R110 清理时一并删掉导致链接失败）。 */
+volatile unsigned g_r99_yield_count = 0;
+volatile unsigned g_r99_yield_ms = 0;
+
 /* 已 hook 地址表：Destroy no-op 后 Harmony 重打同一方法不真撤销，Prepare 可能
    收到重复 target。复用首次 trampoline，避免二次 DobbyHook。 */
 #define R97_MAX_HOOKS 1024
