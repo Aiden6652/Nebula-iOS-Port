@@ -578,15 +578,84 @@ static int r103_cow_readable(void *target, void *image_base, const char *image_p
     return 0;
 }
 
-/* 开关：默认开；NEBULA_R103_COW=0 关闭做 A/B（崩了能干净归因）。 */
+/* ===========================================================================
+ * [R104] 正解：从"事后补 READ"改为"事前抢先 COW 私有化 + 事后立即恢复 r-x"
+ * ---------------------------------------------------------------------------
+ * R103 真机钉死（nebula_host.txt #9）：
+ *   #8/#9 同页 0x11b2a0000，#8 readT=1 成功、#9 readT=0；#9 三档补 READ
+ *   全失败 krA=2(PROTECTION_FAILURE) krB=krC=3(NO_SPACE)，仍送 DobbyHook
+ *   -> relo_relocate CPU 读 --x 页 SIGSEGV，PatchAll 断 -> NOS 没机会加载。
+ *   根因：#8 的 DobbyHook 写跳板后把该页翻成 execute-only(--x)，且该页是
+ *   code-signed file-backed 共享映射，iOS 内核拒绝在其上重新提 READ 权限。
+ *
+ * R104 两次出手（都在我们能控制的 DobbyPrepare 内，全程严格 W^X）：
+ *   ① 首触页（页还没被 Dobby 碰过、多为 r-x）：立即 vm_protect(RW|COPY)
+ *      把整页变成【私有 COW 副本】，再立刻 vm_protect(R|X) 翻回 r-x。
+ *      私有脏页不再受 code-signed maximum-protection 约束，Dobby 之后
+ *      在这页上的写跳板/翻页都作用在私有副本上。
+ *   ② 每次 DobbyHook 返回后：若该页被 Dobby 翻成 --x（读不到），立刻在
+ *      私有副本上 vm_protect(R|X) 补回 r-x + 刷 icache。
+ *      => 下一个同页 target（#9）进入时页已是 r-x，vm_read / relo_relocate
+ *         都能正常读，根本不会触发补 READ，更不会 SIGSEGV。
+ * 红线不变：零降级零跳过（COW 失败也照常送 DobbyHook）、写态 rw- 无 X /
+ *   执行态 r-x 无 W、单 dylib、品牌页不动。A/B：NEBULA_R104_COW=0 关闭。
+ * ========================================================================= */
+
+/* 把整页变成私有 COW 副本并回到 r-x。返回 1 成功 / 0 失败。
+   幂等：已是私有副本时 vm_protect 只是改权限，不会重建副本。 */
+static int r104_page_private_rx(uint64_t base, size_t pg, const char *when,
+                                unsigned seq, uint64_t target,
+                                char *reason, size_t cap) {
+#ifdef __APPLE__
+    (void)seq;
+    /* 写态：READ|WRITE|COPY —— 建私有 COW 副本，无 X（严格 W^X）。 */
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)base,
+                                  (vm_size_t)pg, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr == KERN_SUCCESS) {
+        /* 立刻翻回执行态 r-x（无 W），刷指令缓存。 */
+        vm_protect(mach_task_self(), (vm_address_t)base, (vm_size_t)pg,
+                   FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        sys_icache_invalidate((void *)(uintptr_t)base, pg);
+        unsigned char probe[4];
+        if (r97_safe_read((void *)(uintptr_t)target, probe, sizeof(probe))) {
+            snprintf(reason, cap, "%s成功(私有COW rw-copy -> r-x) kr=0", when);
+            return 1;
+        }
+        snprintf(reason, cap, "%s rw-copy -> r-x 后 probe 仍失败", when);
+        return 0;
+    }
+    /* 兜底一：页本就私有，只需 r-x|COPY。 */
+    kern_return_t kr2 = vm_protect(mach_task_self(), (vm_address_t)base,
+                                   (vm_size_t)pg, FALSE,
+                                   VM_PROT_READ | VM_PROT_EXECUTE | VM_PROT_COPY);
+    if (kr2 == KERN_SUCCESS) {
+        sys_icache_invalidate((void *)(uintptr_t)base, pg);
+        unsigned char probe[4];
+        if (r97_safe_read((void *)(uintptr_t)target, probe, sizeof(probe))) {
+            snprintf(reason, cap, "%s成功(r-x|COPY) kr1=%d kr2=0", when, (int)kr);
+            return 1;
+        }
+    }
+    snprintf(reason, cap, "%s失败 kr1=%d kr2=%d", when, (int)kr, (int)kr2);
+    return 0;
+#else
+    (void)base; (void)pg; (void)when; (void)seq; (void)target;
+    snprintf(reason, cap, "非Apple平台跳过");
+    return 1;
+#endif
+}
+
+/* 开关：默认开；NEBULA_R104_COW=0（或旧名 NEBULA_R103_COW=0）关闭做 A/B。 */
 static int r103_cfg_cow = -1;
 static void r103_cfg_init(void) {
     if (r103_cfg_cow >= 0) return;
     r103_cfg_cow = 1;
-    const char *v = getenv("NEBULA_R103_COW");
+    const char *v = getenv("NEBULA_R104_COW");
+    if (!v) v = getenv("NEBULA_R103_COW");
     if (v && (!strcmp(v, "0"))) r103_cfg_cow = 0;
-    printf("[r103][cfg] COW 补 READ 接管 enabled=%d 页大小=%ld "
-           "（NEBULA_R103_COW=0 关闭做 A/B）\n",
+    printf("[r104][cfg] 首触COW私有化+hook后恢复r-x enabled=%d 页大小=%ld "
+           "（NEBULA_R104_COW=0 关闭做 A/B）\n",
            r103_cfg_cow, (long)getpagesize());
     fflush(stdout);
 }
@@ -665,12 +734,13 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     if (seq == 1) {
         gettimeofday(&r98_t0, NULL);
         r103_cfg_init();
-        printf("[r103][boot] ===== R103：删 MAP_FIXED(证伪 ENOMEM) / vm_protect+VM_PROT_COPY 补 READ =====\n");
-        printf("[r103][boot] R102 真机：#8/#9 同页 readT 1->0 = Dobby 写跳板后把页翻成 execute-only(--x)\n");
-        printf("[r103][boot] 正解=补 READ 不是搬字节；从文件 pread 读机器码(R102 已验证)仅作校验/最坏兜底\n");
-        printf("[r103][boot] 三档 vm_protect：A 纯补R / B +COW(fishhook范式) / C 写态铺文件32B翻回RX；全量打印 kr\n");
-        printf("[r103][boot] 红线保持：零降级零跳过；写态 rw- 无 X、执行态 r-x 无 W，任何时刻无 W+X 同帧\n");
-        printf("[r103][boot] 诊断每条 fflush(stdout)；NEBULA_R103_COW=0 关闭做 A/B\n");
+        printf("[r104][boot] ===== R104：首触页抢先 COW 私有化 + 每次 hook 后恢复 r-x（不再事后补 READ）=====\n");
+        printf("[r104][boot] R103 真机钉死：#8/#9 同页，#9 三档补READ全失败 krA=2/krB,C=3(NO_SPACE)；\n");
+        printf("[r104][boot]   根因=该页是 code-signed file-backed 共享映射，翻成 --x 后内核拒绝再提 READ。\n");
+        printf("[r104][boot] R104 正解：① 首触页(RW|COPY)建私有COW副本->r-x ② hook后若被翻--x立即补回r-x；\n");
+        printf("[r104][boot]   私有脏页不受 code-signing 约束，#9 进入时页已 r-x，relo_relocate 不再 SIGSEGV。\n");
+        printf("[r104][boot] 红线保持：零降级零跳过；写态 rw- 无 X、执行态 r-x 无 W，任何时刻无 W+X 同帧\n");
+        printf("[r104][boot] 诊断每条 fflush(stdout)；NEBULA_R104_COW=0 关闭做 A/B\n");
         printf("[r99b][boot] ===== R99b：删分时让出(证伪) + 信号驱动闸门(等 BeginAsync 再冻结) =====\n");
         printf("[r99][boot] (R99 分时主线程已默认禁用，真机 seq=10 SIGBUS+double fault 证伪)\n");
         printf("[host][r98] ===== R98：判定沿用 R97（vm_read 硬门槛），砍逐 patch dladdr/取证 IO，主线程 QoS 抬档 =====\n");
@@ -702,15 +772,31 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
     int got_replace = r97_safe_read(replace, rhead, sizeof(rhead));
     int got_target  = r97_safe_read(target,  head,  sizeof(head));
 
-    /* [R103] 只在 vm_read 读不到时接管该页；可读页交给 Dobby 原路径
-       （R97b 86 个真 hook / R102 前 8 个 ok 已证 Dobby 能处理可读页）。
-       诊断每条都 fflush(stdout)：R101 崩前诊断被 stdio 缓冲吞掉的坑。 */
+    /* [R104] 首触页即抢先私有化（趁页多为 r-x，vm_protect(RW|COPY) 能建私有
+       副本）；已被接管的页若读不到，用 R103 文件诊断路径补回 r-x。
+       A/B：NEBULA_R104_COW=0 关闭。诊断每条都 fflush(stdout)。 */
+    long pg104 = (long)getpagesize();
+    if (pg104 <= 0) pg104 = 16384;
     if (r103_cfg_cow && !nullish && !misalign) {
-        long pg = (long)getpagesize();
-        if (pg <= 0) pg = 16384;
-        uint64_t page_base = t & ~((uint64_t)(pg - 1));
+        uint64_t page_base = t & ~((uint64_t)(pg104 - 1));
         int taken = r102_page_taken(page_base);
-        if (!got_target && !taken) {
+        if (!taken) {
+            /* ① 首次触碰该页：无论当前可读与否，抢先建私有 COW 副本 -> r-x。
+               关键：必须在 Dobby 写跳板把它翻成 --x 之前做，否则 code-signed
+               共享映射拒绝提权（R103 就是在这里晚了一步）。 */
+            char why[320] = "";
+            int ok = r104_page_private_rx(page_base, (size_t)pg104, "首触私有化",
+                                          seq, t, why, sizeof(why));
+            printf("[r104][cow] #%u 首触 t=0x%llx page=0x%llx readT=%d [%s] %s\n",
+                   seq, t, (unsigned long long)page_base, got_target,
+                   r97_image_of(target), why);
+            fflush(stdout);
+            if (ok) {
+                r102_page_remember(page_base);
+                got_target = r97_safe_read(target, head, sizeof(head));
+            }
+        } else if (!got_target) {
+            /* ② 已接管却读不到：页本应私有，用 R103 三档补 READ 兜底。 */
             Dl_info di;
             memset(&di, 0, sizeof(di));
             int has_img = (dladdr(target, &di) != 0 && di.dli_fbase && di.dli_fname);
@@ -721,20 +807,18 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
                 char why[320] = "";
                 int tier = r103_cow_readable(target, di.dli_fbase, di.dli_fname,
                                              &ern, &foff, i4, why, sizeof(why));
-                printf("[r103][cow] #%u t=0x%llx page=0x%llx tier=%d errno=%d "
-                       "fileoff=0x%llx insn4=%02x%02x%02x%02x [%s] %s\n",
-                       seq, t, (unsigned long long)page_base, tier, ern,
-                       (unsigned long long)foff, i4[0], i4[1], i4[2], i4[3],
-                       di.dli_fname, why);
+                printf("[r104][re] #%u t=0x%llx page=0x%llx tier=%d [%s] %s\n",
+                       seq, t, (unsigned long long)page_base, tier,
+                       r97_image_of(target), why);
                 fflush(stdout);
                 if (tier > 0) got_target = r97_safe_read(target, head, sizeof(head));
             } else {
-                printf("[r103][cow] #%u t=0x%llx 无 image 归属(dladdr失败)，"
+                printf("[r104][re] #%u t=0x%llx 无 image 归属(dladdr失败)，"
                        "仍送 DobbyHook（零跳过）\n", seq, t);
                 fflush(stdout);
             }
         } else {
-            printf("[r103][ok] #%u t=0x%llx readT=%d taken=%d [%s]\n",
+            printf("[r104][ok] #%u t=0x%llx readT=%d taken=%d [%s]\n",
                    seq, t, got_target, taken, r97_image_of(target));
             fflush(stdout);
         }
@@ -762,6 +846,26 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
        真 hook 已实证的原路径。全程无 W+X 同时态：写态 rw- 无 X，执行态
        r-x 无 W。接管失败也照常送 DobbyHook —— 零跳过，不降级，不用原版顶替。 */
     int rc = DobbyHook(target, replace, prepared);
+
+    /* [R104] ② 每次 hook 后立即检查：Dobby 写跳板常把该页翻成 --x。
+       只要该页已被我们接管（私有 COW 副本），此刻 vm_protect(RW|COPY)->R|X
+       就能成功补回 READ；下一个同页 target（如 #9）进入时页已是 r-x，
+       relo_relocate 正常读、不 SIGSEGV。私有页不受 code-signing 约束。
+       失败也不改 rc、不跳过 —— 零降级零跳过红线不变。 */
+    if (r103_cfg_cow && !nullish && !misalign && rc == 0) {
+        uint64_t page_base = t & ~((uint64_t)(pg104 - 1));
+        if (r102_page_taken(page_base)) {
+            unsigned char chk[4];
+            if (!r97_safe_read(target, chk, sizeof(chk))) {
+                char why[320] = "";
+                int ok = r104_page_private_rx(page_base, (size_t)pg104, "hook后恢复",
+                                              seq, t, why, sizeof(why));
+                printf("[r104][post] #%u page=0x%llx 页被翻--x->恢复r-x ok=%d %s\n",
+                       seq, (unsigned long long)page_base, ok, why);
+                fflush(stdout);
+            }
+        }
+    }
 
     if (rc != 0) {
         printf("[r100][dob] #%u DobbyHook rc=%d（真失败，不用原版顶替）\n", seq, rc);
