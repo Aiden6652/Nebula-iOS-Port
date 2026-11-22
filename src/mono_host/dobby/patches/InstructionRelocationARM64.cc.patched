@@ -1,3 +1,5 @@
+#include <string.h>   /* [NEBULA] Dobby 头里用 memset/memcpy，独立编译时需显式引入 */
+
 #include "platform_detect_macro.h"
 
 #if defined(TARGET_ARCH_ARM64)
@@ -22,13 +24,13 @@
 #include <mach/vm_map.h>
 static inline uint32_t nebula_read_inst(void *p) {
   uint32_t v = 0;
-  vm_size_t out = 0;
+  mach_msg_type_number_t out = 0;   /* vm_read 第5参是 mach_msg_type_number_t* */
   vm_offset_t data = 0;
   kern_return_t kr = vm_read(mach_task_self(), (vm_address_t)(uintptr_t)p,
                              (vm_size_t)sizeof(v), &data, &out);
   if (kr != KERN_SUCCESS || out < sizeof(v)) return 0;
   __builtin_memcpy(&v, (const void *)data, sizeof(v));
-  vm_deallocate(mach_task_self(), data, out);
+  vm_deallocate(mach_task_self(), data, (vm_size_t)out);
   return v;
 }
 #define NEBULA_RELO_READ(p) (nebula_read_inst(p))
