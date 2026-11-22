@@ -649,6 +649,58 @@ static int r104_page_private_rx(uint64_t base, size_t pg, const char *when,
 }
 
 /* ==========================================================================
+ * [R106] 根治 execute-only target（#9 类）SIGSEGV —— 前 7 轮的关键盲点：
+ *   relo_relocate 用 CPU `ldr` 读源指令（崩溃指令 ldr w23,[x8] 实锤），而
+ *   iOS 的 r-x 代码页是 APRR execute-only —— CPU 数据读必 SIGSEGV。
+ *   R97b 的 r97_safe_read 走 vm_read（内核 Mach IPC），能读 execute-only 页，
+ *   所以 probe 一直误报"可读"；R99~R105 全拿 vm_read 当判据、还把页恢复成
+ *   r-x（在 iOS 上依旧 execute-only），Dobby 的 CPU ldr 自然还是读不到。
+ * R106 正解：进 DobbyHook 前把 target 页设成【私有 COW + rw-】（CPU 数据可读），
+ *   不设 r-x。Dobby relo 的 CPU ldr 读源成功；DobbyCodePatch 写跳板时会自己
+ *   vm_protect(R|W|COPY)->memcpy->vm_protect(R|X) 恢复 r-x（无 W），全程无
+ *   W+X 同帧。同页第二个 target（#9）进入前再设一次 rw-，循环成立。
+ *   零降级零跳过：设权限失败也照常送 DobbyHook，不替它决定。
+ *   A/B：NEBULA_R106_RW=0 关闭（回 R105 路径对照）。
+ * ========================================================================= */
+static int r106_cfg = -1;
+static void r106_cfg_init(void) {
+    if (r106_cfg >= 0) return;
+    r106_cfg = 1;
+    const char *v = getenv("NEBULA_R106_RW");
+    if (v && !strcmp(v, "0")) r106_cfg = 0;
+    printf("[r106][cfg] 进hook前设页rw-(CPU可读) enabled=%d 页大小=%ld "
+           "(NEBULA_R106_RW=0关闭)\n", r106_cfg, (long)getpagesize());
+    fflush(stdout);
+}
+
+/* 把整页设成【私有 COW + rw-】（CPU 数据可读、无 X）。返回 1 成功。
+   先 RW|COPY 建私有副本（首触必成，hook 后页已是私有时也幂等）；
+   再兜底纯 RW（页本就私有、COPY 被拒时）。 */
+static int r106_page_rw(uint64_t base, size_t pg, const char *when,
+                        unsigned seq, char *reason, size_t cap) {
+#ifdef __APPLE__
+    (void)seq;
+    vm_map_t self = mach_task_self();
+    kern_return_t kr = vm_protect(self, (vm_address_t)base, (vm_size_t)pg,
+                                  FALSE, VM_PROT_READ | VM_PROT_WRITE |
+                                         VM_PROT_COPY);
+    if (kr == KERN_SUCCESS) {
+        snprintf(reason, cap, "%s rw-|COPY 成功 kr=0", when);
+        return 1;
+    }
+    kern_return_t kr2 = vm_protect(self, (vm_address_t)base, (vm_size_t)pg,
+                                   FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    snprintf(reason, cap, "%s rw-|COPY kr=%d 兜底rw- kr=%d", when,
+             (int)kr, (int)kr2);
+    return (kr2 == KERN_SUCCESS);
+#else
+    (void)base; (void)pg; (void)when; (void)seq;
+    snprintf(reason, cap, "非Apple平台跳过");
+    return 1;
+#endif
+}
+
+/* ==========================================================================
  * [R105] 源头拦截：fishhook 重绑定 mprotect / vm_protect / mach_vm_protect，
  *   在 Dobby 把代码页设成 execute-only(--x，有 X 无 R) 的那一刻强制保留 READ，
  *   让同页的下一个 target（#9）的 relo_relocate 能正常 CPU 读，不再 SIGSEGV。
@@ -851,6 +903,12 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
             }
         }
         r103_cfg_init();
+        r106_cfg_init();
+        printf("[r106][boot] ===== R106：hook前把target页设私有COW+rw-(CPU可读) —— 修 #9 relo SIGSEGV =====\n");
+        printf("[r106][boot] 根因=R99~R105全拿vm_read当可读判据，但iOS的r-x=execute-only(APRR)，CPU ldr读不了；\n");
+        printf("[r106][boot]   Dobby relo_relocate用CPU ldr读源(ldr w23,[x8]实锤)。rw-页CPU数据可读，relo不再崩。\n");
+        printf("[r106][boot] DobbyCodePatch在其后写跳板并自行恢复r-x；同页#9进来前再设一次rw-。\n");
+        printf("[r106][boot] 零降级零跳过；W^X严格(设权限期rw-无X)；NEBULA_R106_RW=0关闭做A/B。\n");
         printf("[r105][boot] ===== R105：fishhook 源头拦 mprotect/vm_protect/mach_vm_protect 的 --x -> r-x =====\n");
         printf("[r105][boot] R104 真机钉死：首触私有化 #1~#8 全 kr=0，但 hook 后补 r-x 全 kr1=3 kr2=3(NO_SPACE)；\n");
         printf("[r105][boot]   根因=Dobby 把 maximum protection 也降到 --x，事后补 READ 六轮全败。\n");
@@ -967,6 +1025,24 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
        已写 detour 完整保留）。未被接管的页是 vm_read 可读页，走 R97b 86 个
        真 hook 已实证的原路径。全程无 W+X 同时态：写态 rw- 无 X，执行态
        r-x 无 W。接管失败也照常送 DobbyHook —— 零跳过，不降级，不用原版顶替。 */
+
+    /* [R106] 最后一道权限动作：紧挨 DobbyHook 之前，把 target 页设成【私有 COW
+       + rw-】(CPU 数据可读)。这是 R99~R105 的关键盲点：它们全拿 vm_read 当可读
+       判据、还把页留成 r-x，而 iOS 的 r-x 是 execute-only、CPU ldr 读不了；
+       Dobby 的 relo_relocate 恰恰用 CPU ldr 读源（崩溃指令实锤）。rw- 页 CPU
+       可读，relo 不再 SIGSEGV。DobbyCodePatch 在其后自己写跳板并恢复 r-x，
+       不影响本次 relo；同页 #9 进来前会再走这里设一次 rw-。零降级零跳过：
+       设权限失败也照常送 DobbyHook。 */
+    if (r106_cfg && !nullish && !misalign) {
+        uint64_t pb106 = t & ~((uint64_t)(pg104 - 1));
+        char why106[320] = "";
+        int ok106 = r106_page_rw(pb106, (size_t)pg104, "hook前", seq,
+                                 why106, sizeof(why106));
+        printf("[r106][pre] #%u page=0x%llx %s ok=%d [前readT=%d]\n",
+               seq, (unsigned long long)pb106, why106, ok106, got_target);
+        fflush(stdout);
+    }
+
     int rc = DobbyHook(target, replace, prepared);
 
     /* [R104] ② 每次 hook 后立即检查：Dobby 写跳板常把该页翻成 --x。
