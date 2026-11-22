@@ -207,6 +207,8 @@
 #include <mach/mach.h>
 #include <mach/vm_map.h>            /* r97_safe_read 的 vm_read（R97 起真机验证） */
 #include <libkern/OSCacheControl.h> /* [R102] sys_icache_invalidate：影子页翻 RX 后刷缓存 */
+#include <sys/mman.h>               /* [R105] mprotect / PROT_READ|PROT_EXEC */
+#include "fishhook.h"               /* [R105] rebind_symbols：拦截 Dobby 翻 --x 的源头 */
 /* [R103] 恢复 vm_protect + VM_PROT_COPY（fishhook.c:148 是仓库真机验证范式）：
    - R100c 用的是不带 COPY 的 POSIX mprotect（对 code-signed 共享页无效）；
    - R101 用 vm_protect+COPY 但诊断被 stdio 缓冲吞光、kr 从未真机确认；
@@ -646,6 +648,108 @@ static int r104_page_private_rx(uint64_t base, size_t pg, const char *when,
 #endif
 }
 
+/* ==========================================================================
+ * [R105] 源头拦截：fishhook 重绑定 mprotect / vm_protect / mach_vm_protect，
+ *   在 Dobby 把代码页设成 execute-only(--x，有 X 无 R) 的那一刻强制保留 READ，
+ *   让同页的下一个 target（#9）的 relo_relocate 能正常 CPU 读，不再 SIGSEGV。
+ * --------------------------------------------------------------------------
+ * R104 真机钉死（nebula_host.txt 1255-1314）：
+ *   首触私有化 #1~#8 全成功 kr=0，但每个 hook 后 [r104][post] 补 r-x 全失败
+ *   kr1=3 kr2=3（KERN_NO_SPACE）—— 页被 Dobby 翻成 --x 后 maximum protection
+ *   已被降到 EXEC-only，事后无论 vm_protect(RW|COPY) 还是 (R|X|COPY) 都补不回
+ *   READ。R99→R104 六轮"事后改权限"全部被真机证伪，此路不通。
+ *   #8/#9 同页 0x117c58000，#9 进入时页仍 --x -> relo_relocate 读 -> SIGSEGV。
+ * R105 正解（改源头，不改事后）：
+ *   Dobby 归档符号实锤用 _mprotect / _vm_protect / _mach_vm_protect 翻页
+ *   （mprotect_impl / vm_protect_impl / DobbyCodePatch::vm_protect_impl）。
+ *   用 fishhook 重绑定这三个符号：仅当 prot【有 EXEC 且无 READ】时，补上 READ
+ *   变成 r-x 再透传给原函数；其它 prot 组合一律原样透传（mono JIT 的 W^X
+ *   翻转、fishhook 自身的 RW|COPY 写符号表都不受影响，绝不制造 W+X 同帧）。
+ *   这样 Dobby 从一开始就拿不到 --x 页，maximum 不会被锁死，#9 进去即可读。
+ *   红线不变：零降级零跳过、W^X 严格（r-x 无 W / rw- 无 X）、只拦 --x 一种。
+ *   A/B：NEBULA_R105_FISH=0 关闭拦截，回到 R104 路径做对照。
+ * ========================================================================== */
+#ifdef __APPLE__
+static int (*r105_real_mprotect)(void *, size_t, int) = NULL;
+static kern_return_t (*r105_real_vm_protect)(vm_map_t, vm_address_t, vm_size_t,
+                                             boolean_t, vm_prot_t) = NULL;
+static kern_return_t (*r105_real_mach_vm_protect)(vm_map_t, mach_vm_address_t,
+                                                  mach_vm_size_t, boolean_t,
+                                                  vm_prot_t) = NULL;
+static volatile unsigned r105_fish_mprotect = 0;
+static volatile unsigned r105_fish_vm = 0;
+static volatile unsigned r105_fish_machvm = 0;
+static volatile unsigned r105_fish_passthru = 0;
+
+/* 只拦 execute-only：有 EXEC、无 READ。补 READ -> r-x，绝不引入 W。 */
+static int r105_mprotect(void *addr, size_t len, int prot) {
+    if ((prot & PROT_EXEC) && !(prot & PROT_READ)) {
+        int np = prot | PROT_READ;
+        r105_fish_mprotect++;
+        if (r105_fish_mprotect <= 12)
+            printf("[r105][fish] mprotect 拦 --x->r-x #%u p=%#x->%#x\n",
+                   r105_fish_mprotect, prot, np);
+        prot = np;
+    } else {
+        r105_fish_passthru++;
+    }
+    if (!r105_real_mprotect) { errno = ENOSYS; return -1; }
+    return r105_real_mprotect(addr, len, prot);
+}
+
+static kern_return_t r105_vm_protect(vm_map_t task, vm_address_t addr,
+                                     vm_size_t size, boolean_t set_maximum,
+                                     vm_prot_t new_protection) {
+    if ((new_protection & VM_PROT_EXECUTE) && !(new_protection & VM_PROT_READ)) {
+        vm_prot_t np = new_protection | VM_PROT_READ;
+        r105_fish_vm++;
+        if (r105_fish_vm <= 12)
+            printf("[r105][fish] vm_protect 拦 --x->r-x #%u p=%#x->%#x\n",
+                   r105_fish_vm, (unsigned)new_protection, (unsigned)np);
+        new_protection = np;
+    } else {
+        r105_fish_passthru++;
+    }
+    if (!r105_real_vm_protect) return KERN_FAILURE;
+    return r105_real_vm_protect(task, addr, size, set_maximum, new_protection);
+}
+
+static kern_return_t r105_mach_vm_protect(vm_map_t task, mach_vm_address_t addr,
+                                          mach_vm_size_t size, boolean_t set_maximum,
+                                          vm_prot_t new_protection) {
+    if ((new_protection & VM_PROT_EXECUTE) && !(new_protection & VM_PROT_READ)) {
+        vm_prot_t np = new_protection | VM_PROT_READ;
+        r105_fish_machvm++;
+        if (r105_fish_machvm <= 12)
+            printf("[r105][fish] mach_vm_protect 拦 --x->r-x #%u p=%#x->%#x\n",
+                   r105_fish_machvm, (unsigned)new_protection, (unsigned)np);
+        new_protection = np;
+    } else {
+        r105_fish_passthru++;
+    }
+    if (!r105_real_mach_vm_protect) return KERN_FAILURE;
+    return r105_real_mach_vm_protect(task, addr, size, set_maximum, new_protection);
+}
+
+/* 在第一次 DobbyPrepare 之前安装（seq==1 分支）。幂等。 */
+static void r105_install_fishhook(void) {
+    static int installed = 0;
+    if (installed) return;
+    installed = 1;
+    struct rebinding rb[] = {
+        { "mprotect",        (void *)r105_mprotect,        (void **)&r105_real_mprotect },
+        { "vm_protect",      (void *)r105_vm_protect,      (void **)&r105_real_vm_protect },
+        { "mach_vm_protect", (void *)r105_mach_vm_protect, (void **)&r105_real_mach_vm_protect },
+    };
+    int n = rebind_symbols(rb, 3);
+    printf("[r105][boot] fishhook 装 mprotect/vm_protect/mach_vm_protect n=%d "
+           "real(m=%p v=%p mv=%p)\n", n,
+           (void *)r105_real_mprotect, (void *)r105_real_vm_protect,
+           (void *)r105_real_mach_vm_protect);
+    fflush(stdout);
+}
+#endif /* __APPLE__ */
+
 /* 开关：默认开；NEBULA_R104_COW=0（或旧名 NEBULA_R103_COW=0）关闭做 A/B。 */
 static int r103_cfg_cow = -1;
 static void r103_cfg_init(void) {
@@ -733,8 +837,26 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
 
     if (seq == 1) {
         gettimeofday(&r98_t0, NULL);
+        /* [R105] 必须在任何 DobbyHook 之前装 fishhook：源头拦 Dobby 翻 --x。
+           NEBULA_R105_FISH=0 关掉做 A/B；默认开。 */
+        {
+            const char *fish_off = getenv("NEBULA_R105_FISH");
+            if (!(fish_off && !strcmp(fish_off, "0"))) {
+#ifdef __APPLE__
+                r105_install_fishhook();
+#endif
+            } else {
+                printf("[r105][boot] NEBULA_R105_FISH=0 关闭 fishhook 拦截（A/B 对照）\n");
+                fflush(stdout);
+            }
+        }
         r103_cfg_init();
-        printf("[r104][boot] ===== R104：首触页抢先 COW 私有化 + 每次 hook 后恢复 r-x（不再事后补 READ）=====\n");
+        printf("[r105][boot] ===== R105：fishhook 源头拦 mprotect/vm_protect/mach_vm_protect 的 --x -> r-x =====\n");
+        printf("[r105][boot] R104 真机钉死：首触私有化 #1~#8 全 kr=0，但 hook 后补 r-x 全 kr1=3 kr2=3(NO_SPACE)；\n");
+        printf("[r105][boot]   根因=Dobby 把 maximum protection 也降到 --x，事后补 READ 六轮全败。\n");
+        printf("[r105][boot] R105 正解：Dobby 设页时只拦【有 X 无 R】，补 READ 成 r-x 再透传；\n");
+        printf("[r105][boot]   其它 prot 原样透传(mono W^X 翻转/fishhook RW|COPY 不动)，零 W+X 同帧。\n");
+        printf("[r104][boot] ===== R104 保留：首触页抢先 COW 私有化 + 每次 hook 后恢复 r-x（不再事后补 READ）=====\n");
         printf("[r104][boot] R103 真机钉死：#8/#9 同页，#9 三档补READ全失败 krA=2/krB,C=3(NO_SPACE)；\n");
         printf("[r104][boot]   根因=该页是 code-signed file-backed 共享映射，翻成 --x 后内核拒绝再提 READ。\n");
         printf("[r104][boot] R104 正解：① 首触页(RW|COPY)建私有COW副本->r-x ② hook后若被翻--x立即补回r-x；\n");
@@ -895,6 +1017,11 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
                seq, g_r97b_patch_ok, g_r97b_patch_down, g_r97_hook_n, ms,
                t, r97_image_of(target), r, r97_image_of(replace), got_replace,
                got_post, really);
+#ifdef __APPLE__
+        printf("[r105][fish] 命中 mprotect=%u vm_protect=%u mach_vm=%u 透传=%u\n",
+               r105_fish_mprotect, r105_fish_vm, r105_fish_machvm,
+               r105_fish_passthru);
+#endif
         fflush(stdout);
     }
     /* [R98b] 崩点高发区（R98 停在 #162）：每 8 个 patch 一条极简编号，
