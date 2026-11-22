@@ -517,6 +517,20 @@ if [ ! -f "$DOBBY_A" ]; then
   exit 1
 fi
 
+# [R110] 从源码重编 Dobby 的 relo .o 替换进 libdobby.a —— 根治 iOS execute-only
+# 页 hook 的 relo SIGSEGV（R99~R109 十一轮 shim 权限补丁全部作废删除）。
+# 唯一改动：relo_relocate 读源 CPU ldr -> vm_read（Mach IPC 能读 execute-only）。
+# 写跳板保持 Dobby 上游原样。rebuild_dobby_ios.sh 在 CI(macos-15) 上
+# clone 同源 commit(b0176de) Dobby -> 覆盖 relo.cc -> xcrun clang 编 .o -> ar r 替换。
+if [ -f "$ROOT/dobby/rebuild_dobby_ios.sh" ]; then
+  echo "    [R110] 从源码重编 Dobby（relo 读源 vm_read）..."
+  bash "$ROOT/dobby/rebuild_dobby_ios.sh"
+  echo "    [R110] Dobby 重编完成：$(wc -c < "$DOBBY_A") bytes"
+else
+  echo "!! [R110] 缺 rebuild_dobby_ios.sh，无法重编 Dobby —— 拒绝用旧库(会崩)" >&2
+  exit 1
+fi
+
 # [R96b] 关键修复：从 dobby 归档里【删掉 dobby.cpp.o 这一个成员】，其余
 #   原样 -force_load 整包链入（绝不展开成裸 .o！）。
 #   为什么必须删：dobby.cpp.o 定义上游 _DobbyDestroy / _DobbyGetVersion。
@@ -561,22 +575,13 @@ if "$NM_BIN" -g "$DOBBY_A_R96B" 2>/dev/null | grep -q "T _DobbyDestroy"; then
   echo "!! [R96b] 归档内仍有 _DobbyDestroy，无法链接（会 duplicate symbol）" >&2
   exit 1
 fi
-# [R108] 再删 code-patch-tool-darwin.cc.o：上游 _DobbyCodePatch 对 iOS
-#   code-signed __TEXT_EXEC 页做 vm_protect(R|W|COPY)->memcpy->vm_protect(R|X)，
-#   把页 maximum 钉成 execute-only，同页第二个 target relo CPU ldr 读源 SIGSEGV
-#   (R99~R107 九轮证伪)。shim 现在提供影子页版 DobbyCodePatch，必须排除上游同名符号。
-#   该 .o 只定义 _DobbyCodePatch / _mprotect_impl（全归档无人引用后者），删除安全。
-if "$AR_BIN" t "$DOBBY_A_R96B" 2>/dev/null | grep -qx "code-patch-tool-darwin.cc.o"; then
-  "$AR_BIN" d "$DOBBY_A_R96B" code-patch-tool-darwin.cc.o
-  echo "    [R108] 已从归档删除 code-patch-tool-darwin.cc.o（shim 影子页 DobbyCodePatch 接管）"
-else
-  echo "    [R108] ⚠ 归档内未找到 code-patch-tool-darwin.cc.o，检查 _DobbyCodePatch 是否会 duplicate" >&2
-fi
-if "$NM_BIN" -g "$DOBBY_A_R96B" 2>/dev/null | grep -q "T _DobbyCodePatch"; then
-  echo "!! [R108] 归档内仍有 _DobbyCodePatch，与 shim 影子页版 duplicate symbol" >&2
+# [R110] 保留上游 code-patch-tool-darwin.cc.o（写跳板逻辑不动，首次写真机已验证）。
+# R108 的"删掉+shim 假 DobbyCodePatch"方案随 R110 一并作废。
+if ! "$AR_BIN" t "$DOBBY_A_R96B" 2>/dev/null | grep -qx "code-patch-tool-darwin.cc.o"; then
+  echo "!! [R110] 归档内缺 code-patch-tool-darwin.cc.o，异常" >&2
   exit 1
 fi
-echo "    [R108] 归档完好：$("$AR_BIN" t "$DOBBY_A_R96B" 2>/dev/null | wc -l | tr -d ' ') 个成员，上游 DobbyCodePatch 已排除"
+echo "    [R110] 归档保留上游 code-patch-tool-darwin.cc.o（写跳板逻辑不变）"
 # FORCE_DOBBY 恒有 1 个元素，永不为空 —— 避免 bash 3.2 + set -u 下展开空数组。
 FORCE_DOBBY=("-Wl,-force_load,$DOBBY_A_R96B")
 FORCE_NATIVE=()
