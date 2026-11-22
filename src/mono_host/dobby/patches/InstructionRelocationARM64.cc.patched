@@ -1,5 +1,3 @@
-#include <string.h>   /* [NEBULA] Dobby 头里用 memset/memcpy，独立编译时需显式引入 */
-
 #include "platform_detect_macro.h"
 
 #if defined(TARGET_ARCH_ARM64)

@@ -42,11 +42,13 @@ echo "[dobby-rebuild] 源码就绪 $(git -C "$SRC" rev-parse --short HEAD)"
 cp -f "$PATCH" "$SRC/source/InstructionRelocation/arm64/InstructionRelocationARM64.cc"
 
 # 3. include 路径（对齐 b0176de 的 CMakeLists include_directories）
+# 注意：不要加 -I$SRC/external/TINYSTL —— 否则 platform_features.h 的
+# #include <string.h> 会撞到 TINYSTL/string.h（无 size_t）。TINYSTL/vector.h
+# 由 -I$SRC/external 提供即可（源码写的是 <TINYSTL/vector.h>）。
 INC=("$SRC" "$SRC/include" "$SRC/source" "$SRC/source/dobby"
      "$SRC/external" "$SRC/external/logging" "$SRC/builtin-plugin"
      "$SRC/source/Backend/UserMode"
-     "$SRC/source/InstructionRelocation/arm64"
-     "$SRC/external/TINYSTL")
+     "$SRC/source/InstructionRelocation/arm64")
 INCS=""
 for d in "${INC[@]}"; do INCS="$INCS -I$d"; done
 
