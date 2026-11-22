@@ -561,7 +561,22 @@ if "$NM_BIN" -g "$DOBBY_A_R96B" 2>/dev/null | grep -q "T _DobbyDestroy"; then
   echo "!! [R96b] 归档内仍有 _DobbyDestroy，无法链接（会 duplicate symbol）" >&2
   exit 1
 fi
-echo "    [R96b] 归档完好：$MEMBERS 个成员，DobbyDestroy 已排除，DobbyHook/vtable 保留"
+# [R108] 再删 code-patch-tool-darwin.cc.o：上游 _DobbyCodePatch 对 iOS
+#   code-signed __TEXT_EXEC 页做 vm_protect(R|W|COPY)->memcpy->vm_protect(R|X)，
+#   把页 maximum 钉成 execute-only，同页第二个 target relo CPU ldr 读源 SIGSEGV
+#   (R99~R107 九轮证伪)。shim 现在提供影子页版 DobbyCodePatch，必须排除上游同名符号。
+#   该 .o 只定义 _DobbyCodePatch / _mprotect_impl（全归档无人引用后者），删除安全。
+if "$AR_BIN" t "$DOBBY_A_R96B" 2>/dev/null | grep -qx "code-patch-tool-darwin.cc.o"; then
+  "$AR_BIN" d "$DOBBY_A_R96B" code-patch-tool-darwin.cc.o
+  echo "    [R108] 已从归档删除 code-patch-tool-darwin.cc.o（shim 影子页 DobbyCodePatch 接管）"
+else
+  echo "    [R108] ⚠ 归档内未找到 code-patch-tool-darwin.cc.o，检查 _DobbyCodePatch 是否会 duplicate" >&2
+fi
+if "$NM_BIN" -g "$DOBBY_A_R96B" 2>/dev/null | grep -q "T _DobbyCodePatch"; then
+  echo "!! [R108] 归档内仍有 _DobbyCodePatch，与 shim 影子页版 duplicate symbol" >&2
+  exit 1
+fi
+echo "    [R108] 归档完好：$("$AR_BIN" t "$DOBBY_A_R96B" 2>/dev/null | wc -l | tr -d ' ') 个成员，上游 DobbyCodePatch 已排除"
 # FORCE_DOBBY 恒有 1 个元素，永不为空 —— 避免 bash 3.2 + set -u 下展开空数组。
 FORCE_DOBBY=("-Wl,-force_load,$DOBBY_A_R96B")
 FORCE_NATIVE=()

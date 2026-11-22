@@ -681,17 +681,26 @@ static int r106_page_rw(uint64_t base, size_t pg, const char *when,
 #ifdef __APPLE__
     (void)seq;
     vm_map_t self = mach_task_self();
+    /* [R107] R106 真机钉死：#9 hook前 rw-|COPY kr=3 / 兜底rw- kr=2 全败，
+       根因=R99~R106 八轮全用 set_maximum=FALSE 只改 current，#8 的 DobbyHook
+       已把该页 maximum protection 钉成 execute-only，current 提权必被内核拒。
+       唯一未试维度：set_maximum=TRUE 抬高 maximum 上限到 RWX。页已由首触
+       VM_PROT_COPY 私有化(kr=0)，私有脏页允许抬上限；current 仍设 rw- 无 X，
+       W^X 严格(maximum 是上限，非当前映射)。抬上限成功则同页 #9 可反复提权。 */
+    kern_return_t krm = vm_protect(self, (vm_address_t)base, (vm_size_t)pg,
+                                   TRUE, VM_PROT_READ | VM_PROT_WRITE |
+                                         VM_PROT_EXECUTE);
     kern_return_t kr = vm_protect(self, (vm_address_t)base, (vm_size_t)pg,
                                   FALSE, VM_PROT_READ | VM_PROT_WRITE |
                                          VM_PROT_COPY);
     if (kr == KERN_SUCCESS) {
-        snprintf(reason, cap, "%s rw-|COPY 成功 kr=0", when);
+        snprintf(reason, cap, "%s max↑kr=%d rw-|COPY 成功 kr=0", when, (int)krm);
         return 1;
     }
     kern_return_t kr2 = vm_protect(self, (vm_address_t)base, (vm_size_t)pg,
                                    FALSE, VM_PROT_READ | VM_PROT_WRITE);
-    snprintf(reason, cap, "%s rw-|COPY kr=%d 兜底rw- kr=%d", when,
-             (int)kr, (int)kr2);
+    snprintf(reason, cap, "%s max↑kr=%d rw-|COPY kr=%d 兜底rw- kr=%d", when,
+             (int)krm, (int)kr, (int)kr2);
     return (kr2 == KERN_SUCCESS);
 #else
     (void)base; (void)pg; (void)when; (void)seq;
@@ -904,7 +913,15 @@ int DobbyPrepare(void *target, void *replace, void **prepared) {
         }
         r103_cfg_init();
         r106_cfg_init();
-        printf("[r106][boot] ===== R106：hook前把target页设私有COW+rw-(CPU可读) —— 修 #9 relo SIGSEGV =====\n");
+        printf("[r108][boot] ===== R108：接管DobbyCodePatch，vm_remap影子页写跳板(原页权限不动,RX恒可读) =====\n");
+        printf("[r108][boot] R107真机钉死：#9 rw-|COPY kr=3 兜底rw- kr=2 —— maximum已被Dobby钉死，改权限九轮全灭。\n");
+        printf("[r108][boot] 正解=R63影子页移植：别名RW写跳板=写物理页，原代码页全程RX，relo CPU ldr恒可读。\n");
+        printf("[r108][boot] 构建已删上游code-patch-tool-darwin.cc.o；NEBULA_R108_SHADOW=0退直写做A/B。\n");
+        printf("[r107][boot] ===== R107 保留：hook前 set_maximum=TRUE 抬页上限RWX + current rw- =====\n");
+        printf("[r107][boot] R106 真机钉死：#9 rw-|COPY kr=3 兜底rw- kr=2 —— 八轮set_maximum=FALSE只改current，\n");
+        printf("[r107][boot]   maximum已被#8的Dobby钉成execute-only。R107抬maximum到RWX再设current rw-；\n");
+        printf("[r107][boot]   [r106][pre]的 reason 若含『max↑kr=0』=抬上限成功。W^X严格(current rw-无X)。\n");
+        printf("[r106][boot] ===== R106 保留：hook前把target页设私有COW+rw-(CPU可读) =====\n");
         printf("[r106][boot] 根因=R99~R105全拿vm_read当可读判据，但iOS的r-x=execute-only(APRR)，CPU ldr读不了；\n");
         printf("[r106][boot]   Dobby relo_relocate用CPU ldr读源(ldr w23,[x8]实锤)。rw-页CPU数据可读，relo不再崩。\n");
         printf("[r106][boot] DobbyCodePatch在其后写跳板并自行恢复r-x；同页#9进来前再设一次rw-。\n");
@@ -1127,4 +1144,109 @@ int DobbyDestroy(void *address) {
     printf("[r97b][destroy] #%u address=0x%llx -> no-op（不写回代码页）\n",
            dseq, (unsigned long long)(uintptr_t)address);
     return 0;   /* 0 = 成功，BepInEx UndoImpl 直接 pop 丢弃 */
+}
+
+/* ==========================================================================
+ * [R108] 接管 DobbyCodePatch —— R63 影子页(dual-map)思想移植到 Dobby 路径。
+ * --------------------------------------------------------------------------
+ * 为什么必须接管：上游 cpt.cc:158-163 写跳板时对代码页做
+ *   vm_protect(R|W|COPY) -> memcpy -> vm_protect(R|X)。
+ * iOS 的 code-signed __TEXT_EXEC 页经此一翻，maximum 被钉成 execute-only
+ * (APRR 吞 READ)，同页第二个 target(#9) 的 relo_relocate 用 CPU ldr 读源
+ * 必 SIGSEGV。R99~R107 九轮全在"事后改权限"层打转，真机全部证伪。
+ *
+ * R108 根治：仿 R63，用 vm_remap 映射一个【同物理页的 RW 别名】，跳板写到
+ * 别名页(=写物理页)，原代码页权限从头到尾不动(保持 RX 可数据读)。于是
+ * relo_relocate 的 CPU ldr 读源永远成功，#9 不再崩；也不制造 W+X 同帧
+ * (别名页 RW 无 X，原页 RX 无 W)。构建脚本已从归档删掉上游
+ * code-patch-tool-darwin.cc.o，本函数是唯一 _DobbyCodePatch 实现。
+ * A/B：NEBULA_R108_SHADOW=0 时退回上游同款直写(仅供归因，默认开)。
+ * ========================================================================== */
+#ifdef __APPLE__
+static int r108_cfg_shadow = -1;
+static void r108_cfg_init(void) {
+    if (r108_cfg_shadow >= 0) return;
+    r108_cfg_shadow = 1;
+    const char *v = getenv("NEBULA_R108_SHADOW");
+    if (v && !strcmp(v, "0")) r108_cfg_shadow = 0;
+}
+
+/* 与 R63 host.c 同款：vm_remap 同物理页 RW 别名，写跳板不碰原页权限。
+   返回 0 成功；kr != 0 时失败由调用方决定回退。 */
+static int r108_patch_via_alias(void *address, uint8_t *buffer,
+                                uint32_t buffer_size, long pg) {
+    uintptr_t page = (uintptr_t)address & ~((uintptr_t)pg - 1);
+    vm_address_t alias = 0;
+    vm_prot_t curp = 0, maxp = 0;
+    kern_return_t kr = vm_remap(mach_task_self(), &alias, (vm_size_t)pg, 0,
+                                VM_FLAGS_ANYWHERE, mach_task_self(),
+                                (vm_address_t)page, FALSE, &curp, &maxp,
+                                VM_INHERIT_SHARE);
+    if (kr != KERN_SUCCESS) return (int)kr;
+    /* 别名默认可能沿用源 RX，强制 RW（别名页无 X，W^X 安全） */
+    kr = vm_protect(mach_task_self(), alias, (vm_size_t)pg, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) return (int)kr;
+    /* 原页 offset 处写跳板：别名与原页同物理内存，等价于写原页。 */
+    memcpy((void *)(alias + ((uintptr_t)address - page)), buffer, buffer_size);
+    /* 原页恢复 RX 供取指。关键：一步 R|X、绝不先做 R|W|COPY —— 上游正是
+       "COPY 建私有副本 + R|X" 把 max 钉成 execute-only；这里不污染。 */
+    kern_return_t krx = vm_protect(mach_task_self(), (vm_address_t)page,
+                                   (vm_size_t)pg, FALSE,
+                                   VM_PROT_READ | VM_PROT_EXECUTE);
+    /* 刷指令缓存：别名写了物理页，原地址取指需失效 */
+    sys_icache_invalidate((void *)(uintptr_t)address,
+                          (size_t)(buffer_size + ((uintptr_t)address - page)));
+    if (krx != KERN_SUCCESS) return (int)krx;
+    return 0;
+}
+#endif  /* __APPLE__ */
+
+__attribute__((visibility("default")))
+int DobbyCodePatch(void *address, uint8_t *buffer, uint32_t buffer_size) {
+    static unsigned cseq = 0;
+    unsigned seq = ++cseq;
+    if (!address || !buffer || buffer_size == 0) return -1;
+    long pg = getpagesize();
+    if (pg <= 0) pg = 16384;
+#ifdef __APPLE__
+    r108_cfg_init();
+    /* 跨页：照搬上游递归拆分 */
+    if ((uintptr_t)address + buffer_size >
+        (((uintptr_t)address & ~((uintptr_t)pg - 1)) + (uintptr_t)pg)) {
+        uint32_t a = (uint32_t)((((uintptr_t)address & ~((uintptr_t)pg - 1)) + pg)
+                                - (uintptr_t)address);
+        if (DobbyCodePatch(address, buffer, a) == -1) return -1;
+        return DobbyCodePatch((void *)((uintptr_t)address + a), buffer + a,
+                              buffer_size - a);
+    }
+    if (r108_cfg_shadow) {
+        int kr = r108_patch_via_alias(address, buffer, buffer_size, pg);
+        if (kr == 0) {
+            if (seq <= 12 || (seq % 32) == 0)
+                printf("[r108][patch] #%u addr=0x%llx sz=%u 影子页写跳板 OK "
+                       "(原页权限不动, RX 可读)\n",
+                       seq, (unsigned long long)(uintptr_t)address, buffer_size);
+            fflush(stdout);
+            return 0;
+        }
+        printf("[r108][patch] #%u addr=0x%llx vm_remap影子页失败 kr=%d "
+               "-> 回退直写(可能崩)\n",
+               seq, (unsigned long long)(uintptr_t)address, kr);
+        fflush(stdout);
+    }
+    /* 回退：上游同款直写（A/B 或影子页失败时） */
+    vm_protect(mach_task_self(),
+               (vm_address_t)((uintptr_t)address & ~((uintptr_t)pg - 1)),
+               (vm_size_t)pg, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    memcpy(address, buffer, buffer_size);
+    vm_protect(mach_task_self(),
+               (vm_address_t)((uintptr_t)address & ~((uintptr_t)pg - 1)),
+               (vm_size_t)pg, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate(address, (size_t)buffer_size);
+    return 0;
+#else
+    (void)seq;
+    return -1;
+#endif
 }
