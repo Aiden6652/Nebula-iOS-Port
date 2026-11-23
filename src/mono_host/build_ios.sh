@@ -276,6 +276,22 @@ else
   echo "   [R116] ⚠ 缺 dotnet 或 BEPINEX_CORE_DIR，跳过模块名补丁（第三方动态注入插件可能加载失败）" >&2
 fi
 
+# [U001] 通用加载器入口补丁：给 IL2CPPChainloader.dll 加 UniversalExecute()
+#   （方法体复制 NOS 私有的 NebulaManualExecute = PreloadInteropAssemblies+Execute，通用逻辑）。
+#   宿主优先调 UniversalExecute -> 任意 BepInEx6 IL2CPP 插件包都能加载；找不到回退 NOS。
+#   仅 universal-loader 分支调用；main 分支 build_ios.sh 无此段，保持 NOS-only。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  UE_PROJ="$ROOT/../../tools/patch_universal_execute/patch_universal_execute.csproj"
+  if [ -f "$UE_PROJ" ]; then
+    echo "   [U001] 对 IL2CPPChainloader.dll 加通用入口 UniversalExecute()（幂等）..."
+    dotnet run --project "$UE_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/BepInEx.Unity.IL2CPP.dll || \
+      { echo "   [U001] ✗ 通用入口补丁失败，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [U001] ⚠ 找不到 $UE_PROJ，跳过通用入口（宿主将回退 NOS 流程）" >&2
+  fi
+fi
+
 # [R95c] Cecil resolver 注入：给 MonoMod.Utils.ReflectionHelper.Load 里 module.Write()
 #   之前的【模块自带】DefaultAssemblyResolver AddSearchDirectory(<HOME>/Documents/BepInEx/core)。
 #   宿主 R80 已把 blob 里的全套 BCL（含 System.Private.CoreLib.dll）释放到该目录，

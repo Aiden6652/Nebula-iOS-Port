@@ -3608,6 +3608,9 @@ static void *boot_thread_impl(void *arg) {
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
         hlog("[host] BUILD=%s", NEBULA_BUILD_TAG_STR);
+        hlog("[host][u001] ===== U001 通用加载器分支：基于 R116，加载入口改 UniversalExecute（任意 BepInEx6 IL2CPP 插件包）=====");
+        hlog("[host][u001] nebula_r56_invoke_manual_execute 优先调 UniversalExecute（PreloadInteropAssemblies+Execute），找不到回退 NebulaManualExecute(NOS)。");
+        hlog("[host][u001] 本分支与 main 分开发布：main 仍 NOS-only，本分支通用。IL2CPPChainloader.dll 由 tools/patch_universal_execute 加通用入口。");
         hlog("[host][r116] ===== R116：修第三方插件 InjectorHelpers 模块查找（GameAssembly.dylib -> UnityFramework）=====");
         hlog("[host][r116] ImmersionAudioBridge 等用 RegisterTypeInIl2Cpp 的插件，之前 InjectorHelpers..cctor 里 Process.Modules.Single(GameAssembly) 在 iOS 找不到崩；IL 补丁加 UnityFramework 匹配。");
         hlog("[host][r116] main 仍 NOS-only（加载逻辑/时序/Dobby/心跳静音/R115 cctor 取证均不变）；版本适配宿主侧已完成（进程名恒放行+interop通用+路径递归探测）。");
@@ -4355,12 +4358,22 @@ static void nebula_r56_invoke_manual_execute(void) {
         fflush(NULL);
         return;
     }
-    MonoMethod *m = mono_class_get_method_from_name(k, "NebulaManualExecute", 0);
+    /* [U001] 通用加载入口：优先 UniversalExecute（任意 BepInEx6 插件包），
+       找不到再回退 NebulaManualExecute（老 NOS 版 DLL）—— 同一份宿主两用。 */
+    MonoMethod *m = mono_class_get_method_from_name(k, "UniversalExecute", 0);
+    const char *entry_name = "UniversalExecute";
     if (!m) {
-        printf("[host][r56] !! 找不到 NebulaManualExecute() —— 内嵌 DLL 不是 r56 版？\n");
+        m = mono_class_get_method_from_name(k, "NebulaManualExecute", 0);
+        entry_name = "NebulaManualExecute(回退/NOS)";
+    }
+    if (!m) {
+        printf("[host][r56] !! 找不到 UniversalExecute / NebulaManualExecute() —— 内嵌 DLL 不是适配版？\n");
         fflush(NULL);
         return;
     }
+    printf("[host][u001] 加载入口选定: %s —— %s\n", entry_name,
+           strcmp(entry_name, "UniversalExecute") ? "NOS 兼容回退" : "通用加载器(任意 BepInEx6 插件包)");
+    fflush(NULL);
 
     /* [R82] 进程过滤器已由 IL 补丁恒放行（带不带空格都认），这里仅打印真实进程名
        作诊断；不再硬编码覆盖 Paths.ProcessName。 */
