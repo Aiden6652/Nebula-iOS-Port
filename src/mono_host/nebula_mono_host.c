@@ -3669,6 +3669,11 @@ static void *boot_thread_impl(void *arg) {
        必须在 capture 之后：心跳用 printf，早于此写不进 nebula_host.txt。 */
     g_r97b_stage = R97B_ST_BOOT;
     nebula_r97b_heartbeat_start();
+    /* [R111] 补 R110 遗漏：Dobby GenerateRelocatedCode 里 memcpy/log_hex_format
+       两处 CPU 读 execute-only 源页改走 vm_read（rebuild 脚本重编 InterceptRouting.o）。
+       真机 R110 崩点：seq=9 ok=8 down=0 后崩在 GenerateRelocatedCode -> memcpy 循环。
+       0 降级 0 跳过不变，只读源改法，不动 Dobby 写跳板、不动 shim 判定。 */
+    printf("[r111][boot] ===== R111：补 Dobby GenerateRelocatedCode 的 origin_insns vm_read 读源（R110 漏的第二处 CPU 读）=====\n");
     printf("[r99b][boot] ===== R99b：删分时让出 + 信号驱动闸门 —— 等 Unity 打出 "
            "Begin async loading MainMenu 再冻结主线程跑 PatchAll =====\n");
     printf("[r99b][boot] 用户纠正：R97/R98 都是「能看到原版主菜单加载界面但加载时卡死」，"

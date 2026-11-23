@@ -1,0 +1,128 @@
+#include "dobby/dobby_internal.h"
+
+#include "InterceptRouting/InterceptRouting.h"
+#include "InterceptRouting/RoutingPlugin/RoutingPlugin.h"
+
+/* [R111 NEBULA iOS] 保存原指令与 hex 日志读源走内核 vm_read，不用 CPU 读。
+   iOS code-signed __TEXT_EXEC 页是 APRR execute-only，CPU 数据读(memcpy/ldrb)
+   必 SIGSEGV。R110 只修了 relo_relocate 内的读源，漏了本文件 GenerateRelocatedCode
+   里这两处：memcpy(origin_insns, origin_->addr, size) 与 log_hex_format(origin_->addr)。
+   真机崩点：GenerateRelocatedCode -> memcpy 循环 ldr/str。vm_read 走 Mach IPC 可读。 */
+#if defined(__APPLE__) && defined(TARGET_ARCH_ARM64)
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+static bool nebula_vm_read_bytes(void *src, void *dst, vm_size_t len) {
+  if (len == 0) return true;
+  vm_offset_t data = 0;
+  mach_msg_type_number_t out = 0;
+  kern_return_t kr = vm_read(mach_task_self(), (vm_address_t)(uintptr_t)src,
+                             len, &data, &out);
+  if (kr != KERN_SUCCESS || out < len) {
+    if (data) vm_deallocate(mach_task_self(), data, out);
+    return false;
+  }
+  __builtin_memcpy(dst, (const void *)data, (size_t)len);
+  vm_deallocate(mach_task_self(), data, out);
+  return true;
+}
+#endif
+
+using namespace zz;
+
+void log_hex_format(uint8_t *buffer, uint32_t buffer_size) {
+  char output[1024] = {0};
+  for (int i = 0; i < buffer_size && i < sizeof(output); i++) {
+    snprintf(output + strlen(output), 3, "%02x ", *((uint8_t *)buffer + i));
+  }
+  DEBUG_LOG("%s", output);
+};
+
+void InterceptRouting::Prepare() {
+}
+
+// generate relocated code
+bool InterceptRouting::GenerateRelocatedCode() {
+  uint32_t tramp_size = GetTrampolineBuffer()->GetBufferSize();
+  origin_ = new CodeMemBlock(entry_->patched_addr, tramp_size);
+  relocated_ = new CodeMemBlock();
+
+  auto buffer = (void *)entry_->patched_addr;
+#if defined(TARGET_ARCH_ARM)
+  if (entry_->thumb_mode) {
+    buffer = (void *)((addr_t)buffer + 1);
+  }
+#endif
+  GenRelocateCodeAndBranch(buffer, origin_, relocated_);
+  if (relocated_->size == 0) {
+    ERROR_LOG("[insn relocate]] failed");
+    return false;
+  }
+
+  // set the relocated instruction address
+  entry_->relocated_addr = relocated_->addr;
+
+  // save original prologue
+#if defined(__APPLE__) && defined(TARGET_ARCH_ARM64)
+  if (!nebula_vm_read_bytes((void *)origin_->addr, (void *)entry_->origin_insns, origin_->size)) {
+    ERROR_LOG("[insn relocate] vm_read origin_insns failed");
+    return false;
+  }
+#else
+  memcpy((void *)entry_->origin_insns, (void *)origin_->addr, origin_->size);
+#endif
+  entry_->origin_insn_size = origin_->size;
+
+  // log
+  DEBUG_LOG("[insn relocate] origin %p - %d", origin_->addr, origin_->size);
+  log_hex_format((uint8_t *)entry_->origin_insns, origin_->size);  /* [R111] 读副本，不再 CPU 读 execute-only 源页 */
+
+  DEBUG_LOG("[insn relocate] relocated %p - %d", relocated_->addr, relocated_->size);
+  log_hex_format((uint8_t *)relocated_->addr, relocated_->size);
+
+  return true;
+}
+
+bool InterceptRouting::GenerateTrampolineBuffer(addr_t src, addr_t dst) {
+  // if near branch trampoline plugin enabled
+  if (RoutingPluginManager::near_branch_trampoline) {
+    auto plugin = static_cast<RoutingPluginInterface *>(RoutingPluginManager::near_branch_trampoline);
+    if (plugin->GenerateTrampolineBuffer(this, src, dst) == false) {
+      DEBUG_LOG("Failed enable near branch trampoline plugin");
+    }
+  }
+
+  if (GetTrampolineBuffer() == nullptr) {
+    auto tramp_buffer = GenerateNormalTrampolineBuffer(src, dst);
+    SetTrampolineBuffer(tramp_buffer);
+  }
+  return true;
+}
+
+// active routing, patch origin instructions as trampoline
+void InterceptRouting::Active() {
+  auto ret = DobbyCodePatch((void *)entry_->patched_addr, trampoline_buffer_->GetBuffer(),
+                            trampoline_buffer_->GetBufferSize());
+  if (ret == -1) {
+    ERROR_LOG("[intercept routing] active failed");
+    return;
+  }
+  DEBUG_LOG("[intercept routing] active");
+}
+
+void InterceptRouting::Commit() {
+  this->Active();
+}
+
+#if 0
+int InterceptRouting::PredefinedTrampolineSize() {
+#if __arm64__
+  return 12;
+#elif __arm__
+  return 8;
+#endif
+}
+#endif
+
+InterceptEntry *InterceptRouting::GetInterceptEntry() {
+  return entry_;
+};
