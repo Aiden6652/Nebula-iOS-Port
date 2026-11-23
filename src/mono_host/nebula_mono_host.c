@@ -201,7 +201,7 @@ typedef void *os_log_t;
  *   （每次只排 50ms 空主队列 block，主线程持续交还 Unity，绝不嵌套进 patch 栈），
  *   信号一到立刻冻结主线程同步跑 PatchAll（不并发、类型已注册）；
  *   完成后主线程交还，Unity 完成场景异步加载 -> sceneLoaded 触发 -> NOS 接上。
- *   品牌页（@"AUI Mod Loader by Aiden"）页面/署名/双闸门一行不动（硬红线），
+ *   品牌页（@"Among Us iOS Mod Loader by Aiden"）页面/署名/双闸门一行不动（硬红线），
  *   只把 nebula_signal_ready() 的淡出延后，盖到 NOS 加载动画起来（无缝衔接）。
  *   回退：NEBULA_R99B_REVEAL_MS 调淡出延时；NEBULA_EXEC_DELAY_MS 调阶段A；
  *   NEBULA_R99_YIELD=1 可开回 R99 分时让出做 A/B。
@@ -2620,11 +2620,14 @@ static int g_stdio_pipe[2] = { -1, -1 };
  *   NEBULA_R99B_GATE=startup 等 "MainMenuManager.RunStartUp"（类型更全，
  *                                  但可能已触发 sceneLoaded，作对照）
  *   NEBULA_R99B_GATE=0       关闸门，阶段A 后立即抢跑（回退 R98b 对照）
- *   NEBULA_R99B_GATE_EXTRA_MS=N  信号命中后再给 Unity N ms 推进（默认 0）
+ *   NEBULA_R99B_GATE_EXTRA_MS=N  信号命中后再给 Unity N ms 推进（默认 2000，R113；=0 回退）
  * ------------------------------------------------------------------------- */
 static int          r99b_gate_on      = 1;
 static int          r99b_gate_startup = 0;
-static int64_t      r99b_gate_extra_ms = 0;
+static int64_t      r99b_gate_extra_ms = 2000;  /* [R113] begin 信号命中后再给 Unity 2000ms 完成 il2cpp 类型注册，
+                                                    修 #162 反射读静态字段触发 cctor 时类型未注册 -> UnityFramework SIGSEGV。
+                                                    R97b 成功时序 begin(t≈2-4s) 到 RunStartUp(t≈9-11s) 有 ~7s 窗口，2s 安全。
+                                                    env NEBULA_R99B_GATE_EXTRA_MS 可覆盖；=0 回退旧行为。 */
 
 static void r99b_gate_cfg_init(void) {
     static int done = 0;
@@ -3688,14 +3691,14 @@ static void *boot_thread_impl(void *arg) {
     printf("[r98][boot] 在线核数=%d（运行时探测，不写死 8 核）；阶段A 4000->0ms，阶段B 1500->0ms\n",
            nebula_r98_cpu_count());
 
-    // [R73] 启动画面：无条件强制播放 "AUI Mod Loader by Aiden" 满 5 秒（原 R60 = 3s）。
+    // [R73] 启动画面：无条件强制播放 "Among Us iOS Mod Loader by Aiden" 满 5 秒（原 R60 = 3s）。
     //   ① 不再是「正在生成interop」占位 —— R60 设备端永不生成 interop，那个文案会误导；
     //   ② 用户 R73 明确要求拉到 5s，给「主线程 JIT 预热」留安全窗口：阶段A(Start)
     //      成功返回后由宿主主线程把装插件链路方法提前 mono_compile_method 编好，
     //      让阶段B 新起的托管线程执行已编译代码、不再首次 JIT 崩；
     //   ③ 最短展示时长由 boot_overlay.m 内部把关，Nebula 就绪信号也不得提前销毁。
     //   窗口可能还没起来，内部带重试；30s 安全超时兜底销毁（绝不卡屏）。
-    hlog("[host][r73] 启动画面：强制播放 5s AUI Mod Loader by Aiden（预留主线程 JIT 预热窗口）");
+    hlog("[host][r73] 启动画面：强制播放 5s Among Us iOS Mod Loader by Aiden（预留主线程 JIT 预热窗口）");
     nebula_show_boot_overlay();
 
     // 大小写回退必须在知道游戏根目录后装（只对它生效），且默认关闭
@@ -4130,6 +4133,14 @@ static void *nebula_r97b_heartbeat_thread(void *arg) {
             verdict = "[静止] 进度未推进（可能慢 JIT / 可能卡死，看后续是否恢复）";
         else
             verdict = "[活动中] 加载在推进 / 刚起步";
+        /* [R113] 静止 >=30s 后心跳降频到 20s 一次：崩溃后裸 pthread 仍每秒刷屏，
+           会把 mono 的 native/managed stack 与 fault 字节冲掉（本次 #162 现场即被淹没）。
+           降频不影响加载期（静止 <30s 仍每秒），只保住崩溃遗言。 */
+        if (idle >= 30000) {
+            static long last_slow = -1;
+            if (last_slow >= 0 && el - last_slow < 20000) continue;
+            last_slow = el;
+        }
         printf("[r97b][hb] t+%ldms stage=%d(%s) seq=%u ok=%u down=%u "
                "idle=%ldms prewarm=%ums -> %s\n",
                el, stg, r97b_stage_name(stg), seq, ok, dn,

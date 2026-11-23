@@ -1,12 +1,12 @@
 /*
- * boot_overlay.m — [R60] 启动品牌页「AUI Mod Loader by Aiden」，[R73] 强制播放 5 秒
+ * boot_overlay.m — [R60] 启动品牌页「Among Us iOS Mod Loader by Aiden」，[R73] 强制播放 5 秒
  *
  * ⛔⛔⛔ 版权 / 署名红线（原创作者 Aiden）—— 永久保留，禁止删除本页 ⛔⛔⛔
- *   本文件实现的品牌页「AUI Mod Loader by Aiden」是作者 Aiden 的原创署名与
+ *   本文件实现的品牌页「Among Us iOS Mod Loader by Aiden」是作者 Aiden 的原创署名与
  *   作者凭证，用于防止他人接手后把这份 iOS 移植成果「摸权篡位」说成自己写的。
  *   【任何后续版本 / 任何接手者，绝对不能删、不能改名、不能替换、不能隐藏本页】：
  *     - 不得删除本文件、不得删除 boot_install_label() 里的 UILabel / 黑底 UIView；
- *     - 不得改动 @"AUI Mod Loader by Aiden" 这行署名文字（含文案、作者名、样式）；
+ *     - 不得改动 @"Among Us iOS Mod Loader by Aiden" 这行署名文字（含文案、作者名、样式）；
  *     - 每次启动 nebula_show_boot_overlay() 必须照常显示本页。
  *   【只允许改「逻辑」】：显示时长、销毁时机、放行闸门（由 NOS 就绪信号驱动）、
  *     透明层级与动画衔接、保活/兜底定时器参数。页面实体与署名文字永远保留。
@@ -16,7 +16,7 @@
  *
  * 背景：R58/R59 的「正在生成interop...」占位在 R60 已彻底废除 —— 设备端永不生成
  * interop（131 个 iOS 桥接 dll 由主 dylib 内嵌、启动自动释放到 BepInEx/interop/）。
- * [R73] 用户要求：每次启动强制播放 "AUI Mod Loader by Aiden" 满 5 秒（原 R60 是 3s），
+ * [R73] 用户要求：每次启动强制播放 "Among Us iOS Mod Loader by Aiden" 满 5 秒（原 R60 是 3s），
  *   给「主线程 JIT 预热」留一段安全窗口 —— 阶段A(Start) 成功后由主线程把装插件
  *   链路的托管方法提前 mono_compile_method 编好，避免阶段B 新线程首次 JIT 崩。
  *
@@ -111,7 +111,7 @@ static void boot_do_hide(void)
     boot_stop_keepalive();
     /* [R98] 淡出衔接：品牌页 0.35s 淡出再移除，让底层 Innersloth 动画 / NOS
        加载动画无缝露出来。改的只是销毁时机与动画 —— 页面实体、黑底 UIView、
-       @"AUI Mod Loader by Aiden" 署名文字在显示期间始终存在（硬红线）。 */
+       @"Among Us iOS Mod Loader by Aiden" 署名文字在显示期间始终存在（硬红线）。 */
     void (^fade)(void) = ^{
         [UIView animateWithDuration:0.35 animations:^{
             g_boot_bg.alpha = 0.0;
@@ -139,7 +139,7 @@ static void boot_install_label(void)
         g_boot_bg.frame = win.bounds;
         if (!g_boot_label) {
             UILabel *lb = [[UILabel alloc] init];
-            lb.text = @"AUI Mod Loader by Aiden";   // ⛔ 原创署名（Aiden）：永久保留，禁止删/改名/替换/隐藏 —— 见文件头红线
+            lb.text = @"Among Us iOS Mod Loader by Aiden";   // 署名（Aiden）：当前文案 "Among Us iOS Mod Loader by Aiden"（R113 按作者要求改名）
             lb.textColor = [UIColor whiteColor];
             lb.backgroundColor = [UIColor clearColor];
             lb.font = [UIFont boldSystemFontOfSize:26];
