@@ -3608,6 +3608,10 @@ static void *boot_thread_impl(void *arg) {
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
         hlog("[host] BUILD=%s", NEBULA_BUILD_TAG_STR);
+        hlog("[host][r115] ===== R115 取证+诊断版：mono 源码级在 class_init 入口打印 [Nebula][cctor-init] image+类名 =====");
+        hlog("[host][r115] 目的：R114 心跳静音生效但 mono 仍不写 managed stack；崩在 Harmony.PatchAll 第156个patch(seq=160 ok=155)。");
+        hlog("[host][r115] 崩前最后一条 [Nebula][cctor-init] 行 = 触发 SIGSEGV 的元凶类；同时覆盖 InjectorHelpers..cctor() 模块查找链(B假设)一次验证。");
+        hlog("[host][r115] 日志里若见 [Nebula][cctor-init] 证明 cctor 打印补丁已进二进制；若一条都没有=bump缓存未生效需重编。");
         hlog("[host][r95d] ===== R95d 自证版：修『同大小换包不覆盖磁盘 DLL』+ 启动即报内嵌 MonoMod.Utils.dll 真伪 =====");
         r95d_selfcheck();   // [R95d] 直接判当前 dylib 内嵌托管 DLL 是 R95b 幽灵版还是修好版
         hlog("[host][r92] ===== 版本标记 R92：修 R91 因 CI 缓存复用旧 mono 库导致 4 个 mono 侧兜底补丁全没进二进制、真机照崩的坑 =====");
