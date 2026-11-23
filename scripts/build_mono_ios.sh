@@ -931,7 +931,7 @@ new = ("mono_runtime_class_init_full (MonoVTable *vtable, MonoError *error)\n"
        +T+T+"const char *_img = _ci ? _ci->name : \"?\";\n"
        +T+T+"int _skip = _img && (!strcmp (_img, \"System.Private.CoreLib.dll\") || !strcmp (_img, \"mscorlib.dll\"));\n"
        +T+T+"if (!_skip) {\n"
-       +T+T+T+'g_warning ("[Nebula][cctor-init] image=%s class=%s.%s", _img, mono_class_get_namespace (klass) ? mono_class_get_namespace (klass) : "", mono_class_get_name (klass) ? mono_class_get_name (klass) : "?");\n'
+       +T+T+T+'g_warning ("[Nebula][cctor-init] image=%s class=%s.%s", _img, m_class_get_name_space (klass) ? m_class_get_name_space (klass) : "", m_class_get_name (klass) ? m_class_get_name (klass) : "?");\n'
        +T+T+"}\n"
        +T+"}\n")
 s = s.replace(old, new, 1)
