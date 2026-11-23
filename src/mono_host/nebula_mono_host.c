@@ -2624,10 +2624,10 @@ static int g_stdio_pipe[2] = { -1, -1 };
  * ------------------------------------------------------------------------- */
 static int          r99b_gate_on      = 1;
 static int          r99b_gate_startup = 0;
-static int64_t      r99b_gate_extra_ms = 2000;  /* [R113] begin 信号命中后再给 Unity 2000ms 完成 il2cpp 类型注册，
-                                                    修 #162 反射读静态字段触发 cctor 时类型未注册 -> UnityFramework SIGSEGV。
-                                                    R97b 成功时序 begin(t≈2-4s) 到 RunStartUp(t≈9-11s) 有 ~7s 窗口，2s 安全。
-                                                    env NEBULA_R99B_GATE_EXTRA_MS 可覆盖；=0 回退旧行为。 */
+static int64_t      r99b_gate_extra_ms = 2000;  /* [R113] begin 信号命中后再给 Unity 2000ms 完成 il2cpp 类型注册。
+                                                    R114 复核：2000ms 时 #162 的 162 个 hook 全部插入成功(ok=157)，
+                                                    证明 hook 时机未被延时破坏；#162 崩是独立 cctor 问题，非延时不足，
+                                                    故不再加大(加大反而有 hook 失效风险)。env 可覆盖；=0 回退。 */
 
 static void r99b_gate_cfg_init(void) {
     static int done = 0;
@@ -4133,13 +4133,16 @@ static void *nebula_r97b_heartbeat_thread(void *arg) {
             verdict = "[静止] 进度未推进（可能慢 JIT / 可能卡死，看后续是否恢复）";
         else
             verdict = "[活动中] 加载在推进 / 刚起步";
-        /* [R113] 静止 >=30s 后心跳降频到 20s 一次：崩溃后裸 pthread 仍每秒刷屏，
-           会把 mono 的 native/managed stack 与 fault 字节冲掉（本次 #162 现场即被淹没）。
-           降频不影响加载期（静止 <30s 仍每秒），只保住崩溃遗言。 */
-        if (idle >= 30000) {
-            static long last_slow = -1;
-            if (last_slow >= 0 && el - last_slow < 20000) continue;
-            last_slow = el;
+        /* [R114] Execute 阶段已有 hook 进展(seq>0)后，进度静止 >=3s 心跳线程永久退出。
+           崩点处 mono 崩溃转储(native+managed stack+fault 字节)与裸心跳抢 stdout：
+           R113 阈值设 30s 太晚，崩溃后日志只刷 13s，managed stack 全被心跳冲掉
+           （fault 行 "0x118a27d3c" 后紧跟 hb 即为实锤）。
+           加载正常时 seq 每几秒推进、idle<3s，心跳照常每秒打；只有真卡住/崩了才静音。
+           等待信号阶段(stage<4)或 Execute 刚起步(seq=0)不受影响，仍每秒报。 */
+        if (stg >= 4 && seq > 0 && idle >= 3000) {
+            printf("[r97b][hb] t+%ldms 进度静止 >=3s，心跳静音让出 stdout 给 mono 崩溃转储\n", el);
+            fflush(stdout);
+            return NULL;
         }
         printf("[r97b][hb] t+%ldms stage=%d(%s) seq=%u ok=%u down=%u "
                "idle=%ldms prewarm=%ums -> %s\n",
