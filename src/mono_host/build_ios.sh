@@ -255,6 +255,27 @@ if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
   fi
 fi
 
+# [R116] InjectorHelpers 模块名兼容补丁（修第三方插件 RegisterTypeInIl2Cpp 崩）。
+#   真机日志：ImmersionAudioBridge 加载失败 = InjectorHelpers..cctor 里
+#   Process.Modules.Single(x => ModuleName is GameAssembly.dll/.dylib/.so) 在 iOS 找不到
+#   （IL2CPP 代码在 UnityFramework，模块名不叫 GameAssembly）-> Sequence contains no matching
+#   element -> 整个 InjectorHelpers 类型初始化失败 -> 所有 RegisterTypeInIl2Cpp<T>() 崩。
+#   修法：把 lambda 里 iOS 永远命不中的死字符串 "GameAssembly.dylib" 换成 "UnityFramework"，
+#   幂等、命中校验、原子写回（R78 截 0 字节教训）。必须在 R83 marshal 补丁之后、blob 生成前。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  IH_PROJ="$ROOT/../../tools/patch_injector_helpers/patch_injector_helpers.csproj"
+  if [ -f "$IH_PROJ" ]; then
+    echo "   [R116] 对 Il2CppInterop.Runtime.dll 应用模块名兼容补丁（幂等）..."
+    dotnet run --project "$IH_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/Il2CppInterop.Runtime.dll || \
+      { echo "   [R116] ✗ InjectorHelpers 补丁失败，拒绝产出会崩的包" >&2; exit 1; }
+  else
+    echo "   [R116] ✗ 找不到 $IH_PROJ，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R116] ⚠ 缺 dotnet 或 BEPINEX_CORE_DIR，跳过模块名补丁（第三方动态注入插件可能加载失败）" >&2
+fi
+
 # [R95c] Cecil resolver 注入：给 MonoMod.Utils.ReflectionHelper.Load 里 module.Write()
 #   之前的【模块自带】DefaultAssemblyResolver AddSearchDirectory(<HOME>/Documents/BepInEx/core)。
 #   宿主 R80 已把 blob 里的全套 BCL（含 System.Private.CoreLib.dll）释放到该目录，

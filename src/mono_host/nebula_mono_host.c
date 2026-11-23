@@ -3608,6 +3608,9 @@ static void *boot_thread_impl(void *arg) {
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
         hlog("[host] BUILD=%s", NEBULA_BUILD_TAG_STR);
+        hlog("[host][r116] ===== R116：修第三方插件 InjectorHelpers 模块查找（GameAssembly.dylib -> UnityFramework）=====");
+        hlog("[host][r116] ImmersionAudioBridge 等用 RegisterTypeInIl2Cpp 的插件，之前 InjectorHelpers..cctor 里 Process.Modules.Single(GameAssembly) 在 iOS 找不到崩；IL 补丁加 UnityFramework 匹配。");
+        hlog("[host][r116] main 仍 NOS-only（加载逻辑/时序/Dobby/心跳静音/R115 cctor 取证均不变）；版本适配宿主侧已完成（进程名恒放行+interop通用+路径递归探测）。");
         hlog("[host][r115] ===== R115 取证+诊断版：mono 源码级在 class_init 入口打印 [Nebula][cctor-init] image+类名 =====");
         hlog("[host][r115] 目的：R114 心跳静音生效但 mono 仍不写 managed stack；崩在 Harmony.PatchAll 第156个patch(seq=160 ok=155)。");
         hlog("[host][r115] 崩前最后一条 [Nebula][cctor-init] 行 = 触发 SIGSEGV 的元凶类；同时覆盖 InjectorHelpers..cctor() 模块查找链(B假设)一次验证。");
