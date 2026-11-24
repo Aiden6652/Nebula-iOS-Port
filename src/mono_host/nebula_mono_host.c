@@ -2624,10 +2624,13 @@ static int g_stdio_pipe[2] = { -1, -1 };
  * ------------------------------------------------------------------------- */
 static int          r99b_gate_on      = 1;
 static int          r99b_gate_startup = 0;
-static int64_t      r99b_gate_extra_ms = 2000;  /* [R113] begin 信号命中后再给 Unity 2000ms 完成 il2cpp 类型注册。
-                                                    R114 复核：2000ms 时 #162 的 162 个 hook 全部插入成功(ok=157)，
-                                                    证明 hook 时机未被延时破坏；#162 崩是独立 cctor 问题，非延时不足，
-                                                    故不再加大(加大反而有 hook 失效风险)。env 可覆盖；=0 回退。 */
+static int64_t      r99b_gate_extra_ms = 4000;  /* [R117] begin 信号命中后再给 Unity 4000ms 完成 il2cpp 类型注册。
+                                                    R116 真机新证据：同一份包"成功过一次(patch全跑完300KB)、第二三次崩#157"
+                                                    => #157 cctor 非必然崩，而是类型注册完成度的概率竞态，
+                                                    推翻 R114"独立cctor问题/非延时不足"判断。R97b(等RunStartUp t≈9.1s)稳过，
+                                                    begin+2000ms(≈t4.2s)偶崩 => 注册窗口在 2~7s。取4000ms折中：
+                                                    比2000ms多一倍时间注册类型，又早于sceneLoaded(~7s)不饿死NOS回调。
+                                                    回退：NEBULA_R99B_GATE_EXTRA_MS=2000。 */
 
 static void r99b_gate_cfg_init(void) {
     static int done = 0;
@@ -3687,6 +3690,8 @@ static void *boot_thread_impl(void *arg) {
        execute-only 源页 SIGSEGV（native stack: DobbyCodePatch->DobbyHook->DobbyPrepare，
        fault 是 memcpy ldp/stp）。第三处读源也改 vm_read（rebuild 重编 code-patch-tool-darwin.o）。
        0 降级 0 跳过不变；只读源，不碰写跳板、不碰 shim。 */
+    printf("[r117][boot] ===== R117: 修 NOS 非确定性 cctor 崩 —— gate extra 2000->4000ms（BeginAsync 后多给 2s 让 il2cpp 类型注册完；成功过一次证明是概率竞态非必然崩）=====\n");
+    printf("[r117][boot] 回退：NEBULA_R99B_GATE_EXTRA_MS=2000 回 R114。R115 cctor-init 打印保留，若仍崩日志给出元凶类。\n");
     printf("[r112][boot] ===== R112: 补 DobbyCodePatch 的 patch_page vm_read 整页读源（R111 后的第三处 CPU 读）=====\n");
     printf("[r111][boot] ===== R111：补 Dobby GenerateRelocatedCode 的 origin_insns vm_read 读源（R110 漏的第二处 CPU 读）=====\n");
     printf("[r99b][boot] ===== R99b：删分时让出 + 信号驱动闸门 —— 等 Unity 打出 "
