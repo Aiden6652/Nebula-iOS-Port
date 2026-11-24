@@ -10,10 +10,10 @@ on:
       - 'tools/**'
       - '.github/workflows/build-ios.yml'
 
-# 独有并发组（与 build.yml 不重名），避免同一 commit 重复跑 15 分钟 mono 重编；
-# 同时绝不与 build.yml 共享组，从而不会被 build.yml 取消。
+# 并发组绑定 ref：main 与 universal-loader 各排各的，互不取消（修 cancel 老问题）；
+# 与 build.yml 仍不重名，同一分支内保留 cancel-in-progress 去重。
 concurrency:
-  group: nebula-ios-cross
+  group: nebula-ios-cross-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
