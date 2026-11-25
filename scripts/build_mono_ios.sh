@@ -46,7 +46,7 @@ MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 #   缓存跳过编译，白改。今后任何 mono 源码补丁都必须 bump 本号！
 # [R94] 新增 loader.c 补丁（mono_method_get_marshal_info 的 g_assert(tp) 改 NULL 安全跳过），
 #   必须 bump 本号强制重编，否则旧 mono 静态库仍带 g_assert 崩。
-CACHE_VERSION="${CACHE_VERSION:-36}"
+CACHE_VERSION="${CACHE_VERSION:-37}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -891,7 +891,9 @@ echo "=== [3.9/5] R115: object.c class_init cctor name print (forensics + Inject
 #   FieldInfo.GetValueInternal -> class_init_full -> RunClassConstructor -> class_init_full
 #   -> JIT native code (UnityFramework 0x11639bd4c) -> SIGSEGV, at Harmony.PatchAll patch #156 (seq=160 ok=155).
 # Missing only WHICH class cctor. Instead of betting on crash dump, print the class name directly at
-# mono_runtime_class_init_full entry via glib g_warning. mono is built from source so this is 100% in the binary.
+# mono_runtime_class_init_full entry via fprintf(stderr)+fflush. mono is built from source so this is 100% in the binary.
+# R118: 真机 5236cb9c 证明 g_warning 被 iOS 的 GLib log handler 吞掉(cctor-init 0 条但 SIGSEGV 用 fprintf 能进日志)，
+#        改用 fprintf(stderr) 直写，确保崩溃前最后一条 cctor-init = 元凶类一定可见。
 # The last [Nebula][cctor-init] before crash = culprit patch class.
 # Also covers InjectorHelpers..cctor() (Il2CppInterop module lookup fail chain) -> one run tests both.
 F="$WORK/runtime/src/mono/mono/metadata/object.c"
@@ -931,7 +933,7 @@ new = ("mono_runtime_class_init_full (MonoVTable *vtable, MonoError *error)\n"
        +T+T+"const char *_img = _ci ? _ci->name : \"?\";\n"
        +T+T+"int _skip = _img && (!strcmp (_img, \"System.Private.CoreLib.dll\") || !strcmp (_img, \"mscorlib.dll\"));\n"
        +T+T+"if (!_skip) {\n"
-       +T+T+T+'g_warning ("[Nebula][cctor-init] image=%s class=%s.%s", _img, m_class_get_name_space (klass) ? m_class_get_name_space (klass) : "", m_class_get_name (klass) ? m_class_get_name (klass) : "?");\n'
+       +T+T+T+'fprintf (stderr, "[Nebula][cctor-init] image=%s class=%s.%s\\n", _img, m_class_get_name_space (klass) ? m_class_get_name_space (klass) : "", m_class_get_name (klass) ? m_class_get_name (klass) : "?"); fflush (stderr);\n'
        +T+T+"}\n"
        +T+"}\n")
 s = s.replace(old, new, 1)
