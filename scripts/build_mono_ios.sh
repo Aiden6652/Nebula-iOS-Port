@@ -46,7 +46,7 @@ MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 #   缓存跳过编译，白改。今后任何 mono 源码补丁都必须 bump 本号！
 # [R94] 新增 loader.c 补丁（mono_method_get_marshal_info 的 g_assert(tp) 改 NULL 安全跳过），
 #   必须 bump 本号强制重编，否则旧 mono 静态库仍带 g_assert 崩。
-CACHE_VERSION="${CACHE_VERSION:-37}"
+CACHE_VERSION="${CACHE_VERSION:-38}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -939,6 +939,49 @@ new = ("mono_runtime_class_init_full (MonoVTable *vtable, MonoError *error)\n"
 s = s.replace(old, new, 1)
 open(p,'w',encoding='utf-8').write(s)
 print("    R115 patch applied: mono_runtime_class_init_full prints [Nebula][cctor-init] image+class")
+PY
+
+echo "=== [3.9b/5] R119: icall.c RunClassConstructor -> DEFER (确定性根治 cctor JIT SIGSEGV) ==="
+# 崩链(native 栈实证): FieldInfo.GetValueInternal -> class_init_full(类A) ->
+#   Helpers.RunStaticConstructor (NOS 唯一 icall 调用方) -> RunClassConstructor ->
+#     class_init_full(类B) -> JIT code(UnityFramework) -> SIGSEGV.
+# R114 证明调毫秒无效(时序竞态); R115/R118 只做取证.
+# R119 根治: NOS 的 RunStaticConstructor 是 iOS 上 RunClassConstructor 的唯一调用者,
+#   而它强制初始化的类B cctor 在 PatchAll 时刻访问尚未注册的 il2cpp 类型 -> JIT 崩.
+#   这里不执行 cctor 且不标记 initialized: CLR 会在该类首次真正被访问(读静态字段/
+#   newobj)时经正常 class_init 路径触发 cctor —— 那时 il2cpp 类型已注册完,不再崩.
+#   语义等价(RunClassConstructor 本就只保证"使用前已初始化"),功能保留,确定性消竞态,
+#   不依赖类名(5 个调用方全是 GetTypes() 运行时枚举,类名无法静态预判).
+#   BepInEx 核心 / 正常 cctor 都不走这条 icall,影响面仅限 NOS 强制初始化这一个点.
+F="$WORK/runtime/src/mono/mono/metadata/icall.c"
+[ -f "$F" ] || { echo "!! $F not found" >&2; exit 1; }
+python3 - "$F" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='replace').read()
+T = "\t"
+old = (T+"vtable = mono_class_vtable_checked (klass, error);\n"
+       +T+"return_if_nok (error);\n"
+       +"\n"
+       +T+"/* This will call the type constructor */\n"
+       +T+"mono_runtime_class_init_full (vtable, error);\n")
+assert old in s, "icall.c RunClassConstructor anchor not matched"
+new = (T+"vtable = mono_class_vtable_checked (klass, error);\n"
+       +T+"return_if_nok (error);\n"
+       +"\n"
+       +T+"/* [Nebula iOS R119] DEFER forced class init.\n"
+       +T+"   Only caller on iOS is NOS Helpers.RunStaticConstructor during PatchAll;\n"
+       +T+"   its cctor JIT touches il2cpp types not yet registered -> SIGSEGV.\n"
+       +T+"   Do NOT run cctor here and do NOT set vtable->initialized, so CLR runs it\n"
+       +T+"   later via normal class_init on first real access (after il2cpp ready). */\n"
+       +T+"{\n"
+       +T+T+"MonoImage *_r119img = m_class_get_image (klass);\n"
+       +T+T+'fprintf (stderr, "[Nebula][r119] DEFER RunClassConstructor image=%s class=%s.%s\\n", _r119img ? _r119img->name : "?", m_class_get_name_space (klass) ? m_class_get_name_space (klass) : "", m_class_get_name (klass) ? m_class_get_name (klass) : "?"); fflush (stderr);\n'
+       +T+"}\n"
+       +T+"(void)vtable;\n")
+s = s.replace(old, new, 1)
+open(p,'w',encoding='utf-8').write(s)
+print("    R119 patch applied: RunClassConstructor defers forced cctor (no init, no mark)")
 PY
 
 echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="
