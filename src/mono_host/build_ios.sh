@@ -276,6 +276,22 @@ else
   echo "   [R116] ⚠ 缺 dotnet 或 BEPINEX_CORE_DIR，跳过模块名补丁（第三方动态注入插件可能加载失败）" >&2
 fi
 
+# [U001] 通用加载器入口补丁：给 IL2CPPChainloader.dll 加 UniversalExecute()
+#   （方法体复制 NOS 私有的 NebulaManualExecute = PreloadInteropAssemblies+Execute，通用逻辑）。
+#   宿主优先调 UniversalExecute -> 任意 BepInEx6 IL2CPP 插件包都能加载；找不到回退 NOS。
+#   仅 universal-loader 分支调用；main 分支 build_ios.sh 无此段，保持 NOS-only。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  UE_PROJ="$ROOT/../../tools/patch_universal_execute/patch_universal_execute.csproj"
+  if [ -f "$UE_PROJ" ]; then
+    echo "   [U001] 对 IL2CPPChainloader.dll 加通用入口 UniversalExecute()（幂等）..."
+    dotnet run --project "$UE_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/BepInEx.Unity.IL2CPP.dll || \
+      { echo "   [U001] ✗ 通用入口补丁失败，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [U001] ⚠ 找不到 $UE_PROJ，跳过通用入口（宿主将回退 NOS 流程）" >&2
+  fi
+fi
+
 # [R95c] Cecil resolver 注入：给 MonoMod.Utils.ReflectionHelper.Load 里 module.Write()
 #   之前的【模块自带】DefaultAssemblyResolver AddSearchDirectory(<HOME>/Documents/BepInEx/core)。
 #   宿主 R80 已把 blob 里的全套 BCL（含 System.Private.CoreLib.dll）释放到该目录，
@@ -294,6 +310,27 @@ if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
   fi
 else
   echo "   [R95c] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 resolver，拒绝产出" >&2; exit 1
+fi
+
+# [R120] DetourNativeARMPlatform Copy/Apply 写 RW 别名（修 ARM64 JIT 页 SIGSEGV）。
+#   真机 710kb 日志崩栈：ILHook:Apply -> Context:Refresh -> Detour:Undo ->
+#   NativeDetour:Undo -> DetourNativeARMPlatform:Copy -> SIGSEGV @ 0x1474a1638（RX JIT 页）。
+#   根因：R63 dual-map 给 JIT 页建了 RW 别名，入库 DLL 也注入了 nebula_jit_* P/Invoke，
+#   但 Copy/Apply 仍直接写原 VA（RX）-> 崩。原页为执行安全保持 RX，不能整页翻 RW。
+#   修法：IL 补丁在 Copy 入口 dst=nebula_jit_alias(dst)、Apply 入口
+#   detour.Method=nebula_jit_alias(detour.Method)，写端走别名，幂等。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  A120_PROJ="$ROOT/../../tools/patch_alias_copy/patch_alias_copy.csproj"
+  if [ -f "$A120_PROJ" ]; then
+    echo "   [R120] 给 MonoMod.RuntimeDetour.dll 的 Copy/Apply 注入 RW 别名转换（幂等）..."
+    dotnet run --project "$A120_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/MonoMod.RuntimeDetour.dll || \
+      { echo "   [R120] ✗ alias 补丁失败，拒绝产出会崩的包" >&2; exit 1; }
+  else
+    echo "   [R120] ✗ 找不到 $A120_PROJ，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R120] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 alias 补丁，拒绝产出" >&2; exit 1
 fi
 
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
