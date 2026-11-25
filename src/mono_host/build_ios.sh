@@ -312,6 +312,27 @@ else
   echo "   [R95c] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 resolver，拒绝产出" >&2; exit 1
 fi
 
+# [R120] DetourNativeARMPlatform Copy/Apply 写 RW 别名（修 ARM64 JIT 页 SIGSEGV）。
+#   真机 710kb 日志崩栈：ILHook:Apply -> Context:Refresh -> Detour:Undo ->
+#   NativeDetour:Undo -> DetourNativeARMPlatform:Copy -> SIGSEGV @ 0x1474a1638（RX JIT 页）。
+#   根因：R63 dual-map 给 JIT 页建了 RW 别名，入库 DLL 也注入了 nebula_jit_* P/Invoke，
+#   但 Copy/Apply 仍直接写原 VA（RX）-> 崩。原页为执行安全保持 RX，不能整页翻 RW。
+#   修法：IL 补丁在 Copy 入口 dst=nebula_jit_alias(dst)、Apply 入口
+#   detour.Method=nebula_jit_alias(detour.Method)，写端走别名，幂等。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  A120_PROJ="$ROOT/../../tools/patch_alias_copy/patch_alias_copy.csproj"
+  if [ -f "$A120_PROJ" ]; then
+    echo "   [R120] 给 MonoMod.RuntimeDetour.dll 的 Copy/Apply 注入 RW 别名转换（幂等）..."
+    dotnet run --project "$A120_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/MonoMod.RuntimeDetour.dll || \
+      { echo "   [R120] ✗ alias 补丁失败，拒绝产出会崩的包" >&2; exit 1; }
+  else
+    echo "   [R120] ✗ 找不到 $A120_PROJ，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R120] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 alias 补丁，拒绝产出" >&2; exit 1
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
