@@ -13,7 +13,7 @@ on:
 # 独有并发组（与 build.yml 不重名），避免同一 commit 重复跑 15 分钟 mono 重编；
 # 同时绝不与 build.yml 共享组，从而不会被 build.yml 取消。
 concurrency:
-  group: nebula-ios-cross
+  group: nebula-ios-cross-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
