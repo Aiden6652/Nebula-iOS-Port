@@ -333,6 +333,31 @@ else
   echo "   [R120] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 alias 补丁，拒绝产出" >&2; exit 1
 fi
 
+# [R122] il2cpp_runtime_class_init null 守卫（修 async 状态机 cctor 传 0 崩）。
+#   真机 1.5MB 日志（universal-loader BUILD=015b0fbee21d）崩栈：
+#   Harmony.PatchAll -> ILHook.Apply -> Detour:_RefreshChain -> GetNativeStart ->
+#   RuntimeMethodHandle:GetFunctionPointer -> mono JIT -> mono_runtime_class_init_full ->
+#   _CoUseZipline_d__39:.cctor -> IL2CPP:il2cpp_runtime_class_init -> SIGSEGV.
+#   根因：Il2CppInterop 为 C# async 状态机生成 interop wrapper，但 IL2CPP 侧无该类；
+#   GetIl2CppClass 返回 IntPtr.Zero，裸 P/Invoke il2cpp_runtime_class_init(0) 崩。
+#   R119 DEFER 只拦 RunClassConstructor icall，拦不住 JIT 内部自动跑的 cctor。
+#   修法（真修复·参数守卫·非绕过）：把 P/Invoke 改名 _Raw 保留 native EntryPoint，
+#   建同名托管 wrapper：klass==0 时 no-op，否则调 _Raw。跨程序集调用点按名字自动绑
+#   wrapper（设备 interop DLL 零改动）。只对 null 生效，跨 AU 版本/设备/iOS 一致。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  C122_PROJ="$ROOT/../../tools/patch_class_init_nullguard/patch_class_init_nullguard.csproj"
+  if [ -f "$C122_PROJ" ]; then
+    echo "   [R122] 给 Il2CppInterop.Runtime.dll 的 il2cpp_runtime_class_init 加 null 守卫（幂等）..."
+    dotnet run --project "$C122_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/Il2CppInterop.Runtime.dll || \
+      { echo "   [R122] ✗ null 守卫补丁失败，拒绝产出会崩的包" >&2; exit 1; }
+  else
+    echo "   [R122] ✗ 找不到 $C122_PROJ，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R122] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，拒绝产出" >&2; exit 1
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
