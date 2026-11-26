@@ -46,7 +46,7 @@ MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 #   缓存跳过编译，白改。今后任何 mono 源码补丁都必须 bump 本号！
 # [R94] 新增 loader.c 补丁（mono_method_get_marshal_info 的 g_assert(tp) 改 NULL 安全跳过），
 #   必须 bump 本号强制重编，否则旧 mono 静态库仍带 g_assert 崩。
-CACHE_VERSION="${CACHE_VERSION:-38}"
+CACHE_VERSION="${CACHE_VERSION:-39}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
