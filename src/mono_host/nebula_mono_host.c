@@ -3266,9 +3266,31 @@ static void nebula_r60_quarantine_win_dobby(void) {
        与 mono 自身 JIT 同款，且页隔离避免踩相邻堆。
    判别：MemAlloc 的 mmap 页记入 g_nebula_tramp；make_writable 对其不动、对其余(代码页)建别名；
    make_executable 对别名页只刷 icache、对 trampoline 翻 RW->RX。 */
-#define NEBULA_ALIAS_MAX 64
-static struct { uintptr_t orig; uintptr_t alias; } g_nebula_alias[NEBULA_ALIAS_MAX];
+/* [R121] 别名表改动态扩容：R120 让所有 detour 写端走 RW 别名后，64 项静态表被
+   第 65 个 JIT 代码页撑满；表满时旧代码 return base 把原 RX 页当"别名"返回，
+   DetourHelper.Write 写 RX -> SIGSEGV。改为按需翻倍扩容，消除容量上限这一崩溃条件。 */
+#define NEBULA_ALIAS_INIT 64
+typedef struct { uintptr_t orig; uintptr_t alias; } NebulaAliasEntry;
+static NebulaAliasEntry *g_nebula_alias = NULL;   /* [R121] 动态数组 */
 static int g_nebula_alias_n = 0;
+static int g_nebula_alias_cap = 0;
+
+/* [R121] 保证至少还能容纳 1 项；满则翻倍。返回 1=可写，0=分配失败 */
+static int nebula_alias_reserve(void) {
+    if (g_nebula_alias_n < g_nebula_alias_cap) return 1;
+    int newcap = g_nebula_alias_cap ? g_nebula_alias_cap * 2 : NEBULA_ALIAS_INIT;
+    NebulaAliasEntry *p = (NebulaAliasEntry *)realloc(g_nebula_alias,
+                                   (size_t)newcap * sizeof(NebulaAliasEntry));
+    if (!p) {
+        hlog("[host][r121] !! 别名表扩容失败 n=%d cap=%d newcap=%d（写入可能落原 RX 页）",
+             g_nebula_alias_n, g_nebula_alias_cap, newcap);
+        return 0;
+    }
+    g_nebula_alias = p;
+    g_nebula_alias_cap = newcap;
+    hlog("[host][r121] 别名表扩容 %d -> %d", g_nebula_alias_n, newcap);
+    return 1;
+}
 
 /* MemAlloc 的 mmap 隔离页基址+大小，用于判别 trampoline（需翻 RX）vs 代码页（双映射） */
 #define NEBULA_TRAMP_MAX 64
@@ -3283,13 +3305,13 @@ static int nebula_is_tramp(uintptr_t base) {
     return 0;
 }
 
-/* 查/建 某代码页 的 RW 别名（与原页同物理）；无则回原基址 */
+/* [R121] 查/建 某代码页 的 RW 别名（与原页同物理）；满则扩容而非静默回原 RX 页 */
 static uintptr_t nebula_jit_alias_base(uintptr_t base) {
     long ps = nebula_ps();
     base &= ~((uintptr_t)ps - 1);
     for (int i = 0; i < g_nebula_alias_n; i++)
         if (g_nebula_alias[i].orig == base) return g_nebula_alias[i].alias;
-    if (g_nebula_alias_n >= NEBULA_ALIAS_MAX) return base;
+    if (!nebula_alias_reserve()) return base;   /* [R121] 扩容失败才回退，且已打日志 */
     vm_address_t ali = 0;
     vm_size_t sz = (vm_size_t)ps;
     vm_prot_t curp = 0, maxp = 0;
@@ -3297,19 +3319,25 @@ static uintptr_t nebula_jit_alias_base(uintptr_t base) {
         VM_FLAGS_ANYWHERE, mach_task_self(), (vm_address_t)base,
         FALSE, &curp, &maxp, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) {
-        hlog("[host][r63] !! dual-map remap 失败 kr=%d @%p（回退原页，可能崩）", (int)kr, (void *)base);
+        hlog("[host][r121] !! dual-map remap 失败 kr=%d @%p（回退原页，可能崩）", (int)kr, (void *)base);
         return base;
     }
-    /* 别名页强制 RW（remap 默认可能沿用源 RX），写跳转用 */
+    /* 别名页强制 RW（remap 默认可能沿用源 RX），写跳转用；原页保持 RX 不动 */
     vm_protect(mach_task_self(), ali, sz, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     g_nebula_alias[g_nebula_alias_n].orig = base;
     g_nebula_alias[g_nebula_alias_n].alias = (uintptr_t)ali;
     g_nebula_alias_n++;
-    hlog("[host][r63] dual-map + @%p -> %p (RW 别名, 同物理页)", (void *)base, (void *)ali);
+    hlog("[host][r63] dual-map + @%p -> %p (RW 别名, 同物理页, #%d)",
+         (void *)base, (void *)ali, g_nebula_alias_n);
     return (uintptr_t)ali;
 }
 
-/* 给定任意地址，返回应写入的 VA（代码页走 RW 别名，其余原样） */
+/* [R121] 给定任意地址，返回应写入的 VA。
+   硬不变量：只要该页是 JIT 代码页，返回的必须是 RW 别名，绝不返回原 RX 页。
+   - 已建别名：alias + 页内偏移
+   - 未建且是 trampoline 页(mem_alloc 已 RW)：原样返回
+   - 未建的代码页：主动懒建别名（兜底 R120 写端，即使 MakeWritable 漏调也安全）
+   - 真失败(扩容/remap)：打日志后原样返回（极端情况，已尽力） */
 __attribute__((visibility("default")))
 void *nebula_jit_alias(void *addr) {
     long ps = nebula_ps();
@@ -3318,7 +3346,14 @@ void *nebula_jit_alias(void *addr) {
     for (int i = 0; i < g_nebula_alias_n; i++)
         if (g_nebula_alias[i].orig == base)
             return (void *)(g_nebula_alias[i].alias + (ua - base));
-    return addr;
+    if (nebula_is_tramp(base)) return addr;   /* trampoline 页本身已 RW */
+    /* [R121] 懒建：任何未登记的代码页都当场建 RW 别名，避免写端拿到 RX 原页 */
+    uintptr_t ali = nebula_jit_alias_base(base);
+    if (ali == base) {
+        hlog("[host][r121] !! alias 无法为 @%p 建 RW 别名，返回原址（写入可能 SIGSEGV）", (void *)addr);
+        return addr;
+    }
+    return (void *)(ali + (ua - base));
 }
 
 __attribute__((visibility("default")))
@@ -3611,6 +3646,9 @@ static void *boot_thread_impl(void *arg) {
         log_try("/var/mobile/nebula_host.txt");
         hlog("[host] === boot start ===");
         hlog("[host] BUILD=%s", NEBULA_BUILD_TAG_STR);
+        hlog("[host][r121] ===== R121 真修复：dual-map 别名表耗尽导致 detour 写 RX 页 SIGSEGV（通用加载器分支同步）=====");
+        hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。");
+        hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
         hlog("[host][u001] ===== U001 通用加载器分支：基于 R116，加载入口改 UniversalExecute（任意 BepInEx6 IL2CPP 插件包）=====");
         hlog("[host][u001] nebula_r56_invoke_manual_execute 优先调 UniversalExecute（PreloadInteropAssemblies+Execute），找不到回退 NebulaManualExecute(NOS)。");
         hlog("[host][u001] 本分支与 main 分开发布：main 仍 NOS-only，本分支通用。IL2CPPChainloader.dll 由 tools/patch_universal_execute 加通用入口。");
