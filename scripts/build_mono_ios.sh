@@ -46,7 +46,7 @@ MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 #   缓存跳过编译，白改。今后任何 mono 源码补丁都必须 bump 本号！
 # [R94] 新增 loader.c 补丁（mono_method_get_marshal_info 的 g_assert(tp) 改 NULL 安全跳过），
 #   必须 bump 本号强制重编，否则旧 mono 静态库仍带 g_assert 崩。
-CACHE_VERSION="${CACHE_VERSION:-39}"
+CACHE_VERSION="${CACHE_VERSION:-40}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -969,19 +969,26 @@ assert old in s, "icall.c RunClassConstructor anchor not matched"
 new = (T+"vtable = mono_class_vtable_checked (klass, error);\n"
        +T+"return_if_nok (error);\n"
        +"\n"
-       +T+"/* [Nebula iOS R119] DEFER forced class init.\n"
-       +T+"   Only caller on iOS is NOS Helpers.RunStaticConstructor during PatchAll;\n"
-       +T+"   its cctor JIT touches il2cpp types not yet registered -> SIGSEGV.\n"
-       +T+"   Do NOT run cctor here and do NOT set vtable->initialized, so CLR runs it\n"
-       +T+"   later via normal class_init on first real access (after il2cpp ready). */\n"
+       +T+"/* [Nebula iOS R128] Selective DEFER: only game assembly (Assembly-CSharp*)\n"
+       +T+"   forced cctor stays deferred (its JIT touches not-yet-registered il2cpp types).\n"
+       +T+"   System/framework/interop classes MUST run cctor normally: Il2CppClassPointerStore<T>\n"
+       +T+"   delegates NativeClassPtr setup to T.cctor via RunClassConstructor; deferring it\n"
+       +T+"   leaves NativeClassPtr==0 -> il2cpp_class_get_type(0) -> invalid handle -> SIGSEGV\n"
+       +T+"   (UnityAction 2-arg cctor -> internal_from_handle -> il2cpp_type_get_object, R127). */\n"
        +T+"{\n"
        +T+T+"MonoImage *_r119img = m_class_get_image (klass);\n"
-       +T+T+'fprintf (stderr, "[Nebula][r119] DEFER RunClassConstructor image=%s class=%s.%s\\n", _r119img ? _r119img->name : "?", m_class_get_name_space (klass) ? m_class_get_name_space (klass) : "", m_class_get_name (klass) ? m_class_get_name (klass) : "?"); fflush (stderr);\n'
-       +T+"}\n"
-       +T+"(void)vtable;\n")
+       +T+T+'const char *_r128iname = _r119img ? _r119img->name : "";\n'
+       +T+T+'int _r128_is_game = (_r128iname && strstr (_r128iname, "Assembly-CSharp") != NULL);\n'
+       +T+T+"if (_r128_is_game) {\n"
+       +T+T+T+'fprintf (stderr, "[Nebula][r119] DEFER RunClassConstructor image=%s class=%s.%s\\n", _r119img ? _r119img->name : "?", m_class_get_name_space (klass) ? m_class_get_name_space (klass) : "", m_class_get_name (klass) ? m_class_get_name (klass) : "?"); fflush (stderr);\n'
+       +T+T+T+"(void)vtable;\n"
+       +T+T+"} else {\n"
+       +T+T+T+"mono_runtime_class_init_full (vtable, error);\n"
+       +T+T+"}\n"
+       +T+"}\n")
 s = s.replace(old, new, 1)
 open(p,'w',encoding='utf-8').write(s)
-print("    R119 patch applied: RunClassConstructor defers forced cctor (no init, no mark)")
+print("    R128 patch applied: selective DEFER (game assembly only), system cctor runs normally")
 PY
 
 echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="
