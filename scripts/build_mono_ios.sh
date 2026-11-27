@@ -46,7 +46,7 @@ MANIFEST="${MANIFEST:-$HOME/mono_ios_manifest.txt}"
 #   缓存跳过编译，白改。今后任何 mono 源码补丁都必须 bump 本号！
 # [R94] 新增 loader.c 补丁（mono_method_get_marshal_info 的 g_assert(tp) 改 NULL 安全跳过），
 #   必须 bump 本号强制重编，否则旧 mono 静态库仍带 g_assert 崩。
-CACHE_VERSION="${CACHE_VERSION:-41}"
+CACHE_VERSION="${CACHE_VERSION:-42}"
 # iOS JIT 总开关：1=放出 ARM64 JIT（pro 模式需要；standard 仍走 aot_only 不受影响）；
 # 设 0 回到标准 DISABLE_JIT 构建（standard 安全，不编 JIT）。CI 默认 1。
 MONO_IOS_JIT="${MONO_IOS_JIT:-1}"
@@ -979,11 +979,24 @@ new = (T+"vtable = mono_class_vtable_checked (klass, error);\n"
        +T+"   NativeClassPtr get set (fixes R127 Scene.NativeClassPtr==0 handle SIGSEGV). */\n"
        +T+"{\n"
        +T+T+"MonoImage *_r119img = m_class_get_image (klass);\n"
-       +T+T+'const char *_r129iname = _r119img ? _r119img->name : "";\n'
-       +T+T+'const char *_r129cname = m_class_get_name (klass) ? m_class_get_name (klass) : "";\n'
-       +T+T+'int _r129_is_game = (_r129iname && strstr (_r129iname, "Assembly-CSharp") != NULL);\n'
-       +T+T+"int _r129_is_generic = (_r129cname && strchr (_r129cname, '`') != NULL);\n"
-       +T+T+"if (_r129_is_game || _r129_is_generic) {\n"
+       +T+T+'const char *_r130cname = m_class_get_name (klass) ? m_class_get_name (klass) : "";\n'
+       +T+T+'const char *_r130cns = m_class_get_name_space (klass) ? m_class_get_name_space (klass) : "";\n'
+       +T+T+"/* R130: DEFER ALL cctor (R127 full-DEFER keeps Harmony detour healthy, seq=160).\n"
+       +T+T+"   Whitelist ONLY pure-native Scene pipeline classes whose cctor just does\n"
+       +T+T+"   GetIl2CppClass/GetIl2CppField/GetIl2CppMethodByToken + runtime_class_init\n"
+       +T+T+"   (NO MakeGenericType/get_TypeHandle/internal_from_handle bad chain), so\n"
+       +T+T+"   Scene.NativeClassPtr/SceneManager/LoadSceneMode get set for sceneLoaded.\n"
+       +T+T+"   R129 wrongly let 134 non-generic system classes run cctor -> polluted\n"
+       +T+T+"   Il2CppSystem.Type metadata -> Harmony detour il2cpp_class_value_size\n"
+       +T+T+"   got wild class -> SIGSEGV at seq=35. */\n"
+       +T+T+'int _r130_ns = (_r130cns && !strcmp (_r130cns, "UnityEngine.SceneManagement"));\n'
+       +T+T+'int _r130_allow = 0;\n'
+       +T+T+'if (_r130_ns && _r130cname && !strcmp (_r130cname, "Scene")) _r130_allow = 1;\n'
+       +T+T+'if (_r130_ns && _r130cname && !strcmp (_r130cname, "SceneManager")) _r130_allow = 1;\n'
+       +T+T+'if (_r130_ns && _r130cname && !strcmp (_r130cname, "SceneManagerAPIInternal")) _r130_allow = 1;\n'
+       +T+T+'if (_r130_ns && _r130cname && !strcmp (_r130cname, "SceneManagerAPI")) _r130_allow = 1;\n'
+       +T+T+'if (_r130_ns && _r130cname && !strcmp (_r130cname, "LoadSceneMode")) _r130_allow = 1;\n'
+       +T+T+"if (!_r130_allow) {\n"
        +T+T+T+'fprintf (stderr, "[Nebula][r119] DEFER RunClassConstructor image=%s class=%s.%s\\n", _r119img ? _r119img->name : "?", m_class_get_name_space (klass) ? m_class_get_name_space (klass) : "", m_class_get_name (klass) ? m_class_get_name (klass) : "?"); fflush (stderr);\n'
        +T+T+T+"(void)vtable;\n"
        +T+T+"} else {\n"
@@ -992,7 +1005,7 @@ new = (T+"vtable = mono_class_vtable_checked (klass, error);\n"
        +T+"}\n")
 s = s.replace(old, new, 1)
 open(p,'w',encoding='utf-8').write(s)
-print("    R129 patch applied: DEFER game+generic, non-generic system cctor runs (fix R128 seq=35 regression)")
+print("    R130 patch applied: DEFER ALL except pure-native Scene pipeline whitelist (fix R128 seq=35 regression)")
 PY
 
 echo "=== [4/5] 编译 iOS arm64 mono 运行时 ==="
