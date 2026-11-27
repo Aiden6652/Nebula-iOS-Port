@@ -434,7 +434,7 @@ else
   echo "   [R125] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法加 method 守卫，拒绝产出" >&2; exit 1
 fi
 
-# [R126] 根治 internal_from_handle 的坏 methodInfo（R125 把崩降级成 null→NRE→patch全空，是绕过非修复）。
+# [R127] 根治 internal_from_handle 的坏 methodInfo + 修 R126b 非法 IL（栈平衡 dup+brtrue）（R125 把崩降级成 null→NRE→patch全空，是绕过非修复）。
 #   真机 BUILD=83d89bd69ec9(R125)：seq=0 ok=0 down=0（patch 全空）。异常链：
 #     HarmonyException: Patching exception in AmongUsClient::Awake()
 #       -> NullReferenceException at Il2CppSystem.Type.op_Equality(Type,Type)
@@ -449,9 +449,9 @@ if command -v dotnet >/dev/null 2>&1; then
   D126_PROJ="$ROOT/../../tools/patch_internal_from_handle/patch_internal_from_handle.csproj"
   MS126="$ROOT/prebuilt-interop/Il2Cppmscorlib.dll"
   if [ -f "$D126_PROJ" ] && [ -f "$MS126" ]; then
-    echo "   [R126] 根治 internal_from_handle：直调 il2cpp_type_get_object（幂等）..."
+    echo "   [R127] 根治 internal_from_handle：dup+brtrue 栈平衡（修 IL_0010: pop，幂等）..."
     dotnet run --project "$D126_PROJ" -c Release -- "$MS126" || \
-      { echo "   [R126] ✗ 补丁失败，拒绝产出会 NRE 的包" >&2; exit 1; }
+      { echo "   [R127] ✗ 补丁失败/IL 栈校验不过，拒绝产出会进原版的包" >&2; exit 1; }
   else
     echo "   [R126] ✗ 找不到 $D126_PROJ 或 $MS126，拒绝产出" >&2; exit 1
   fi
