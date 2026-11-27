@@ -419,6 +419,31 @@ else
   echo "   [R125] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法加 method 守卫，拒绝产出" >&2; exit 1
 fi
 
+# [R126] 根治 internal_from_handle 的坏 methodInfo（R125 把崩降级成 null→NRE→patch全空，是绕过非修复）。
+#   真机 BUILD=83d89bd69ec9(R125)：seq=0 ok=0 down=0（patch 全空）。异常链：
+#     HarmonyException: Patching exception in AmongUsClient::Awake()
+#       -> NullReferenceException at Il2CppSystem.Type.op_Equality(Type,Type)
+#       -> HarmonySupport.TryResolve -> Harmony.PatchAll -> NebulaPlugin.LoadInternal
+#   根因：internal_from_handle 是 icall，iOS 预生成 interop 里它的 NativeMethodInfoPtr 是坏指针。
+#     R123(method==0)/R124a(缺失返回0) 打不中；R125 守卫把它拦成 null，上游 op_Equality(null,..) NRE。
+#   正解（真修复·非绕过·跨 AU 版本/设备/iOS 通用）：internal_from_handle(handle) 本质 =
+#     il2cpp_type_get_object(handle) 再包成 Il2CppSystem.Type。直接替换方法体，绕开坏 methodInfo。
+#     这正是上游新版 Il2CppInterop 对该 icall 的生成方式，语义完全等价。
+#   目标：$ROOT/prebuilt-interop/Il2Cppmscorlib.dll（blob 打包前 patch，指纹随内容变化→设备自动重释放）。
+if command -v dotnet >/dev/null 2>&1; then
+  D126_PROJ="$ROOT/../../tools/patch_internal_from_handle/patch_internal_from_handle.csproj"
+  MS126="$ROOT/prebuilt-interop/Il2Cppmscorlib.dll"
+  if [ -f "$D126_PROJ" ] && [ -f "$MS126" ]; then
+    echo "   [R126] 根治 internal_from_handle：直调 il2cpp_type_get_object（幂等）..."
+    dotnet run --project "$D126_PROJ" -c Release -- "$MS126" || \
+      { echo "   [R126] ✗ 补丁失败，拒绝产出会 NRE 的包" >&2; exit 1; }
+  else
+    echo "   [R126] ✗ 找不到 $D126_PROJ 或 $MS126，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R126] ✗ 缺 dotnet，无法根治 internal_from_handle，拒绝产出" >&2; exit 1
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
