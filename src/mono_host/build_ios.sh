@@ -343,6 +343,35 @@ else
   echo "   [R122] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，拒绝产出" >&2; exit 1
 fi
 
+# [R123] il2cpp_runtime_invoke null-method 守卫（修 UnityAction`2 cctor 传 0 method 崩）。
+#   真机 1.9MB 日志（main BUILD=66cb9e001f2d，即 R122 版）崩栈：
+#   NebulaPlugin.LoadInternal -> SceneManager:get_sceneLoaded -> Il2CppObjectPool:Get ->
+#   System.Object:Initializer<UnityAction`2> -> UnityEngine.Events.UnityAction`2:.cctor ->
+#   Il2CppSystem.Type:internal_from_handle -> IL2CPP:il2cpp_runtime_invoke(method=0) ->
+#   SIGSEGV (native fault: ldr w8,[x8,#8] 解引用 method->methodPointer, method=NULL)。
+#   根因：Il2CppInterop 为泛型委托 UnityAction`2 生成的 interop 类 cctor 里要 invoke 的
+#   IL2CPP 侧方法指针为 0（类/方法不存在或被裁剪）。il2cpp_runtime_invoke 是裸 P/Invoke、
+#   无 null 检查 -> 传 0 进 libil2cpp -> SIGSEGV。与 R122 的 class_init(0) 同根因族；
+#   R119 DEFER 只拦 RunClassConstructor icall，拦不住 JIT 内部自动跑的 cctor。
+#   修法（真修复·参数守卫·非绕过）：把 P/Invoke 改名 _Raw 保留 native EntryPoint，
+#   建同名托管 wrapper：method==0 时返回 IntPtr.Zero(no-op)，否则原样透传 4 参数调 _Raw。
+#   跨程序集调用点（设备 interop DLL）按名字+签名自动绑 wrapper，设备 DLL 零改动。
+#   method==0 表示 IL2CPP 侧无该方法可调用，返回 null 是唯一安全语义；只对 null 生效，
+#   跨 AU 版本/设备/iOS 一致。幂等、原子写回。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  D123_PROJ="$ROOT/../../tools/patch_invoke_nullguard/patch_invoke_nullguard.csproj"
+  if [ -f "$D123_PROJ" ]; then
+    echo "   [R123] 给 Il2CppInterop.Runtime.dll 的 il2cpp_runtime_invoke 加 null-method 守卫（幂等）..."
+    dotnet run --project "$D123_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/Il2CppInterop.Runtime.dll || \
+      { echo "   [R123] ✗ null-method 守卫补丁失败，拒绝产出会崩的包" >&2; exit 1; }
+  else
+    echo "   [R123] ✗ 找不到 $D123_PROJ，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R123] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 null-method 守卫，拒绝产出" >&2; exit 1
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
