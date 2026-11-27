@@ -397,6 +397,28 @@ else
   echo "   [R124a] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法根治坏 method 桩，拒绝产出" >&2; exit 1
 fi
 
+# [R125] native method 指针有效性守卫（真修复·非绕过·跨 AU 版本/设备/iOS 通用）。
+#   真机 BUILD=8b349c49(R124) 崩栈与 R123 完全一致：R123/R124a 都进了产物但都没生效，
+#   因为 method 既不是 0 也不是"找不到"坏桩，而是【非0野指针】(native fault ldr w8,[x0,#8],
+#   x0=method 页不可读)。Type..cctor 早期缓存的 internal_from_handle method 在 iOS 失效。
+#   修法：R123 wrapper 在调 _Raw 前加 nebula_method_readable(method)（宿主导出，
+#   mach_vm_region 校验页可读）守卫；不可读返回 IntPtr.Zero 让 internal_from_handle 走
+#   自带 null 分支。有效 method 恒返回 1、成功路径零影响，与 PC 现场生成 interop 一致。
+#   宿主 dllmap 把 "nebula_guard" -> 主 dylib；失败硬中止（无兜底）。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  D125_PROJ="$ROOT/../../tools/patch_method_guard/patch_method_guard.csproj"
+  if [ -f "$D125_PROJ" ]; then
+    echo "   [R125] 给 il2cpp_runtime_invoke wrapper 加 method 可读性守卫（幂等）..."
+    dotnet run --project "$D125_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/Il2CppInterop.Runtime.dll || \
+      { echo "   [R125] ✗ 补丁失败，拒绝产出会崩的包" >&2; exit 1; }
+  else
+    echo "   [R125] ✗ 找不到 $D125_PROJ，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R125] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法加 method 守卫，拒绝产出" >&2; exit 1
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
