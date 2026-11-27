@@ -3728,6 +3728,11 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r125] 根因：Il2CppSystem.Type..cctor 早期用 token 解析缓存的 internal_from_handle method 在 iOS 指向失效 native 内存；PC 端现场生成 interop 避开。");
         hlog("[host][r125] 修法（参数有效性守卫·真修复非绕过·跨 AU 版本/设备/iOS 通用）：il2cpp_runtime_invoke wrapper 调 _Raw 前先调 nebula_method_readable(method)（本导出，mach_vm_region 校验 method 页 VM_PROT_READ；野指针落 unmapped 区返回0）；不可读返回 IntPtr.Zero 让 internal_from_handle 走自带 null 分支。method 有效恒返回1、成功路径零影响，与 PC 完全一致。");
         hlog("[host][r125] 真机验收：boot 出现本 banner + dllmap: nebula_guard -> 主 dylib；不再崩于 internal_from_handle 的 il2cpp_runtime_invoke，NebulaPlugin.LoadInternal 完成 sceneLoaded 注册、进入 NOS 角色注册/大厅劫持。");
+        hlog("[host][r126] ===== R126 根治 internal_from_handle 坏 methodInfo（R125 是绕过、实测 patch 全空 seq=0 ok=0 down=0）=====");
+        hlog("[host][r126] 真机 BUILD=83d89bd69ec9(R125)：HarmonyException in AmongUsClient::Awake -> NullReferenceException at Il2CppSystem.Type.op_Equality -> HarmonySupport.TryResolve -> PatchAll。");
+        hlog("[host][r126] 根因：internal_from_handle 是 icall，其 NativeMethodInfoPtr 在 iOS 预生成 interop 里是坏指针；R123(==0)/R124a(缺失返回0) 打不中，R125 守卫拦成 null 导致 op_Equality(null,..) NRE、patch 全空。");
+        hlog("[host][r126] 修法（真修复非绕过·跨版本/设备/iOS）：构建时把 prebuilt-interop/Il2Cppmscorlib.dll 的 internal_from_handle 方法体替换为直调 il2cpp_type_get_object(handle) 再包 Type，绕开坏 methodInfo（=上游新版 Il2CppInterop 生成方式，语义等价）。R125 守卫保留作安全网，正常 method 恒透传。");
+        hlog("[host][r126] 真机验收：boot 出现本 banner；interop 指纹变化触发设备自动重释放；不再 NRE、Harmony.PatchAll seq>0、NOS 角色注册启动。");
         hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。日志证据：dual-map 成功正好64次，崩溃前 make_writable 别名=原地址 @0x164950000。");
         hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容(消除容量上限)；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
         hlog("[host][r121] 真机验收：boot 出现本 banner；不再在 seq~38 崩于 DetourNativeARMPlatform:Apply -> DetourHelper:Write；dual-map 可超过64次并出现 [host][r121] 别名表扩容 日志。");
