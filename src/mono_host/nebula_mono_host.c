@@ -3738,6 +3738,12 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r127] 根因：R126b 补丁工具生成的 IL 非法——brtrue.s 已弹出栈顶，零分支紧接 pop 弹空栈；且 ok 分支 call poolGet 时栈上无参数。上次验收只查了 runtime_invoke 计数=0，抽错 DLL（顶层 mscorlib.dll 而非 interop/Il2Cppmscorlib.dll），漏检 IL 栈合法性，虚过。");
         hlog("[host][r127] 修法（真修复·非绕过·跨版本/设备/iOS）：internal_from_handle 改为与 Il2CppInterop 官方生成器同构的 dup+brtrue 栈平衡 IL——ldarg.0; call il2cpp_type_get_object; dup; brtrue.s ok; pop; ldnull; br.s ret; ok: call Il2CppObjectPool.Get<Type>; ret。obj=0 走 null 分支，obj!=0 消费 dup 栈值，两个分支栈深恒一致。补丁工具内置 IL 栈深度自检，任何栈冲突/非法 opcode 直接拒绝产出。");
         hlog("[host][r127] 真机验收：boot 出现本 banner；interop 指纹变化触发设备重释放；不再 InvalidProgramException、Harmony.PatchAll seq>0、NOS 角色注册启动、主菜单被劫持。");
+        hlog("[host][r128] ===== R128 真修 R119 DEFER 破坏系统类 cctor → Scene.NativeClassPtr=0 → UnityAction`2.cctor handle 野 SIGSEGV =====");
+        hlog("[host][r128] 真机 BUILD=d23a6afab57e(R127)：R127 IL 修复成功，seq=160 ok=158（patch 真打上，历史首次），NOS 进 LoadInternal 注册 sceneLoaded；但崩于 UnityAction`2:.cctor -> internal_from_handle -> il2cpp_type_get_object，fault ldr w9,[x0,#8]（handle 野）。");
+        hlog("[host][r128] 根因：R119 把 RunClassConstructor icall 无差别 DEFER 成 no-op。Il2CppInterop 的 Il2CppClassPointerStore<T>.cctor 靠 RunClassConstructor(T) 触发 T.cctor 去设置 NativeClassPtr；系统类 Scene/SceneManager/UnityAction`2 也被 DEFER → Scene.cctor 不跑 → NativeClassPtr=0 → il2cpp_class_get_type(0) 返回野 handle → 崩。R123(method=0)/R125/R126/R127 全在下游打转，根因一直是这个。");
+        hlog("[host][r128] 修法（真修复·非绕过·跨版本/设备/iOS）：R119 DEFER 改为选择性——仅 Assembly-CSharp*（NOS 强制初始化会 JIT 崩的游戏类）继续 DEFER；UnityEngine.*/Il2Cpp*/BepInEx/mscorlib 等系统/框架/interop 类照常执行 cctor，NativeClassPtr 按 Il2CppInterop 契约正确设置。CACHE_VERSION 39->40 强制重编 mono。");
+        hlog("[host][r128] 真机验收：boot 出现本 banner；日志里 DEFER 只剩 Assembly-CSharp.dll 游戏类、不再有 UnityEngine.CoreModule.dll 的 Scene/SceneManager/UnityAction`2；不再崩于 UnityAction`2.cctor；sceneLoaded 注册完成、NOS 进入大厅、劫持原版。");
+
         hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。日志证据：dual-map 成功正好64次，崩溃前 make_writable 别名=原地址 @0x164950000。");
         hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容(消除容量上限)；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
         hlog("[host][r121] 真机验收：boot 出现本 banner；不再在 seq~38 崩于 DetourNativeARMPlatform:Apply -> DetourHelper:Write；dual-map 可超过64次并出现 [host][r121] 别名表扩容 日志。");
