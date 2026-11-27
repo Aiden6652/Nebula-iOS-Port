@@ -3663,6 +3663,11 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r124] R124a：GetMethodInfoForMissingMethod 返回 IntPtr.Zero（缺失方法=明确 null 句柄，非野指针桩）；R123 的 method==0 守卫这才真正生效，internal_from_handle 走自带 null 分支安全返回。只影响解析不到的异常路径，PC/正常方法零变化。");
         hlog("[host][r124] R124b：r99b_gate_extra_ms 4000->0，信号(refdata done)命中立即冻结跑 PatchAll+Execute，赶在主菜单 Awake 前挂 sceneLoaded，对齐 PC Doorstep 同步注入。");
         hlog("[host][r124] 真机验收：boot 出现本 banner + extra=0ms；不再崩于 seq≈160 的 il2cpp_runtime_invoke；NOS 回调早于原版 sceneLoaded、能劫持原版主菜单。");
+        hlog("[host][r125] ===== R125 真修复：il2cpp_runtime_invoke method 指针有效性守卫（R123/R124a 无效的根治）=====");
+        hlog("[host][r125] 真机 BUILD=8b349c49(R124) 崩栈与 R123 一字不差，证明 R123(method==0)+R124a(缺失返回0) 都没打中：method 不是0也不是坏桩，是【非0野指针】，native fault ldr w8,[x0,#8] 读 method+8(methodPointer) 时 method 页已不可读。");
+        hlog("[host][r125] 根因：Il2CppSystem.Type..cctor 早期用 token 解析缓存的 internal_from_handle method 在 iOS 指向失效 native 内存；PC 端现场生成 interop 避开。");
+        hlog("[host][r125] 修法（参数有效性守卫·真修复非绕过·跨 AU 版本/设备/iOS 通用）：il2cpp_runtime_invoke wrapper 调 _Raw 前先调 nebula_method_readable(method)（本导出，mach_vm_region 校验 method 页 VM_PROT_READ；野指针落 unmapped 区返回0）；不可读返回 IntPtr.Zero 让 internal_from_handle 走自带 null 分支。method 有效恒返回1、成功路径零影响，与 PC 完全一致。");
+        hlog("[host][r125] 真机验收：boot 出现本 banner + dllmap: nebula_guard -> 主 dylib；不再崩于 internal_from_handle 的 il2cpp_runtime_invoke，NebulaPlugin.LoadInternal 完成 sceneLoaded 注册、进入 NOS 角色注册/大厅劫持。");
         hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。");
         hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
         hlog("[host][u001] ===== U001 通用加载器分支：基于 R116，加载入口改 UniversalExecute（任意 BepInEx6 IL2CPP 插件包）=====");
