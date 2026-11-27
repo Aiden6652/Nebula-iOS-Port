@@ -3683,6 +3683,11 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r128] 根因：R119 把 RunClassConstructor icall 无差别 DEFER 成 no-op。Il2CppInterop 的 Il2CppClassPointerStore<T>.cctor 靠 RunClassConstructor(T) 触发 T.cctor 去设置 NativeClassPtr；系统类 Scene/SceneManager/UnityAction`2 也被 DEFER → Scene.cctor 不跑 → NativeClassPtr=0 → il2cpp_class_get_type(0) 返回野 handle → 崩。R123(method=0)/R125/R126/R127 全在下游打转，根因一直是这个。");
         hlog("[host][r128] 修法（真修复·非绕过·跨版本/设备/iOS）：R119 DEFER 改为选择性——仅 Assembly-CSharp*（NOS 强制初始化会 JIT 崩的游戏类）继续 DEFER；UnityEngine.*/Il2Cpp*/BepInEx/mscorlib 等系统/框架/interop 类照常执行 cctor，NativeClassPtr 按 Il2CppInterop 契约正确设置。CACHE_VERSION 39->40 强制重编 mono。");
         hlog("[host][r128] 真机验收：boot 出现本 banner；日志里 DEFER 只剩 Assembly-CSharp.dll 游戏类、不再有 UnityEngine.CoreModule.dll 的 Scene/SceneManager/UnityAction`2；不再崩于 UnityAction`2.cctor；sceneLoaded 注册完成、NOS 进入大厅、劫持原版。");
+        hlog("[host][r129] ===== R129 修 R128 回归：放行所有系统类导致 AsyncOperationHandle`1.cctor 崩、PatchAll 停在 seq=35 =====");
+        hlog("[host][r129] 真机 BUILD=b6ceadf8da77(R128)：seq=35 ok=34，心跳却报「完成」（R129 已修该误报）；崩于 Error loading [NebulaLoader] -> HarmonyException: IL Compile Error -> AsyncOperationHandle`1[[GameObject]].cctor -> Il2CppSystem.Type.get_TypeHandle() -> Il2CppObjectBaseToPtrNotNull(null) -> NRE；随后 native SIGSEGV。");
+        hlog("[host][r129] 根因：R128 把 R119 DEFER 改成只 defer 游戏类，放行全部系统类。R127 全 DEFER 时 PatchAll 跑满 seq=160 ok=158 且 AsyncOperationHandle`1.cctor 从未触发；R128 放行后泛型 interop cctor 走 MakeGenericType+get_TypeHandle 这条 iOS 坏链，对 null 解引用 -> NRE -> PatchAll 第35个patch异常终止。");
+        hlog("[host][r129] 修法（真修复·非绕过·跨版本/设备/iOS）：R119 DEFER 恢复——游戏类(Assembly-CSharp)继续 DEFER；类名含反引号的泛型类(AsyncOperationHandle`1/UnityAction`2/Il2CppClassPointerStore`1等)也 DEFER（不走 get_TypeHandle 坏链）；只放行非泛型系统/框架类(Scene/SceneManager/SceneManagerAPIInternal/GameObject/Debug...)正常执行 cctor，NativeClassPtr 按契约正确设置（修 R127 的 Scene.NativeClassPtr=0 handle 野崩）。CACHE_VERSION 40->41 强制重编 mono。");
+        hlog("[host][r129] 真机验收：boot 出现本 banner；DEFER 日志里出现 UnityEngine.CoreModule.dll 的 Scene/SceneManager 放行（不再 DEFER），但不再有 AsyncOperationHandle`1/UnityAction`2 的 get_TypeHandle NRE；心跳 DONE 时 ok>=150 才报 patch 充足；PatchAll 跑满、sceneLoaded 注册完成、进 NOS 大厅劫持原版。");
 
         hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。");
         hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
@@ -4215,8 +4220,13 @@ static void *nebula_r97b_heartbeat_thread(void *arg) {
         /* [R97b] 只报客观数据，不替用户下「卡死」结论：2 分钟零日志增长
            不足以区分「慢 JIT」与「死锁」，定性交给看日志的人。 */
         const char *verdict;
-        if (stg >= R97B_ST_DONE)
-            verdict = "[完成] Execute 已返回（是否进 NOS 看主菜单）";
+        if (stg >= R97B_ST_DONE) {
+            /* [R129] ok 远低于历史正常值(158)即视为异常终止，不再误报"完成"（R128 实测 ok=34 却报完成）。 */
+            if (ok < 100)
+                verdict = "[Execute返回·patch异常终止] ok 偏少(正常应>=150)，看上面 Error loading/HarmonyException 栈";
+            else
+                verdict = "[Execute返回·patch充足] 是否进 NOS 看主菜单";
+        }
         else if (stg == 0)
             verdict = "[等待] boot 尚未开始";
         else if (idle >= 8000)
