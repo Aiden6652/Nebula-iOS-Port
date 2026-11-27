@@ -3651,6 +3651,10 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r122] 崩链: Harmony.PatchAll -> GetFunctionPointer -> JIT -> _CoUseZipline_d__39:.cctor -> il2cpp_runtime_class_init(IntPtr.Zero) -> SIGSEGV；R119 DEFER 拦不住 JIT 内部 cctor。");
         hlog("[host][r122] 修法：Il2CppInterop.Runtime.dll 里把该 P/Invoke 改名 _Raw 保留 EntryPoint，建同名 wrapper：klass==0 no-op，非 0 透传。跨程序集调用点按名字自动绑 wrapper，设备 interop DLL 零改动。");
         hlog("[host][r122] 真机验收：boot 出现本 banner；不再在 seq≈112 崩于 il2cpp_runtime_class_init；加载继续推进。");
+        hlog("[host][r123] ===== R123 真修复：il2cpp_runtime_invoke(method=0) null-method 守卫（修 UnityAction`2 cctor 崩）=====");
+        hlog("[host][r123] 崩链: NebulaPlugin.LoadInternal -> SceneManager:get_sceneLoaded -> Il2CppObjectPool:Get -> UnityAction`2:.cctor -> Il2CppSystem.Type:internal_from_handle -> il2cpp_runtime_invoke(method=0) -> SIGSEGV；native fault ldr w8,[x8,#8] 解引用 method->methodPointer。");
+        hlog("[host][r123] 修法：Il2CppInterop.Runtime.dll 里把 il2cpp_runtime_invoke P/Invoke 改名 _Raw 保留 EntryPoint，建同名 wrapper：method==0 返回 IntPtr.Zero，否则原样透传 4 参数。跨程序集调用点按名字自动绑 wrapper，设备 interop DLL 零改动。与 R122 同根因族（null native pointer 裸 P/Invoke），R119 DEFER 拦不住 JIT 内部 cctor。");
+        hlog("[host][r123] 真机验收：boot 出现本 banner；不再在 seq≈160 崩于 il2cpp_runtime_invoke；加载继续推进（预期进入 NOS 角色注册/游戏本体）。");
         hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。");
         hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
         hlog("[host][u001] ===== U001 通用加载器分支：基于 R116，加载入口改 UniversalExecute（任意 BepInEx6 IL2CPP 插件包）=====");
