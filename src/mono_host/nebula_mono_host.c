@@ -2624,7 +2624,10 @@ static int g_stdio_pipe[2] = { -1, -1 };
  * ------------------------------------------------------------------------- */
 static int          r99b_gate_on      = 1;
 static int          r99b_gate_startup = 0;
-static int64_t      r99b_gate_extra_ms = 4000;  /* [R117] begin 信号命中后再给 Unity 4000ms 完成 il2cpp 类型注册。
+static int64_t      r99b_gate_extra_ms = 0;     /* [R124b] begin 信号(refdata done,类型已注册)命中后立即冻结注入，赶在主菜单 Awake 前挂 sceneLoaded 回调，对齐 PC 同步注入。
+                                                    4000ms(R117) 把 3 秒黄金窗口让给原版 -> 主菜单已 Awake/原版已挂回调 -> 劫持不了 + sceneLoaded 构造 UnityAction`2 触发坏桩 cctor 崩。
+                                                    回退：NEBULA_R99B_GATE_EXTRA_MS=4000。 */
+                                                    /* [R117 原始] 4000ms 完成 il2cpp 类型注册。
                                                     R116 真机新证据：同一份包"成功过一次(patch全跑完300KB)、第二三次崩#157"
                                                     => #157 cctor 非必然崩，而是类型注册完成度的概率竞态，
                                                     推翻 R114"独立cctor问题/非延时不足"判断。R97b(等RunStartUp t≈9.1s)稳过，
@@ -3655,6 +3658,11 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r123] 崩链: NebulaPlugin.LoadInternal -> SceneManager:get_sceneLoaded -> Il2CppObjectPool:Get -> UnityAction`2:.cctor -> Il2CppSystem.Type:internal_from_handle -> il2cpp_runtime_invoke(method=0) -> SIGSEGV；native fault ldr w8,[x8,#8] 解引用 method->methodPointer。");
         hlog("[host][r123] 修法：Il2CppInterop.Runtime.dll 里把 il2cpp_runtime_invoke P/Invoke 改名 _Raw 保留 EntryPoint，建同名 wrapper：method==0 返回 IntPtr.Zero，否则原样透传 4 参数。跨程序集调用点按名字自动绑 wrapper，设备 interop DLL 零改动。与 R122 同根因族（null native pointer 裸 P/Invoke），R119 DEFER 拦不住 JIT 内部 cctor。");
         hlog("[host][r123] 真机验收：boot 出现本 banner；不再在 seq≈160 崩于 il2cpp_runtime_invoke；加载继续推进（预期进入 NOS 角色注册/游戏本体）。");
+        hlog("[host][r124] ===== R124 两问题同修：坏桩根治(R124a) + 注入时机对齐PC(R124b) =====");
+        hlog("[host][r124] 问题①没加载成功 + ②劫持不了原版，同一根因链：4000ms extra 让注入晚于主菜单 Awake；sceneLoaded 注册时构造 UnityAction`2 触发 internal_from_handle 用坏桩 method 崩。");
+        hlog("[host][r124] R124a：GetMethodInfoForMissingMethod 返回 IntPtr.Zero（缺失方法=明确 null 句柄，非野指针桩）；R123 的 method==0 守卫这才真正生效，internal_from_handle 走自带 null 分支安全返回。只影响解析不到的异常路径，PC/正常方法零变化。");
+        hlog("[host][r124] R124b：r99b_gate_extra_ms 4000->0，信号(refdata done)命中立即冻结跑 PatchAll+Execute，赶在主菜单 Awake 前挂 sceneLoaded，对齐 PC Doorstep 同步注入。");
+        hlog("[host][r124] 真机验收：boot 出现本 banner + extra=0ms；不再崩于 seq≈160 的 il2cpp_runtime_invoke；NOS 回调早于原版 sceneLoaded、能劫持原版主菜单。");
         hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。");
         hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
         hlog("[host][u001] ===== U001 通用加载器分支：基于 R116，加载入口改 UniversalExecute（任意 BepInEx6 IL2CPP 插件包）=====");
