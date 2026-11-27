@@ -372,6 +372,31 @@ else
   echo "   [R123] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法注入 null-method 守卫，拒绝产出" >&2; exit 1
 fi
 
+# [R124a] 根治坏 method 指针：GetMethodInfoForMissingMethod 返回 IntPtr.Zero。
+#   真机 1.9MB 日志 BUILD=46887ef74f7f（R123 版）仍崩，崩栈末行 il2cpp_runtime_invoke_Raw；
+#   R123 的 method==0 守卫确实生效但拦不住——因为传进来的 method 是【非0坏桩】。
+#   反编译实证：System.Type..cctor 用 GetIl2CppMethodByToken(NativeClassPtr, token) 取
+#   methodInfoPtr；查不到 token 时不返回 0，而是 GetMethodInfoForMissingMethod() 生成
+#   Slot=0xFFFF、methodPointer 未赋值的野指针桩 -> il2cpp_runtime_invoke 解引用 -> SIGSEGV。
+#   不是 interop 版本错配（Unity 引擎类型 token 跨 AU 版本稳定，InnerSloth 不动底层）。
+#   修法（真修复·源头·非绕过）：把 GetMethodInfoForMissingMethod 方法体改成 return IntPtr.Zero。
+#   「方法不存在」返回明确 null 句柄，R123 守卫这才真正生效；internal_from_handle 的 IL
+#   自带 dup/brtrue->ldnull null 分支，安全返回 null。只影响解析不到的异常路径，
+#   正常方法零变化、PC 端零变化，跨 AU 版本/设备/iOS 一致。幂等、原子写回。
+if [ -n "${BEPINEX_CORE_DIR:-}" ] && command -v dotnet >/dev/null 2>&1; then
+  D124A_PROJ="$ROOT/../../tools/patch_missing_method_zero/patch_missing_method_zero.csproj"
+  if [ -f "$D124A_PROJ" ]; then
+    echo "   [R124a] 让 GetMethodInfoForMissingMethod 返回 IntPtr.Zero（根治坏 method 桩，幂等）..."
+    dotnet run --project "$D124A_PROJ" -c Release -- \
+        "$BEPINEX_CORE_DIR"/Il2CppInterop.Runtime.dll || \
+      { echo "   [R124a] ✗ 补丁失败，拒绝产出会崩的包" >&2; exit 1; }
+  else
+    echo "   [R124a] ✗ 找不到 $D124A_PROJ，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R124a] ✗ 缺 dotnet 或 BEPINEX_CORE_DIR，无法根治坏 method 桩，拒绝产出" >&2; exit 1
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
