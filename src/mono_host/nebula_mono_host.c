@@ -3302,6 +3302,59 @@ static int g_nebula_tramp_n = 0;
 
 static long nebula_ps(void) { long ps = sysconf(_SC_PAGESIZE); return ps > 0 ? ps : 16384; }
 
+/* [R125] native method 指针有效性守卫（真修复，非绕过）。
+ * 真机 BUILD=8b349c49(R124) 崩栈与 R123 完全一致：
+ *   NebulaPlugin.LoadInternal -> get_sceneLoaded -> UnityAction`2..cctor
+ *   -> Il2CppSystem.Type:internal_from_handle -> il2cpp_runtime_invoke
+ *   -> SIGSEGV，native fault 指令 ldr w8,[x0,#8]（x0=method）。
+ * 实证 R123(method==0 守卫) + R124a(缺失方法返回0) 都进了产物但未生效：
+ *   method 不是 0，也不是"找不到"的坏桩，而是【非0野指针】——
+ *   il2cpp_runtime_invoke 读 method+8(methodPointer) 时 method 页已不可读。
+ * 这是 Il2CppInterop 对 internal_from_handle 的 method 缓存(在 Type..cctor
+ * 早期用 token 解析)在 iOS 上指向失效 native 内存，PC 端现场生成 interop 避开。
+ *
+ * 修法（参数有效性守卫·跨 AU 版本/设备/iOS 通用·成功路径零影响）：
+ *   Il2CppInterop.Runtime.dll 的 il2cpp_runtime_invoke wrapper 在调 _Raw 前先调
+ *   本函数校验 method 指向的页可读（且 method+8 同页可读）；不可读则返回 0，
+ *   让 internal_from_handle 走其 IL 自带的 `dup/brtrue -> ldnull` null 分支安全返回。
+ *   method 有效时本函数恒返回 1，_Raw 原样透传全部参数，行为与 PC 完全一致。
+ *   不是跳过功能：仅在 native 指针已失效、原本必崩的异常路径上做安全降级。
+ *
+ * 正确性要点：vm_region_64 返回"地址 >= a 的第一个 region"，野指针落在 unmapped
+ *   区时会返回一个 a'>a 的 region；必须校验 returned_base == 查询页基址，否则误判。 */
+__attribute__((visibility("default")))
+int nebula_method_readable(const void *method)
+{
+    if (!method) return 0;
+    vm_address_t q = (vm_address_t)(uintptr_t)method;
+    long ps = nebula_ps();
+    vm_address_t page = q & ~((vm_address_t)ps - 1);
+    vm_address_t a = page;
+    vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t bi;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = vm_region_64(mach_task_self(), &a, &sz,
+                                    VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&bi, &cnt, &obj);
+    if (kr != KERN_SUCCESS) return 0;
+    if (a != page) return 0;                       /* 野指针落在 unmapped 区 */
+    if (!(bi.protection & VM_PROT_READ)) return 0; /* execute-only 页不可读 */
+    /* method->methodPointer 在 +8；同页内即已覆盖跨页边界的极端情况 */
+    if (q - page > (vm_address_t)ps - 8) {
+        vm_address_t a2 = page + ps;
+        vm_address_t q2 = a2;
+        vm_size_t sz2 = 0;
+        vm_region_basic_info_data_64_t bi2;
+        mach_msg_type_number_t cnt2 = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj2 = MACH_PORT_NULL;
+        kr = vm_region_64(mach_task_self(), &q2, &sz2, VM_REGION_BASIC_INFO_64,
+                          (vm_region_info_t)&bi2, &cnt2, &obj2);
+        if (kr != KERN_SUCCESS || q2 != a2 || !(bi2.protection & VM_PROT_READ)) return 0;
+    }
+    return 1;
+}
+
 static int nebula_is_tramp(uintptr_t base) {
     for (int i = 0; i < g_nebula_tramp_n; i++)
         if (g_nebula_tramp[i].base == base) return 1;
@@ -3578,6 +3631,13 @@ static void nebula_setup_native_dllmaps(const char *appdir)
         hlog("[host][r62] dllmap: nebula_jit -> %s（detour 内存翻转原生函数）", self);
     }
 
+    /* ---- 1.6) [R125] nebula_guard：method 指针可读性守卫（修 internal_from_handle 野指针崩）。
+       必须在下面 static_shim 的 return 之前挂，否则 CoreLib 静态链成功时会被跳过。 ---- */
+    if (self) {
+        mono_dllmap_insert(NULL, "nebula_guard", NULL, self, NULL);
+        hlog("[host][r125] dllmap: nebula_guard -> %s（il2cpp_runtime_invoke method 可读性守卫）", self);
+    }
+
     /* ---- 2) CoreLib 的 5 个 P/Invoke shim ---- */
     int static_shim = 0;
     {
@@ -3663,6 +3723,11 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r124] R124a：GetMethodInfoForMissingMethod 返回 IntPtr.Zero（缺失方法=明确 null 句柄，非野指针桩）；R123 的 method==0 守卫这才真正生效，internal_from_handle 走自带 null 分支安全返回。只影响解析不到的异常路径，PC/正常方法零变化。");
         hlog("[host][r124] R124b：r99b_gate_extra_ms 4000->0，信号(refdata done)命中立即冻结跑 PatchAll+Execute，赶在主菜单 Awake 前挂 sceneLoaded，对齐 PC Doorstep 同步注入。");
         hlog("[host][r124] 真机验收：boot 出现本 banner + extra=0ms；不再崩于 seq≈160 的 il2cpp_runtime_invoke；NOS 回调早于原版 sceneLoaded、能劫持原版主菜单。");
+        hlog("[host][r125] ===== R125 真修复：il2cpp_runtime_invoke method 指针有效性守卫（R123/R124a 无效的根治）=====");
+        hlog("[host][r125] 真机 BUILD=8b349c49(R124) 崩栈与 R123 一字不差，证明 R123(method==0)+R124a(缺失返回0) 都没打中：method 不是0也不是坏桩，是【非0野指针】，native fault ldr w8,[x0,#8] 读 method+8(methodPointer) 时 method 页已不可读。");
+        hlog("[host][r125] 根因：Il2CppSystem.Type..cctor 早期用 token 解析缓存的 internal_from_handle method 在 iOS 指向失效 native 内存；PC 端现场生成 interop 避开。");
+        hlog("[host][r125] 修法（参数有效性守卫·真修复非绕过·跨 AU 版本/设备/iOS 通用）：il2cpp_runtime_invoke wrapper 调 _Raw 前先调 nebula_method_readable(method)（本导出，mach_vm_region 校验 method 页 VM_PROT_READ；野指针落 unmapped 区返回0）；不可读返回 IntPtr.Zero 让 internal_from_handle 走自带 null 分支。method 有效恒返回1、成功路径零影响，与 PC 完全一致。");
+        hlog("[host][r125] 真机验收：boot 出现本 banner + dllmap: nebula_guard -> 主 dylib；不再崩于 internal_from_handle 的 il2cpp_runtime_invoke，NebulaPlugin.LoadInternal 完成 sceneLoaded 注册、进入 NOS 角色注册/大厅劫持。");
         hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。日志证据：dual-map 成功正好64次，崩溃前 make_writable 别名=原地址 @0x164950000。");
         hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容(消除容量上限)；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
         hlog("[host][r121] 真机验收：boot 出现本 banner；不再在 seq~38 崩于 DetourNativeARMPlatform:Apply -> DetourHelper:Write；dual-map 可超过64次并出现 [host][r121] 别名表扩容 日志。");
