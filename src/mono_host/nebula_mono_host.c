@@ -3733,6 +3733,11 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r126] 根因：internal_from_handle 是 icall，其 NativeMethodInfoPtr 在 iOS 预生成 interop 里是坏指针；R123(==0)/R124a(缺失返回0) 打不中，R125 守卫拦成 null 导致 op_Equality(null,..) NRE、patch 全空。");
         hlog("[host][r126] 修法（真修复非绕过·跨版本/设备/iOS）：构建时把 prebuilt-interop/Il2Cppmscorlib.dll 的 internal_from_handle 方法体替换为直调 il2cpp_type_get_object(handle) 再包 Type，绕开坏 methodInfo（=上游新版 Il2CppInterop 生成方式，语义等价）。R125 守卫保留作安全网，正常 method 恒透传。");
         hlog("[host][r126] 真机验收：boot 出现本 banner；interop 指纹变化触发设备自动重释放；不再 NRE、Harmony.PatchAll seq>0、NOS 角色注册启动。");
+        hlog("[host][r127] ===== R127 真修 R126b 非法 IL：internal_from_handle 的 IL_0010: pop 弹空栈（真机 InvalidProgramException → PatchAll 全灭进原版）=====");
+        hlog("[host][r127] 真机 BUILD=e3af98aa2c70(R126b)：无 SIGSEGV，但 Error loading [NebulaLoader]：HarmonyException in UnityEngine.Debug::LogWarning -> InvalidProgramException: Invalid IL code in Il2CppSystem.Type:internal_from_handle (intptr): IL_0010: pop -> Il2CppType.TypeFromPointerInternal -> HarmonySupport.TryResolve -> PatchAll；seq=0 ok=0 down=0，进原版。");
+        hlog("[host][r127] 根因：R126b 补丁工具生成的 IL 非法——brtrue.s 已弹出栈顶，零分支紧接 pop 弹空栈；且 ok 分支 call poolGet 时栈上无参数。上次验收只查了 runtime_invoke 计数=0，抽错 DLL（顶层 mscorlib.dll 而非 interop/Il2Cppmscorlib.dll），漏检 IL 栈合法性，虚过。");
+        hlog("[host][r127] 修法（真修复·非绕过·跨版本/设备/iOS）：internal_from_handle 改为与 Il2CppInterop 官方生成器同构的 dup+brtrue 栈平衡 IL——ldarg.0; call il2cpp_type_get_object; dup; brtrue.s ok; pop; ldnull; br.s ret; ok: call Il2CppObjectPool.Get<Type>; ret。obj=0 走 null 分支，obj!=0 消费 dup 栈值，两个分支栈深恒一致。补丁工具内置 IL 栈深度自检，任何栈冲突/非法 opcode 直接拒绝产出。");
+        hlog("[host][r127] 真机验收：boot 出现本 banner；interop 指纹变化触发设备重释放；不再 InvalidProgramException、Harmony.PatchAll seq>0、NOS 角色注册启动、主菜单被劫持。");
         hlog("[host][r121] 根因：NEBULA_ALIAS_MAX=64 静态表被第65个 JIT 代码页撑满，表满时 return base 把原 RX 页当别名返回；R120 的 Apply/Copy 补丁经 nebula_jit_alias 拿到 RX 地址写入 -> DetourHelper.Write SIGSEGV。日志证据：dual-map 成功正好64次，崩溃前 make_writable 别名=原地址 @0x164950000。");
         hlog("[host][r121] 修法（非绕过）：①别名表改动态数组+翻倍扩容(消除容量上限)；②nebula_jit_alias 查不到时懒建 RW 别名(写入必落别名的硬不变量)；③扩容/remap 失败打明确日志。原页始终 RX 不变。");
         hlog("[host][r121] 真机验收：boot 出现本 banner；不再在 seq~38 崩于 DetourNativeARMPlatform:Apply -> DetourHelper:Write；dual-map 可超过64次并出现 [host][r121] 别名表扩容 日志。");
