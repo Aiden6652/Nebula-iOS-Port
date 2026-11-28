@@ -577,6 +577,14 @@ if command -v dotnet >/dev/null 2>&1; then
 
   # [R136] 0降级真修：RegisterTypeInIl2Cpp (class injection) 在 iOS ARM64 全崩。
   # [R137] R136 真机(BUILD=5191ae45131c)复盘：Sequence contains no elements 消失、PatchAll seq=164 ok=161，
+  # [R138] R137 真机(BUILD=60f6e19b18fd)复盘：Setup 全跑完(PatchAll seq=160 ok=158, Sequence/ElementAt 均消失)，
+  #   但崩在 native SIGBUS/SIGSEGV(mono_class_instance_size)。R137 两处语义错误,已由官方 v1.5.3 源码+Cecil 状态机 IL 双证：
+  #   (1) BR/BLR(IndirectBranch)官方不 yield(ExtractTargetAddress 对寄存器跳抛异常),R137 却 yield regs[rn] 野值
+  #       (found=8 含重复 0x117068848/跨段野值 0x115E13A40);ADRP/ADD/LDR 模拟用 Marshal.ReadIntPtr 读 GOT 野地址
+  #       -> native SIGBUS(try-catch 抓不住),detour 打错地址；
+  #   (2) BL(Call)官方 yield target,R137 漏 yield -> GenericMethod::GetMethod 靠 call 目标定位的 hook 拿不到 target。
+  #   R138 删除全部寄存器模拟(无 ReadIntPtr/无内存读),Scan 只保留 b(首条停)/bl(yield不停)/cbz/tbz(不yield)/
+  #   br/blr(不yield)/ret(停) 纯位运算解码,严格对齐官方。恒返回>=1,上层 Single/Last/ElementAt/Count 自适应。
   #   但崩在 MetadataCache hook 的 ElementAt(source,1) 越界 —— R136 把 Scan 结果砍成 1 个元素(result[1])，
   #   欺骗了上层 Count()==1 判断；且 B 掩码 0x7C000000 把 BL(0x94) 误判成 B(0x14)，found 虚高到 26。
   #   R137 精确复刻官方 JumpTargetsImpl 状态机：B(0xFC000000 掩码) 命中即停 / BL(调用)不yield /
@@ -597,16 +605,16 @@ if command -v dotnet >/dev/null 2>&1; then
   D136_HELPER_PROJ="$ROOT/../../tools/arm64_xref_helper/arm64_xref_helper.csproj"
   IIC136="${BEPINEX_CORE_DIR:-}/Il2CppInterop.Common.dll"
   if [ -f "$D136_PROJ" ] && [ -f "$D136_HELPER_PROJ" ] && [ -f "$IIC136" ]; then
-    echo "   [R137] 编译 ARM64 xref helper（纯托管，无原生依赖）..."
-    dotnet build "$D136_HELPER_PROJ" -c Release >/dev/null ||       { echo "   [R137] ✗ helper 编译失败，拒绝产出" >&2; exit 1; }
+    echo "   [R138] 编译 ARM64 xref helper（纯托管，无原生依赖）..."
+    dotnet build "$D136_HELPER_PROJ" -c Release >/dev/null ||       { echo "   [R138] ✗ helper 编译失败，拒绝产出" >&2; exit 1; }
     D136_HELPER_DLL="$ROOT/../../tools/arm64_xref_helper/bin/Release/net6.0/NebulaArm64Xref.dll"
     if [ ! -f "$D136_HELPER_DLL" ]; then
-      echo "   [R137] ✗ helper DLL 未产出，拒绝产出" >&2; exit 1
+      echo "   [R138] ✗ helper DLL 未产出，拒绝产出" >&2; exit 1
     fi
-    echo "   [R137] JumpTargets ARM64 真修（Iced x86 -> 纯托管 ARM64 解码，0降级，幂等）..."
-    dotnet run --project "$D136_PROJ" -c Release -- "$IIC136" "$D136_HELPER_DLL" ||       { echo "   [R137] ✗ ARM64 xref 补丁失败/自检不过，拒绝产出" >&2; exit 1; }
+    echo "   [R138] JumpTargets ARM64 真修（Iced x86 -> 纯托管 ARM64 解码，0降级，幂等）..."
+    dotnet run --project "$D136_PROJ" -c Release -- "$IIC136" "$D136_HELPER_DLL" ||       { echo "   [R138] ✗ ARM64 xref 补丁失败/自检不过，拒绝产出" >&2; exit 1; }
   else
-    echo "   [R137] ✗ 找不到 $D136_PROJ / $D136_HELPER_PROJ / $IIC136，拒绝产出" >&2; exit 1
+    echo "   [R138] ✗ 找不到 $D136_PROJ / $D136_HELPER_PROJ / $IIC136，拒绝产出" >&2; exit 1
   fi
 else
   echo "   [R134/R135/R136] ✗ 缺 dotnet，无法真修，拒绝产出" >&2; exit 1
