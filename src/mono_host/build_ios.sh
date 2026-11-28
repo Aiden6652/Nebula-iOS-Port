@@ -616,6 +616,32 @@ if command -v dotnet >/dev/null 2>&1; then
   else
     echo "   [R138] ✗ 找不到 $D136_PROJ / $D136_HELPER_PROJ / $IIC136，拒绝产出" >&2; exit 1
   fi
+
+  # [R139] 0降级真修：根治 Execute 阶段 RegisterTypeInIl2Cpp 注入拿野 class 崩溃。
+  #   真机 R138(BUILD=b0098ba2d59f)：Setup 五 hook 全跑完、PatchAll seq=160 ok=158、
+  #   Sequence/ElementAt 崩全消失——但 Execute 阶段仍两次 native 崩：
+  #     SIGSEGV @mono_class_instance_size(=il2cpp_class_value_size)，栈 = nebula_r99b_run_execute
+  #       → 反射 InternalInvoke → JIT → il2cpp_class_value_size(野 class)；
+  #     AudioBridge (被 catch): Class System.Object does not inherit from a class registered in il2cpp。
+  #   根因(IL 反编译+真机双证)：Il2CppClassPointerStore<T>.cctor 对非 enum 类走
+  #     IL_0025 RunClassConstructor(T) → IL_0030 br IL_010e，【跳过】IL_0035 起的
+  #     GetIl2CppClass → stsfld NativeClassPtr 直取；而 R119/R130 把 RunClassConstructor
+  #     DEFER 成 no-op → T.cctor 不跑 → NativeClassPtr=0 → 注入拿野 class 崩。
+  #   enum 分支(IL_0017 brtrue → IL_0035)本就走直取，R132 已验证能拿 NONZERO。
+  #   修法(真修复·0降级·跨AU版本/设备/iOS)：唯一最小改动 = 非 enum 分支 IL_0030 的
+  #     `br IL_010e` 改成 `br IL_0035`，让非 enum 类也走那条已验证的 GetIl2CppClass 直取。
+  #     直取只解析名字+stsfld，不执行目标 cctor，避开 R128/R129 泛型坏链；DEFER 白名单
+  #     一个不动，PatchAll 照常 seq=160。必须在 blob 打包前写回 Runtime.dll。
+  #   PC/Win：RunClassConstructor 未被 DEFER，此补丁仅多一次幂等 GetIl2CppClass，零变化。
+  D139_PROJ="$ROOT/../../tools/patch_cps_direct/patch_cps_direct.csproj"
+  IIR139="${BEPINEX_CORE_DIR:-}/Il2CppInterop.Runtime.dll"
+  if [ -f "$D139_PROJ" ] && [ -f "$IIR139" ]; then
+    echo "   [R139] CPS<T>.cctor 非 enum 分支改走 GetIl2CppClass 直取（修注入野 class，0降级，幂等）..."
+    dotnet run --project "$D139_PROJ" -c Release -- "$IIR139" || \
+      { echo "   [R139] ✗ CPS 直取补丁失败/IL 校验不过，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [R139] ✗ 找不到 $D139_PROJ 或 $IIR139，拒绝产出" >&2; exit 1
+  fi
 else
   echo "   [R134/R135/R136] ✗ 缺 dotnet，无法真修，拒绝产出" >&2; exit 1
 fi
