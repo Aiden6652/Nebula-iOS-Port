@@ -528,6 +528,25 @@ else
   echo "   [R132b] ⚠ 缺 dotnet 或 BEPINEX_CORE_DIR，跳过 InjectorHelpers 补丁" >&2
 fi
 
+# [R133] NOS 诊断插桩：在 UnityAction`2.cctor 的关键 native 调用后注入栈中立的
+#   Console.WriteLine 日志, 真机一次定位 get_TypeHandle(null) 的 null 断在哪一层。
+#   R131(methodInfo 按名字)/R132(CPS 读换 GetIl2CppClass) 真机栈一字不差且补丁确实进了设备,
+#   说明根因在更深的 MakeGenericType 链, 继续盲改无意义 —— 这一版先取证。
+#   必须在 R132 patch 之后跑(依赖 GetIl2CppClass 直调的存在), blob 打包之前写回。
+if command -v dotnet >/dev/null 2>&1; then
+  D133_PROJ="$ROOT/../../tools/patch_unityaction_diag/patch_unityaction_diag.csproj"
+  UCM133="$ROOT/prebuilt-interop/UnityEngine.CoreModule.dll"
+  if [ -f "$D133_PROJ" ] && [ -f "$UCM133" ]; then
+    echo "   [R133] UnityAction2.cctor 诊断插桩（10 处栈中立日志，取证 null 断点）..."
+    dotnet run --project "$D133_PROJ" -c Release -- "$UCM133" || \
+      { echo "   [R133] ✗ 诊断插桩失败/栈自检不过，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [R133] ✗ 找不到 $D133_PROJ 或 $UCM133，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R133] ✗ 缺 dotnet，无法插诊断桩，拒绝产出" >&2; exit 1
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
