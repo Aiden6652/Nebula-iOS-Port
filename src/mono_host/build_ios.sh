@@ -574,8 +574,36 @@ if command -v dotnet >/dev/null 2>&1; then
   else
     echo "   [R135] ✗ 找不到 $D135_PROJ 或 $IIR134，拒绝产出" >&2; exit 1
   fi
+
+  # [R136] 0降级真修：RegisterTypeInIl2Cpp (class injection) 在 iOS ARM64 全崩。
+  #   真机 R135：closed class NONZERO / PatchAll 跑满 / 音频恢复，但 NOS 与音频插件
+  #   都在 RegisterTypeInIl2Cpp -> InjectorHelpers.Setup() -> hook.FindTargetMethod ->
+  #   XrefScannerLowLevel.JumpTargets 崩：Iced x86 decoder 解不出 ARM64 b/bl -> 空 ->
+  #   Enumerable.Single() 抛 "Sequence contains no elements"。根因是 Iced 只支持 x86/x64，
+  #   与 JIT 权限无关。R135 的 null 守卫只是把 NRE 变成 fallback 崩，未触根因。
+  #   修法：把 NebulaArm64Xref.Arm64Xref（纯托管 ARM64 解码，Marshal.ReadInt32 + 位运算，
+  #   不依赖 Iced/Capstone 原生库）的 Scan/LooksArm64/IsArm64 方法体克隆进
+  #   Il2CppInterop.Common.dll 的 XrefScannerLowLevel；原 JumpTargets 改名 JumpTargetsX86，
+  #   新 JumpTargets 分发器按架构选择。所有 hook 共用一处，全覆盖；恒返回 >=1 目标，
+  #   Single()/Last() 不再崩。PC/Win 用未 patch 的 NuGet DLL，零变化。
+  #   0降级、跨AU版本/设备/iOS。必须在 blob 打包前写回 Common.dll。
+  D136_PROJ="$ROOT/../../tools/patch_xref_arm64/patch_xref_arm64.csproj"
+  D136_HELPER_PROJ="$ROOT/../../tools/arm64_xref_helper/arm64_xref_helper.csproj"
+  IIC136="${BEPINEX_CORE_DIR:-}/Il2CppInterop.Common.dll"
+  if [ -f "$D136_PROJ" ] && [ -f "$D136_HELPER_PROJ" ] && [ -f "$IIC136" ]; then
+    echo "   [R136] 编译 ARM64 xref helper（纯托管，无原生依赖）..."
+    dotnet build "$D136_HELPER_PROJ" -c Release >/dev/null ||       { echo "   [R136] ✗ helper 编译失败，拒绝产出" >&2; exit 1; }
+    D136_HELPER_DLL="$ROOT/../../tools/arm64_xref_helper/bin/Release/net6.0/NebulaArm64Xref.dll"
+    if [ ! -f "$D136_HELPER_DLL" ]; then
+      echo "   [R136] ✗ helper DLL 未产出，拒绝产出" >&2; exit 1
+    fi
+    echo "   [R136] JumpTargets ARM64 真修（Iced x86 -> 纯托管 ARM64 解码，0降级，幂等）..."
+    dotnet run --project "$D136_PROJ" -c Release -- "$IIC136" "$D136_HELPER_DLL" ||       { echo "   [R136] ✗ ARM64 xref 补丁失败/自检不过，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [R136] ✗ 找不到 $D136_PROJ / $D136_HELPER_PROJ / $IIC136，拒绝产出" >&2; exit 1
+  fi
 else
-  echo "   [R134/R135] ✗ 缺 dotnet，无法真修，拒绝产出" >&2; exit 1
+  echo "   [R134/R135/R136] ✗ 缺 dotnet，无法真修，拒绝产出" >&2; exit 1
 fi
 
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
