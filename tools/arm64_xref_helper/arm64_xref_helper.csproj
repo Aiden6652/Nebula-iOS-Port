@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>NebulaArm64Xref</AssemblyName>
+    <RootNamespace>NebulaArm64Xref</RootNamespace>
+  </PropertyGroup>
+</Project>
