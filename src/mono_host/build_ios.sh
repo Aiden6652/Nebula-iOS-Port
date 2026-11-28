@@ -573,8 +573,24 @@ if command -v dotnet >/dev/null 2>&1; then
   else
     echo "   [R134-B] ✗ 找不到 $D134A_PROJ 或 $IIR134，拒绝产出" >&2; exit 1
   fi
+
+  # [R135] 0降级真修：修 InjectorHelpers.Setup() 的 FindSignatureInModule(null) NRE。
+  #   真机 R134：closed class 真修成功(NONZERO)、PatchAll 跑满、音频恢复，但 Setup() 首次执行
+  #   撞上 Il2CppModule=null（iOS Process.Modules 枚举不到 GameAssembly）-> 两条 hook 的签名扫描
+  #   FindSignatureInModule(null) NRE -> ConvertDelegate<UnityAction`2> 崩 -> NOS 未加载。
+  #   修法：MemoryUtils::FindSignatureInModule 入口加 module==null -> return IntPtr.Zero 守卫，
+  #   签名扫描得 0 被 ptr>0 过滤 -> 走 GetIl2CppExport+XrefScan fallback（另3条hook已验证可用）。
+  #   0降级、跨AU版本/设备/iOS。与 R134-B 同改 IIR.dll 的不同方法，须在其后、blob 打包前跑。
+  D135_PROJ="$ROOT/../../tools/patch_finder_nullguard/patch_finder_nullguard.csproj"
+  if [ -f "$D135_PROJ" ] && [ -f "$IIR134" ]; then
+    echo "   [R135] FindSignatureInModule null 守卫（修 Setup() NRE，0降级，幂等）..."
+    dotnet run --project "$D135_PROJ" -c Release -- "$IIR134" || \
+      { echo "   [R135] ✗ finder nullguard 补丁失败/自检不过，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [R135] ✗ 找不到 $D135_PROJ 或 $IIR134，拒绝产出" >&2; exit 1
+  fi
 else
-  echo "   [R134] ✗ 缺 dotnet，无法真修，拒绝产出" >&2; exit 1
+  echo "   [R134/R135] ✗ 缺 dotnet，无法真修，拒绝产出" >&2; exit 1
 fi
 
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
