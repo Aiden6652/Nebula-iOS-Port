@@ -3532,6 +3532,48 @@ static void nebula_enable_dobby_dllmap(void) {
     }
 }
 
+/* [R133] GameAssembly -> UnityFramework dllmap：修 InjectorHelpers..cctor 的
+   NativeLibrary.Load("GameAssembly") DllNotFoundException（第三方注入插件/音频全挂）。
+   真机 R132：R132b 把 Process.Modules.Single 换 FirstOrDefault 生效后, cctor 推进到下一句
+     `Il2CppHandle = NativeLibrary.Load("GameAssembly", ...)` 才暴露本崩点 —— iOS 上 IL2CPP
+     静态链进 UnityFramework, app bundle 里根本没有 GameAssembly 文件, 故 dlopen 失败 ->
+     整个 InjectorHelpers cctor 失败 -> ClassInjector.RegisterTypeInIl2Cpp<T>() 全崩 ->
+     AudioBridge/ImmersionAudioBridge 等注入插件挂（进游戏一点声音都没有）。
+   修法（真修复·非绕过·跨 AU 版本/设备/iOS 通用）：把 GameAssembly 家族名 dllmap 到
+     UnityFramework 二进制路径（那里导出 il2cpp_* 符号, 与 Windows 的 GameAssembly.dll 等价）。
+     NativeLibrary.Load 在 mono 下走 dllmap 查找, 命中后 dlopen(UnityFramework) 拿已加载镜像
+     handle, Il2CppHandle 有效, ClassInjector 恢复。PC/Win 仍走真 GameAssembly.dll，零变化。
+   自包含探测 appdir/Frameworks/.../UnityFramework, 不依赖 setenv 时序。 */
+static void nebula_install_gameassembly_dllmap(const char *appdir)
+{
+    char hit[PATH_MAX];
+    static const char *const rels[] = {
+        "/Frameworks/UnityFramework.framework/UnityFramework",
+        "/GameAssembly.dylib", "/GameAssembly.so", NULL
+    };
+    const char *found = NULL;
+    for (int i = 0; rels[i] && !found; i++) {
+        snprintf(hit, sizeof(hit), "%s%s", appdir ? appdir : "", rels[i]);
+        if (access(hit, R_OK) == 0) found = hit;
+    }
+    // 兜底：读 r47 已 setenv 的绝对路径（若上面 appdir 探测落空）
+    if (!found) {
+        const char *env = getenv("BEPINEX_GAME_ASSEMBLY_PATH");
+        if (env && env[0] && access(env, R_OK) == 0) found = env;
+    }
+    if (!found) {
+        hlog("[host][r133] !! 没找到 UnityFramework/GameAssembly，GameAssembly dllmap 未挂（音频注入插件仍会 DllNotFound）");
+        return;
+    }
+    static const char *names[] = {
+        "GameAssembly", "GameAssembly.dll", "GameAssembly.dylib", "GameAssembly.so",
+        "libGameAssembly", "UserAssembly", "UserAssembly.dll", NULL
+    };
+    for (int i = 0; names[i]; i++)
+        mono_dllmap_insert(NULL, names[i], NULL, found, NULL);
+    hlog("[host][r133] dllmap: GameAssembly* -> %s（修 InjectorHelpers NativeLibrary.Load，音频注入插件恢复）", found);
+}
+
 /* [Nebula iOS 第二十轮] 用 mono_dllmap_insert 把 .NET 8 CoreLib 的 P/Invoke
    原生库名（libSystem.Native 等）重映射到 iOS 版 shim。
    [R60] 改造：dobby + 5 个 libSystem.* 全部【静态链进主 dylib】，dllmap 一律
@@ -3577,6 +3619,10 @@ static void nebula_setup_native_dllmaps(const char *appdir)
         mono_dllmap_insert(NULL, "nebula_jit", NULL, self, NULL);
         hlog("[host][r62] dllmap: nebula_jit -> %s（detour 内存翻转原生函数）", self);
     }
+
+    /* ---- 1.7) [R133] GameAssembly -> UnityFramework：修音频注入插件 NativeLibrary.Load DllNotFound。
+       必须放在下面 static_shim 的 return 之前（那里会提前返回）。初始化阶段挂即可, 纯 dllmap 无 detour/无 JIT。 ---- */
+    nebula_install_gameassembly_dllmap(appdir);
 
     /* ---- 2) CoreLib 的 5 个 P/Invoke shim ---- */
     int static_shim = 0;
@@ -3688,6 +3734,13 @@ static void *boot_thread_impl(void *arg) {
         hlog("[host][r129] 根因：R128 把 R119 DEFER 改成只 defer 游戏类，放行全部系统类。R127 全 DEFER 时 PatchAll 跑满 seq=160 ok=158 且 AsyncOperationHandle`1.cctor 从未触发；R128 放行后泛型 interop cctor 走 MakeGenericType+get_TypeHandle 这条 iOS 坏链，对 null 解引用 -> NRE -> PatchAll 第35个patch异常终止。");
         hlog("[host][r129] 修法（真修复·非绕过·跨版本/设备/iOS）：R119 DEFER 恢复——游戏类(Assembly-CSharp)继续 DEFER；类名含反引号的泛型类(AsyncOperationHandle`1/UnityAction`2/Il2CppClassPointerStore`1等)也 DEFER（不走 get_TypeHandle 坏链）；只放行非泛型系统/框架类(Scene/SceneManager/SceneManagerAPIInternal/GameObject/Debug...)正常执行 cctor，NativeClassPtr 按契约正确设置（修 R127 的 Scene.NativeClassPtr=0 handle 野崩）。CACHE_VERSION 40->41 强制重编 mono。");
         hlog("[host][r129] 真机验收：boot 出现本 banner；DEFER 日志里出现 UnityEngine.CoreModule.dll 的 Scene/SceneManager 放行（不再 DEFER），但不再有 AsyncOperationHandle`1/UnityAction`2 的 get_TypeHandle NRE；心跳 DONE 时 ok>=150 才报 patch 充足；PatchAll 跑满、sceneLoaded 注册完成、进 NOS 大厅劫持原版。");
+        hlog("[host][r133] ===== R133 音频真修(GameAssembly dllmap) + NOS get_TypeHandle(null) 精确诊断插桩 =====\n");
+        hlog("[host][r133] 真机 BUILD=107eb3815142(R132)：R132 两个补丁【都进了设备】(指纹 c5750d13f3158958 变更强制覆盖 135 文件 + R132b 生效), 但结果一成一败：\n");
+        hlog("[host][r133]   ①音频: 错误从 Single: Sequence contains no matching element 推进到 NativeLibrary.Load(\"GameAssembly\") DllNotFound —— R132b(Single->FirstOrDefault) 生效, 暴露下一层崩点。\n");
+        hlog("[host][r133]   ②NOS: 崩溃栈与 R131 一字不差(get_TypeHandle(null) NRE)。注意『栈一字不差』≠补丁没进: R132 只换 MakeGenericType 的参数来源(CPS->GetIl2CppClass), get_TypeHandle 链仍在, 若 MakeGenericType 仍返回 null 栈就一样。真 null 源在更深的 MakeGenericType 链(R131 按名字解析 methodInfo 也无效)。\n");
+        hlog("[host][r133] 修法1(音频·真修复·跨版本/设备/iOS)：nebula_setup_native_dllmaps 里把 GameAssembly 家族名(GameAssembly/.dll/.dylib/.so/UserAssembly) dllmap -> UnityFramework 二进制(自包含探测 appdir/Frameworks/.../UnityFramework, 兜底 BEPINEX_GAME_ASSEMBLY_PATH)。iOS 上 IL2CPP 静态链进 UnityFramework 无独立 GameAssembly 文件, NativeLibrary.Load 走 dllmap 命中后 dlopen(已加载镜像)拿有效 Il2CppHandle -> ClassInjector.RegisterTypeInIl2Cpp 恢复 -> AudioBridge 等注入插件正常、大厅有声音。PC/Win 仍走真 GameAssembly.dll 零变化。\n");
+        hlog("[host][r133] 修法2(NOS·取证诊断)：build_ios.sh 在 R132 patch 之后跑 tools/patch_unityaction_diag, 在 UnityAction`2.cctor 的 GetIl2CppClass/class_get_type/internal_from_handle/MakeGenericType 各调用后注入【栈中立】Console.WriteLine([R133-DIAG] tag=ZERO/NULL 或 NONZERO/NONNULL) 共 10 处。日志落 [r54][log] 行, 真机一次定位 null 断在哪一层。注入块 dup+brtrue+双分支打印栈恒等, 静态自检+ildump 反编译验证, 不改原 cctor 栈结构、不调用 Type.ToString 避免二次崩。下一版据此精准真修。\n");
+        hlog("[host][r133] 真机验收点：boot 出现本 banner + dllmap: GameAssembly* -> UnityFramework；[r54][log] 行出现 [R133-DIAG] 10 行(GetIl2CppClass#0/1/2、class_get_type#0/1/2、internal_from_handle#0/1/2、MakeGenericType#0 各一行 ZERO/NULL 或 NONZERO/NONNULL)；音频插件不再 DllNotFound。main 仍 NOS-only。\n");
         hlog("[host][r132] ===== R132 真修 UnityAction`2.cctor get_TypeHandle(null) NRE + InjectorHelpers 音频插件崩（诊断+修理一体）=====\n");
         hlog("[host][r132] 真机 BUILD=3bdf35c58449(R131)：R131 methodInfo token->名字补丁【无效】——崩溃栈与 R130 一字不差（get_TypeHandle(null) NRE），因崩的是 get_TypeHandle 的 this=null，来自 MakeGenericType 返回 null，与 methodInfo 解析方式无关。R130/R131 日志 cctor 指纹一致，确认 R131 未改变行为。\n");
         hlog("[host][r132] 根因（反编译硬证据·非猜测）：UnityAction`2.cctor 的 IL_0026/0038 读 CPS<T0=Scene>/CPS<T1=LoadSceneMode>.NativeClassPtr。Scene 是普通类，Scene.cctor（R130 放行）stsfld 有效指针；但 LoadSceneMode 是 enum【无自己的 cctor】，其 CPS 指针只能靠泛型包装类 Il2CppClassPointerStore`1<LoadSceneMode>.cctor 的 enum 分支设置，而该泛型类被 R119/R130 全 DEFER（名带反引号、不在 Scene 白名单）-> 指针=0 -> il2cpp_class_get_type(0) -> internal_from_handle(null guard)=null -> MakeGenericType([Scene.Type, null])=null -> get_TypeHandle(null) NRE。这解释了 R130 为何进步到 seq=163 但仍崩（enum 没修）。\n");
