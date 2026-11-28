@@ -543,23 +543,38 @@ else
   echo "   [R132b] ⚠ 缺 dotnet 或 BEPINEX_CORE_DIR，跳过 InjectorHelpers 补丁" >&2
 fi
 
-# [R133] NOS 诊断插桩：在 UnityAction`2.cctor 的关键 native 调用后注入栈中立的
-#   Console.WriteLine 日志, 真机一次定位 get_TypeHandle(null) 的 null 断在哪一层。
-#   R131(methodInfo 按名字)/R132(CPS 读换 GetIl2CppClass) 真机栈一字不差且补丁确实进了设备,
-#   说明根因在更深的 MakeGenericType 链, 继续盲改无意义 —— 这一版先取证。
-#   必须在 R132 patch 之后跑(依赖 GetIl2CppClass 直调的存在), blob 打包之前写回。
+# [R134] NOS 真修(0降级) + 音频真修。R133 诊断铁证: UnityAction`2.cctor 的 10 处打点
+#   9 处 NONNULL/NONZERO, 唯 MakeGenericType#0=NULL。用户核心洞察: 设备已开 JIT(CS_DEBUGGED/
+#   MAP_JIT), 不该判"AOT 无解", 而应"直接拿 AOT 里真实存在的 closed class":
+#   sceneLoaded 事件本身就是 UnityAction<Scene,LoadSceneMode>, 其 closed generic 必在引擎二进制中。
+# R134-A) 把 cctor 的 MakeGenericType 死链替换为 native 直取:
+#   GetIl2CppClass(SceneManager)->class_get_field_from_name("sceneLoaded")->field_get_type->
+#   class_from_il2cpp_type -> NativeClassPtr。后续 method 指针用该有效 class 填充, 全部真实有效。
+# R134-B) InjectorHelpers..cctor 的 NativeLibrary.Load("GameAssembly") 改读 env
+#   BEPINEX_GAME_ASSEMBLY_PATH(宿主已 setenv 指向 UnityFramework), 空则 fallback GameAssembly。
+#   真机 R133 证实 dllmap 对 NativeLibrary.Load 无效(mono 不走 dllmap), 故改 IL 参数层, 跨版本/设备/iOS。
+# 必须在 R132 patch 之后跑(依赖 cctor 的 GetIl2CppClass 直调锚点), blob 打包之前写回。
 if command -v dotnet >/dev/null 2>&1; then
-  D133_PROJ="$ROOT/../../tools/patch_unityaction_diag/patch_unityaction_diag.csproj"
-  UCM133="$ROOT/prebuilt-interop/UnityEngine.CoreModule.dll"
-  if [ -f "$D133_PROJ" ] && [ -f "$UCM133" ]; then
-    echo "   [R133] UnityAction2.cctor 诊断插桩（10 处栈中立日志，取证 null 断点）..."
-    dotnet run --project "$D133_PROJ" -c Release -- "$UCM133" || \
-      { echo "   [R133] ✗ 诊断插桩失败/栈自检不过，拒绝产出" >&2; exit 1; }
+  D134C_PROJ="$ROOT/../../tools/patch_unityaction_closedclass/patch_unityaction_closedclass.csproj"
+  D134A_PROJ="$ROOT/../../tools/patch_injector_loadpath/patch_injector_loadpath.csproj"
+  UCM134="$ROOT/prebuilt-interop/UnityEngine.CoreModule.dll"
+  IIR134="${BEPINEX_CORE_DIR:-}/Il2CppInterop.Runtime.dll"
+  if [ -f "$D134C_PROJ" ] && [ -f "$UCM134" ] && [ -f "$IIR134" ]; then
+    echo "   [R134-A] UnityAction2.cctor MakeGenericType 死链 -> field-type 直取 closed class（0降级，幂等）..."
+    dotnet run --project "$D134C_PROJ" -c Release -- "$UCM134" "$IIR134" || \
+      { echo "   [R134-A] ✗ closedclass 补丁失败/自检不过，拒绝产出" >&2; exit 1; }
   else
-    echo "   [R133] ✗ 找不到 $D133_PROJ 或 $UCM133，拒绝产出" >&2; exit 1
+    echo "   [R134-A] ✗ 找不到 $D134C_PROJ / $UCM134 / $IIR134，拒绝产出" >&2; exit 1
+  fi
+  if [ -f "$D134A_PROJ" ] && [ -f "$IIR134" ]; then
+    echo "   [R134-B] InjectorHelpers NativeLibrary.Load -> env BEPINEX_GAME_ASSEMBLY_PATH（音频，幂等）..."
+    dotnet run --project "$D134A_PROJ" -c Release -- "$IIR134" || \
+      { echo "   [R134-B] ✗ 音频 loadpath 补丁失败，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [R134-B] ✗ 找不到 $D134A_PROJ 或 $IIR134，拒绝产出" >&2; exit 1
   fi
 else
-  echo "   [R133] ✗ 缺 dotnet，无法插诊断桩，拒绝产出" >&2; exit 1
+  echo "   [R134] ✗ 缺 dotnet，无法真修，拒绝产出" >&2; exit 1
 fi
 
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
