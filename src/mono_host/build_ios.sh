@@ -471,6 +471,63 @@ else
   echo "   [R131] ✗ 缺 dotnet，无法按名字解析 methodInfo，拒绝产出" >&2; exit 1
 fi
 
+# [R132] 根治 NOS 加载最后一崩 UnityAction`2.cctor -> get_TypeHandle(null) NRE。
+#   真机 R130/R131：PatchAll 跑满 seq=163 ok=160（detour 已健康），但 NOS 加载崩在
+#     SceneManager.get_sceneLoaded() -> Il2CppObjectPool.Get<UnityAction`2>
+#       -> UnityAction`2..cctor -> MakeGenericType([Scene.Type, LoadSceneMode.Type])=null
+#       -> get_TypeHandle(null) -> NRE。
+#   根因（反编译硬证据）：IL_0026/0038 读 CPS<T0=Scene>/CPS<T1=LoadSceneMode>.NativeClassPtr。
+#     Scene 是普通类，Scene.cctor（R130 放行）会 stsfld 有效指针；但 LoadSceneMode 是 enum，
+#     【没有自己的 cctor】，其 CPS<LoadSceneMode>.NativeClassPtr 只能靠泛型包装类
+#     Il2CppClassPointerStore`1<LoadSceneMode>.cctor 的 enum 分支设置，而该泛型类被 R119/R130
+#     全 DEFER（名带反引号、不在 Scene 白名单）-> 指针=0 -> il2cpp_class_get_type(0) ->
+#     internal_from_handle(null guard)=null -> MakeGenericType 收 null -> null -> get_TypeHandle(null) NRE。
+#   真修（非绕过·跨 AU 版本/设备/iOS）：patch UnityAction`2.cctor 把两处 CPS 读取换成
+#     GetIl2CppClass("UnityEngine.CoreModule.dll","UnityEngine.SceneManagement","Scene"/"LoadSceneMode")
+#     按固定三元组直调（Unity 引擎固定 API，跨版本不变；同 cctor 开头 IL_000f 已用同法拿 open generic，
+#     自证 image 已注册）。带改动片段栈平衡校验、幂等、原子写回。
+if command -v dotnet >/dev/null 2>&1; then
+  D132_PROJ="$ROOT/../../tools/patch_unityaction_cctor/patch_unityaction_cctor.csproj"
+  UCM132="$ROOT/prebuilt-interop/UnityEngine.CoreModule.dll"
+  if [ -f "$D132_PROJ" ] && [ -f "$UCM132" ]; then
+    echo "   [R132] UnityAction2.cctor CPS 依赖消除（GetIl2CppClass 直调，栈校验+幂等）..."
+    dotnet run --project "$D132_PROJ" -c Release -- "$UCM132" || \
+      { echo "   [R132] ✗ UnityAction cctor 补丁失败/栈校验不过，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [R132] ✗ 找不到 $D132_PROJ 或 $UCM132，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R132] ✗ 缺 dotnet，无法修 UnityAction cctor，拒绝产出" >&2; exit 1
+fi
+
+# [R132b] 根治 InjectorHelpers..cctor TypeInitializationException（第三方插件/音频全挂 → 大厅没声音）。
+#   真机日志：AudioBridge runner install failed: TypeInitializationException:
+#     Il2CppInterop.Runtime.Injection.InjectorHelpers..cctor
+#      ---> InvalidOperationException: Sequence contains no matching element
+#       at System.Linq.Enumerable.Single<ProcessModule>(...)
+#   根因：cctor IL_0033 用 Enumerable.Single<ProcessModule> 按模块名匹配 GameAssembly/UnityFramework；
+#     iOS 上 IL2CPP 静态链接进主可执行，Process.Modules 枚举不到该模块 -> Single 抛异常 ->
+#     整个 InjectorHelpers cctor 失败 -> 所有 ClassInjector.RegisterTypeInIl2Cpp<T>() 崩 ->
+#     AudioBridge/GamePatch 等动态注入插件全挂（进游戏一点声音都没有）。
+#     R116 只把匹配字符串 GameAssembly.dylib->UnityFramework，iOS 上仍枚举不到 -> 无效（R131 实证仍崩）。
+#   真修（非绕过·跨版本/设备/iOS）：Single<ProcessModule> -> FirstOrDefault<ProcessModule>（签名完全相同
+#     pop2/push1），找不到返回 null 而非抛异常，cctor 完成；Il2CppModule=null 不影响 ClassInjector
+#     （它真正依赖的 Il2CppHandle 由 NativeLibrary.Load("GameAssembly") 独立取得，宿主已导出 stub 兜底）。
+#   复用 DLL 内现成 FirstOrDefault ElementMethod 模板（签名合法，避免 Cecil 二次读回崩）。幂等、原子写回。
+if command -v dotnet >/dev/null 2>&1 && [ -n "${BEPINEX_CORE_DIR:-}" ]; then
+  D132B_PROJ="$ROOT/../../tools/patch_injector_single/patch_injector_single.csproj"
+  IH132="$BEPINEX_CORE_DIR/Il2CppInterop.Runtime.dll"
+  if [ -f "$D132B_PROJ" ] && [ -f "$IH132" ]; then
+    echo "   [R132b] InjectorHelpers Single->FirstOrDefault（根治 iOS 模块枚举不到，幂等）..."
+    dotnet run --project "$D132B_PROJ" -c Release -- "$IH132" || \
+      { echo "   [R132b] ✗ InjectorHelpers 补丁失败，拒绝产出" >&2; exit 1; }
+  else
+    echo "   [R132b] ✗ 找不到 $D132B_PROJ 或 $IH132，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R132b] ⚠ 缺 dotnet 或 BEPINEX_CORE_DIR，跳过 InjectorHelpers 补丁" >&2
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
