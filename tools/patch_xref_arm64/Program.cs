@@ -46,35 +46,35 @@ class Program
             return 2;
         }
         string commonPath = args[0], helperPath = args[1];
-        if (!System.IO.File.Exists(commonPath)) { Console.Error.WriteLine("[R136] x Common.dll 不存在: " + commonPath); return 2; }
-        if (!System.IO.File.Exists(helperPath)) { Console.Error.WriteLine("[R136] x helper.dll 不存在: " + helperPath); return 2; }
+        if (!System.IO.File.Exists(commonPath)) { Console.Error.WriteLine("[R137] x Common.dll 不存在: " + commonPath); return 2; }
+        if (!System.IO.File.Exists(helperPath)) { Console.Error.WriteLine("[R137] x helper.dll 不存在: " + helperPath); return 2; }
 
         var common = ModuleDefinition.ReadModule(commonPath, new ReaderParameters { InMemory = true, ReadWrite = true });
         var helper = ModuleDefinition.ReadModule(helperPath, new ReaderParameters { InMemory = true, ReadWrite = false });
 
         var tgtType = common.GetTypes().FirstOrDefault(t => t.FullName == COMMON_TYPE);
-        if (tgtType == null) { Console.Error.WriteLine("[R136] x 找不到 " + COMMON_TYPE); return 3; }
+        if (tgtType == null) { Console.Error.WriteLine("[R137] x 找不到 " + COMMON_TYPE); return 3; }
         var hType = helper.GetTypes().FirstOrDefault(t => t.FullName == HELPER_TYPE);
-        if (hType == null) { Console.Error.WriteLine("[R136] x 找不到 helper 类型 " + HELPER_TYPE); return 3; }
+        if (hType == null) { Console.Error.WriteLine("[R137] x 找不到 helper 类型 " + HELPER_TYPE); return 3; }
 
         // 幂等：若已存在 ScanArm64 方法说明打过补丁
         if (tgtType.Methods.Any(m => m.Name == "ScanArm64") && tgtType.Methods.Any(m => m.Name == "LooksArm64"))
         {
-            Console.WriteLine("[R136] = ARM64 xref 补丁已存在，跳过（幂等）");
+            Console.WriteLine("[R137] = ARM64 xref 补丁已存在，跳过（幂等）");
             return 0;
         }
 
         var jt = tgtType.Methods.FirstOrDefault(m => m.Name == "JumpTargets" && m.Parameters.Count == 2);
-        if (jt == null) { Console.Error.WriteLine("[R136] x 找不到 JumpTargets(IntPtr,bool)"); return 3; }
+        if (jt == null) { Console.Error.WriteLine("[R137] x 找不到 JumpTargets(IntPtr,bool)"); return 3; }
         if (jt.ReturnType.FullName != "System.Collections.Generic.IEnumerable`1<System.IntPtr>")
         {
-            Console.Error.WriteLine("[R136] x JumpTargets 返回类型不符: " + jt.ReturnType.FullName); return 3;
+            Console.Error.WriteLine("[R137] x JumpTargets 返回类型不符: " + jt.ReturnType.FullName); return 3;
         }
 
         var hScan = hType.Methods.FirstOrDefault(m => m.Name == "Scan" && m.Parameters.Count == 2);
         var hIsArm = hType.Methods.FirstOrDefault(m => m.Name == "IsArm64" && m.Parameters.Count == 0);
         var hLooks = hType.Methods.FirstOrDefault(m => m.Name == "LooksArm64" && m.Parameters.Count == 1);
-        if (hScan == null || hIsArm == null || hLooks == null) { Console.Error.WriteLine("[R136] x helper 缺 Scan/IsArm64/LooksArm64"); return 3; }
+        if (hScan == null || hIsArm == null || hLooks == null) { Console.Error.WriteLine("[R137] x helper 缺 Scan/IsArm64/LooksArm64"); return 3; }
 
         // 1) 克隆 Scan -> ScanArm64(IntPtr,bool) -> IntPtr[]
         var scanArm = CloneMethodBody(common, hScan, "ScanArm64");
@@ -135,15 +135,15 @@ class Program
         brToRet.Operand = ret;
 
         // 栈中立自检：分发器两个分支都返回 1 个 IEnumerable<IntPtr>
-        if (!VerifyDispatcher()) { Console.Error.WriteLine("[R136] x 分发器栈中立自检失败，拒绝产出"); return 8; }
+        if (!VerifyDispatcher()) { Console.Error.WriteLine("[R137] x 分发器栈中立自检失败，拒绝产出"); return 8; }
 
         // 元数据合法性：全类型遍历
         foreach (var t in common.GetTypes()) { var _ = t.Name; }
 
         common.Write(commonPath);
-        Console.WriteLine("[R136] ✓ ARM64 xref 真修已写入 " + commonPath);
-        Console.WriteLine("[R136]   JumpTargets -> (IsArm64 || LooksArm64(code)) ? ScanArm64 : JumpTargetsX86（PC 零变化）");
-        Console.WriteLine("[R136]   ScanArm64: 纯托管 ARM64 b/bl/cbz/tbz/adrp/add/ldr/br/ret 解码，恒返回 >=1 目标");
+        Console.WriteLine("[R137] ✓ ARM64 xref 真修已写入 " + commonPath);
+        Console.WriteLine("[R137]   JumpTargets -> (IsArm64 || LooksArm64(code)) ? ScanArm64 : JumpTargetsX86（PC 零变化）");
+        Console.WriteLine("[R137]   ScanArm64: 纯托管 ARM64 b/bl/cbz/tbz/adrp/add/ldr/br/ret 解码，恒返回 >=1 目标");
         return 0;
     }
 

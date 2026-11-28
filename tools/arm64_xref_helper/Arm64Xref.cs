@@ -1,29 +1,30 @@
 using System;
 using System.Runtime.InteropServices;
 
-// R136: Il2CppInterop 1.5.3 的 XrefScannerLowLevel.JumpTargets 用 Iced x86 decoder，
-// 在 ARM64 上解不出 b/bl 目标 -> 返回空 -> 上层 Single() 抛
-// "Sequence contains no elements" -> RegisterTypeInIl2Cpp (class injection) 全崩。
-// 本类提供纯托管 ARM64 指令扫描（Marshal.ReadInt32 读代码页 + 位运算），不依赖
-// Iced / Capstone 原生库。所有方法自包含（符号扩展内联），便于 Cecil 方法体克隆进
-// Il2CppInterop.Common.dll；只引用 BCL，ImportReference 可自动重映射。
+// R137: 精确复刻 Il2CppInterop 官方 JumpTargetsImpl 状态机语义（从 Cecil IL 反编译还原）：
+//   firstFlowControl=true; 逐条解码：
+//     FlowControl.UnconditionalBranch(b)   -> yield target; 若 firstFlowControl 则停止
+//     FlowControl.IndirectBranch(br/blr)   -> yield target; 继续
+//     FlowControl.Call(bl)                 -> 不 yield; 继续
+//     FlowControl.ConditionalBranch(cbz/tbz) -> 不 yield; 继续
+//     FlowControl.Return(ret)              -> 停止
+//   非 Next 指令令 firstFlowControl=false。
+// R136 的错误：把所有跳转都 yield 且只返回 targets[n-1] 砍成 1 个，
+//   既破坏了上层 Count()==1 判断（致 ElementAt(1)/Single 语义错乱），target 也取错（取 last 而非第一条）。
+// 本实现返回真实目标列表（至少 1 个，解码失败回退 code），让上层 Single/Last/First/ElementAt/Count 各取所需。
+// 纯托管 ARM64 解码（Marshal.ReadInt32 + 位运算），不依赖 Iced/Capstone 原生库；方法自包含便于 Cecil 克隆。
 namespace NebulaArm64Xref
 {
     public static class Arm64Xref
     {
-        // IL2CPP 导出 thunk 一般只有几条指令；限定 1000 字节（与原 Iced DecoderForAddress 一致）。
         const int SCAN_BYTES = 1000;
 
-        // 架构判断：patched JumpTargets 分发器据此选 ARM64 扫描 / 原 x86 路径。
-        // PC/x86 上返回 false -> 走原路径，零变化。
         public static bool IsArm64()
         {
             return RuntimeInformation.ProcessArchitecture == Architecture.Arm64;
         }
 
-        // 直接在代码页上判定架构，不依赖 RuntimeInformation.ProcessArchitecture
-        // （iOS 上该 API 可能返回 Unknown）。ARM64 b/bl/cbz/tbz/adrp/ret 的位模式在
-        // x86-64 上是非法或极罕见 opcode；连续命中 2 条即可高置信判定 ARM64。
+        // 代码页上判定架构，不依赖 iOS 上可能返回 Unknown 的 RuntimeInformation.ProcessArchitecture。
         public static bool LooksArm64(IntPtr code)
         {
             int hits = 0;
@@ -34,14 +35,14 @@ namespace NebulaArm64Xref
                     uint w = (uint)Marshal.ReadInt32(code, off);
                     if (w == 0u) break;
                     bool arm =
-                        ((w & 0x7C000000u) == 0x14000000u) || // b/bl
-                        ((w & 0x7E000000u) == 0x34000000u) || // cbz/cbnz
-                        ((w & 0x7E000000u) == 0x36000000u) || // tbz/tbnz
-                        ((w & 0x9F000000u) == 0x90000000u) || // adrp
-                        ((w & 0xFFC00000u) == 0xF9400000u) || // ldr imm
-                        ((w & 0x7F800000u) == 0x11000000u) || // add/sub imm
-                        ((w & 0xFFFFFC1Fu) == 0xD65F0000u) || // ret
-                        ((w & 0xFFFFFC1Fu) == 0xD61F0000u);   // br
+                        ((w & 0x7C000000u) == 0x14000000u) ||
+                        ((w & 0x7E000000u) == 0x34000000u) ||
+                        ((w & 0x7E000000u) == 0x36000000u) ||
+                        ((w & 0x9F000000u) == 0x90000000u) ||
+                        ((w & 0xFFC00000u) == 0xF9400000u) ||
+                        ((w & 0x7F800000u) == 0x11000000u) ||
+                        ((w & 0xFFFFFC1Fu) == 0xD65F0000u) ||
+                        ((w & 0xFFFFFC1Fu) == 0xD61F0000u);
                     if (arm) { hits++; if (hits >= 2) break; }
                 }
             }
@@ -49,15 +50,15 @@ namespace NebulaArm64Xref
             return hits >= 2;
         }
 
-        // 从 code 开始扫描最多 1000 字节，解析 b/bl/cbz/cbnz/tbz/tbnz/adrp/add/ldr/br/blr/ret，
-        // 返回跳转目标（恒至少 1 个：解码失败回退 code 本身，保证上层 Single()/Last() 不崩）。
-        // useXref 保留原签名（本实现忽略，ARM64 下统一做跳转目标解析）。
+        // 返回 code 处 ARM64 thunk 的跳转目标列表（对齐官方 JumpTargetsImpl 语义）。
+        // 恒返回 >=1 个（解码失败回退 code 本身），保证上层 Single()/First()/Last() 不崩。
         public static IntPtr[] Scan(IntPtr code, bool useXref)
         {
             IntPtr[] targets = new IntPtr[64];
             int n = 0;
-            IntPtr[] regs = new IntPtr[31]; // x0..x30，0 表示未知
+            IntPtr[] regs = new IntPtr[31]; // x0..x30
             long codeLong = code.ToInt64();
+            bool firstFlowControl = true;
             try
             {
                 for (int off = 0; off + 4 <= SCAN_BYTES; off += 4)
@@ -66,37 +67,34 @@ namespace NebulaArm64Xref
                     long pc = codeLong + off;
                     if (w == 0u) break;
 
-                    // B / BL: 0x14000000 / 0x94000000, imm26 -> target = pc + sext(imm26<<2, 28)
-                    if ((w & 0x7C000000u) == 0x14000000u || (w & 0x7C000000u) == 0x94000000u)
+                    // B (0x14000000, 无条件跳转): yield target; firstFlowControl 时立即停止。
+                    // 精确匹配官方：第一条 UnconditionalBranch yield 后 yield break。
+                    if ((w & 0xFC000000u) == 0x14000000u)
                     {
                         long o = (long)(w & 0x03FFFFFFu) << 2;
                         if ((w & 0x02000000u) != 0u) o |= ~0x0FFFFFFF;
                         long t = pc + o;
-                        if (t != 0) targets[n++] = (IntPtr)t;
+                        if (t != 0 && n < 64) targets[n++] = (IntPtr)t;
+                        if (firstFlowControl) break;
                         continue;
                     }
 
-                    // CBZ / CBNZ: 0x34000000 / 0x35000000, imm19 -> pc + sext(imm19<<2, 21)
-                    if ((w & 0x7E000000u) == 0x34000000u || (w & 0x7E000000u) == 0x35000000u)
+                    // BL (0x94000000, call): 官方 FlowControl.Call 不 yield；令 firstFlowControl=false。
+                    if ((w & 0xFC000000u) == 0x94000000u)
                     {
-                        long o = (long)((w >> 5) & 0x7FFFFu) << 2;
-                        if (((w >> 5) & 0x80000u) != 0u) o |= ~0x1FFFFF;
-                        long t = pc + o;
-                        if (t != 0) targets[n++] = (IntPtr)t;
+                        firstFlowControl = false;
                         continue;
                     }
 
-                    // TBZ / TBNZ: 0x36000000 / 0x37000000, imm14 -> pc + sext(imm14<<2, 16)
-                    if ((w & 0x7E000000u) == 0x36000000u || (w & 0x7E000000u) == 0x37000000u)
+                    // CBZ / CBNZ / TBZ / TBNZ (条件跳转): 官方 ConditionalBranch 不 yield。
+                    if ((w & 0x7E000000u) == 0x34000000u || (w & 0x7E000000u) == 0x35000000u ||
+                        (w & 0x7E000000u) == 0x36000000u || (w & 0x7E000000u) == 0x37000000u)
                     {
-                        long o = (long)((w >> 5) & 0x3FFFu) << 2;
-                        if (((w >> 5) & 0x2000u) != 0u) o |= ~0xFFFF;
-                        long t = pc + o;
-                        if (t != 0) targets[n++] = (IntPtr)t;
+                        firstFlowControl = false;
                         continue;
                     }
 
-                    // ADRP: 0x90000000, page = (pc & ~0xFFF) + sext(immhi:immlo, 21) << 12
+                    // ADRP: 计算页基址 -> regs[rd]
                     if ((w & 0x9F000000u) == 0x90000000u)
                     {
                         int rd = (int)(w & 0x1Fu);
@@ -109,7 +107,7 @@ namespace NebulaArm64Xref
                         continue;
                     }
 
-                    // ADD immediate (64-bit, sf=1): 0x91000000, reg[Rd] = reg[Rn] + imm12<<shift
+                    // ADD immediate (64-bit): regs[rd] = regs[rn] + imm
                     if ((w & 0x7F800000u) == 0x11000000u && ((w >> 31) & 1u) == 1u)
                     {
                         int rd = (int)(w & 0x1Fu);
@@ -121,7 +119,7 @@ namespace NebulaArm64Xref
                         continue;
                     }
 
-                    // LDR immediate unsigned (64-bit): 0xF9400000, reg[Rt] = [reg[Rn] + imm12*8]
+                    // LDR immediate unsigned (64-bit): regs[rt] = [regs[rn] + imm*8]
                     if ((w & 0xFFC00000u) == 0xF9400000u)
                     {
                         int rt = (int)(w & 0x1Fu);
@@ -135,34 +133,41 @@ namespace NebulaArm64Xref
                         continue;
                     }
 
-                    // BR / BLR: 0xD61F0000 / 0xD63F0000, target = reg[Rn]
+                    // BR / BLR (0xD61F0000 / 0xD63F0000, 间接跳转): yield regs[rn], 继续。
+                    // 官方 FlowControl.IndirectBranch yield 后继续扫描（令 firstFlowControl=false）。
                     if ((w & 0xFFFFFC1Fu) == 0xD61F0000u || (w & 0xFFFFFC1Fu) == 0xD63F0000u)
                     {
                         int rn = (int)((w >> 5) & 0x1Fu);
                         if (rn < 31 && regs[rn] != IntPtr.Zero)
                         {
                             long t = regs[rn].ToInt64();
-                            if (t != 0) targets[n++] = (IntPtr)t;
+                            if (t != 0 && n < 64) targets[n++] = (IntPtr)t;
                         }
-                        break;
+                        firstFlowControl = false;
+                        continue;
                     }
 
-                    // RET: 终止扫描
+                    // RET: 官方 FlowControl.Return -> 停止
                     if ((w & 0xFFFFFC1Fu) == 0xD65F0000u) break;
                 }
             }
             catch { }
 
-            IntPtr[] result = new IntPtr[1];
-            if (n > 0)
-                result[0] = targets[n - 1]; // 优先最后一个外部跳转目标（thunk 尾跳）
-            else
-                result[0] = code; // 解码失败回退导出地址，保证 Single() 恒得 1 个
+            if (n == 0)
+            {
+                targets[0] = code;
+                n = 1;
+            }
+
+            IntPtr[] result = new IntPtr[n];
+            for (int i = 0; i < n; i++) result[i] = targets[i];
 
             try
             {
-                Console.WriteLine("[R136-XREF] code=0x" + code.ToInt64().ToString("X") +
-                                  " found=" + n.ToString() + " target=0x" + result[0].ToInt64().ToString("X"));
+                string line = "[R137-XREF] code=0x" + code.ToInt64().ToString("X") + " found=" + n.ToString();
+                for (int i = 0; i < n; i++)
+                    line += " t" + i.ToString() + "=0x" + result[i].ToInt64().ToString("X");
+                Console.WriteLine(line);
             }
             catch { }
             return result;
