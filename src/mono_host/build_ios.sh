@@ -444,6 +444,33 @@ else
   echo "   [R126] ✗ 缺 dotnet，无法根治 internal_from_handle，拒绝产出" >&2; exit 1
 fi
 
+# [R131] 根治 UnityAction`2.cctor -> get_TypeHandle(null) NRE（NOS 加载最后一崩点）。
+#   真机 R130：PatchAll 首次跑满 seq=163 ok=160（detour 已健康），但 NOS 加载崩在
+#     SceneManager.get_sceneLoaded() -> Il2CppObjectPool.Get<UnityAction`2>
+#       -> UnityAction`2..cctor() -> MakeGenericType(...)=null -> get_TypeHandle(null) NRE.
+#   根因：Il2CppSystem.Type.cctor 里 NativeMethodInfoPtr_MakeGenericType / _get_TypeHandle
+#     是用 GetIl2CppMethodByToken(class, <烤死 token>) 解析的；预生成 interop 的 token
+#     在 iOS GameAssembly 里错位 -> methodInfo=0 -> runtime_invoke(0) 被 R123 guard 转 null
+#     -> MakeGenericType 返回 null -> get_TypeHandle(null) 解引用 NRE.
+#   真修（真修复·非绕过·跨 AU 版本/设备/iOS 通用）：按【方法名】解析而非 token：
+#     il2cpp_class_get_method_from_name(class, "MakeGenericType", 1)
+#     il2cpp_class_get_method_from_name(class, "get_TypeHandle", 0)
+#   方法名在所有 AU 版本不变、与 token 无关；两 native 函数栈行为一致。含改动片段栈平衡校验。
+#   目标：$ROOT/prebuilt-interop/Il2Cppmscorlib.dll（blob 打包前 patch，指纹变化→设备自动重释放）。
+if command -v dotnet >/dev/null 2>&1; then
+  D131_PROJ="$ROOT/../../tools/patch_type_methodinfo/patch_type_methodinfo.csproj"
+  MS131="$ROOT/prebuilt-interop/Il2Cppmscorlib.dll"
+  if [ -f "$D131_PROJ" ] && [ -f "$MS131" ]; then
+    echo "   [R131] Type.cctor methodInfo 按名字解析（MakeGenericType/get_TypeHandle，幂等+栈校验）..."
+    dotnet run --project "$D131_PROJ" -c Release -- "$MS131" || \
+      { echo "   [R131] ✗ 补丁失败/IL 栈校验不过，拒绝产出会进原版的包" >&2; exit 1; }
+  else
+    echo "   [R131] ✗ 找不到 $D131_PROJ 或 $MS131，拒绝产出" >&2; exit 1
+  fi
+else
+  echo "   [R131] ✗ 缺 dotnet，无法按名字解析 methodInfo，拒绝产出" >&2; exit 1
+fi
+
 python3 - "$MONO_ROOT" "${BEPINEX_CORE_DIR:-}" "$BLOB" "$ROOT" "$FACADE_SHA_MARK" <<'PY'
 import sys, os, struct
 mono_root = sys.argv[1]
